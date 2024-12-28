@@ -4,7 +4,7 @@ class AppConfig:
     """
     Configuration File
     """
-    APP_NAME: str = "MIDI-templater"
+    APP_NAME: str = "virtuOS"
     SAMPLE_RATE: int = 44100
     FRAME_SIZE: int = 2048
     HOP_SIZE: int = 128

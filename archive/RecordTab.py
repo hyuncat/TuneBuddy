@@ -6,22 +6,22 @@ from math import ceil
 from app.config import AppConfig
 
 # Audio recording/playback modules
-from app.modules.audio.AudioData import AudioData
-from app.modules.audio.AudioRecorder import AudioRecorder
-from app.modules.audio.AudioPlayer import AudioPlayer
+from app.core.audio.AudioData import AudioData
+from app.core.audio.AudioRecorder import AudioRecorder
+from app.core.audio.AudioPlayer import AudioPlayer
 from archive.PitchAnalyzer import PitchAnalyzer
 
 # MIDI handling / playback modules
-from app.modules.midi.MidiData import MidiData
-from app.modules.midi.MidiSynth import MidiSynth
-from app.modules.midi.MidiPlayer import MidiPlayer
+from app.core.midi.MidiData import MidiData
+from app.core.midi.MidiSynth import MidiSynth
+from app.core.midi.MidiPlayer import MidiPlayer
 
 # UI
-from app.ui.Slider import Slider
+from app.ui.widgets.Slider import Slider
 from archive.PitchPlot import PitchPlot
 
 # DTW
-from app.modules.dtw.PitchDTW import PitchDTW
+from app.dtw.PitchDTW import PitchDTW
 
 
 class RecordTab(QWidget):

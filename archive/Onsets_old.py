@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from math import ceil
 
-from app.modules.pitch.models.Pitch import Pitch
+from app.algorithms.pitch.models.Pitch import Pitch
 
 class OnsetsOld:
     """Store old Onsets methods no longer in use by the app."""

@@ -7,8 +7,8 @@ import pyqtgraph as pg
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QApplication
 from PyQt6.QtGui import QColor
 
-from app.modules.core.midi.MidiData import MidiData
-from app.modules.processing.pda.Pitch import Pitch
+from app.core.midi.MidiData import MidiData
+from app.algorithms.pitch.Pitch import Pitch
 
 
 class PitchPlot(QWidget):
@@ -197,7 +197,7 @@ class PitchPlot(QWidget):
             for j in range(len(note_df) - 1):
                 note_line = pg.PlotCurveItem(
                     x=[note_df.iloc[j]['time'], note_df.iloc[j + 1]['time']],
-                    y=[note_df.iloc[j]['midi_num'], note_df.iloc[j]['midi_num']],
+                    y=[note_df.iloc[j]['pitch'], note_df.iloc[j]['pitch']],
                     pen=pg.mkPen(self.colors['notes'], width=25),
                     name='Notes'
                 )
@@ -206,7 +206,9 @@ class PitchPlot(QWidget):
 
 
     def plot_onsets(self, onset_df: pd.DataFrame):
-        """Plot the detected onsets on the pitch plot."""
+        """Plot the detected onsets on the pitch plot.
+        Pitch differences are grey, onsets are pink
+        """
         
         self.onsets = []
         for i, onset_row in onset_df.iterrows():
@@ -235,6 +237,30 @@ class PitchPlot(QWidget):
                 self.onsets.append(pitch_onset_bar)
                 self.plot.addItem(pitch_onset_bar)
 
+    def plot_alignment(self, align_df: pd.DataFrame):
+        """Plot the alignment between the user pitch data and the MIDI data."""
+        # self.plot_user(user_pitchdf)
+
+        if hasattr(self, 'alignment_lines'):
+            for line in self.alignment_lines:
+                self.plot.removeItem(line)
+        else:
+            self.alignment_lines = []
+
+        for midi_idx, row in align_df.iterrows():
+            midi_time = row['midi_time']
+            midi_pitch = self.midi_data.pitch_df.iloc[midi_idx]['pitch']
+            for user_idx, user_time in enumerate(row['user_time']):
+                user_pitch = row['user_midi_nums'][user_idx]
+                line = pg.PlotCurveItem(
+                    x=[midi_time, user_time],
+                    y=[midi_pitch, midi_pitch+5],
+                    pen=pg.mkPen('#B1B1B1', width=4),
+                    name='Alignment'
+                )
+                self.plot.addItem(line)
+                self.alignment_lines.append(line)
+
     def move_plot(self, current_time: float):
         """Move the plot to the current time."""
         self.current_time = current_time
@@ -252,7 +278,7 @@ class PitchPlot(QWidget):
 
 
 class RunPitchPlot:
-    def __init__(self, app=None, midi_data: MidiData=None, pitches: list[Pitch]=None, onsets: np.ndarray=None, note_df: pd.DataFrame=None):
+    def __init__(self, app=None, midi_data: MidiData=None, pitches: list[Pitch]=None, onsets: np.ndarray=None, note_df: pd.DataFrame=None, align_df: pd.DataFrame=None):
         import sys
         sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
         from app.config import AppConfig
@@ -274,7 +300,7 @@ class RunPitchPlot:
         self.mainLayout = QVBoxLayout(self.centralWidget)
         self.mainWindow.setCentralWidget(self.centralWidget)
 
-        # Initialize VisualizeWindow and add it to the layout
+        # Initialize PitchPlot and add it to the layout
         self.pitch_plot = PitchPlot()
         self.mainLayout.addWidget(self.pitch_plot)
 
@@ -293,6 +319,8 @@ class RunPitchPlot:
             self.pitch_plot.plot_notes(note_df)
         if pitches is not None:
             self.pitch_plot.plot_pitches(pitches)
+        if align_df is not None:
+            self.pitch_plot.plot_alignment(align_df)
 
         self.mainWindow.show()
         self.app.exec()

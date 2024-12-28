@@ -23,7 +23,7 @@ class PYin:
     def __init__(self):
         pass
 
-    def high_pass_irr_filter(audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
+    def high_pass_iir_filter(audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
         # High pass filter to lower intensity of low frequency noise
         # Based on McLeod
         nyquist = sample_rate / 2
@@ -234,7 +234,7 @@ class PYin:
         frame_size = 2048*2
         hop_size = 128
 
-        audio_data = PYin.high_pass_irr_filter(audio_data, sr)
+        audio_data = PYin.high_pass_iir_filter(audio_data, sr)
 
         N_THRESHOLDS = 100
         thresholds = np.linspace(0, 1, N_THRESHOLDS) 

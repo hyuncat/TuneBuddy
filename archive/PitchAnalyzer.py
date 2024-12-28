@@ -6,7 +6,7 @@ from math import ceil
 import librosa
 
 from app.config import AppConfig
-from app.modules.audio.AudioData import AudioData
+from app.core.audio.AudioData import AudioData
 from archive.OldYin import pitch_yin
 
 class PitchAnalyzer:

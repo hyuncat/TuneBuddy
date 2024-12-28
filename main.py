@@ -1,6 +1,6 @@
 import sys
 from PyQt6.QtWidgets import QApplication
-from app.app import MidiDTWApp
+from app.app import virtuOS
 from app.config import AppConfig
 
 
@@ -14,7 +14,7 @@ def run() -> int:
     app: QApplication = QApplication(sys.argv)
     AppConfig.initialize(app)
 
-    window: MidiDTWApp = MidiDTWApp()
+    window: virtuOS = virtuOS()
     window.show()
     return sys.exit(app.exec())
 

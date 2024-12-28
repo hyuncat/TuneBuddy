@@ -3,7 +3,7 @@ import pyqtgraph as pg
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from app.modules.midi.MidiData import MidiData
+from app.core.midi.MidiData import MidiData
 from archive.PitchAnalyzer import PitchAnalyzer
 import os
 import json

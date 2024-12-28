@@ -7,7 +7,7 @@ class PYIN:
     def pyin(audio_data: np.ndarray, mean_threshold: float=0.3, 
              sr: int=44100, fmin: int=196, fmax: int=3000):
         
-        audio_data = Filter.high_pass_irr_filter(audio_data, cutoff_freq=fmin)
+        audio_data = Filter.high_pass_iir_filter(audio_data, cutoff_freq=fmin)
         
         # Config variables
         FRAME_SIZE = 2048
@@ -89,7 +89,7 @@ class PYIN:
         
     #     audio_data = audio_data.data
     #     # High-pass filter the audio data
-    #     audio_data = Filter.high_pass_irr_filter(audio_data, cutoff_freq=fmin)
+    #     audio_data = Filter.high_pass_iir_filter(audio_data, cutoff_freq=fmin)
 
     #     N_THRESHOLDS = 100
     #     thresholds = np.linspace(0, 1, N_THRESHOLDS) 

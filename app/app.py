@@ -13,7 +13,7 @@ from app.ui.widgets.StatusBar import StatusBar
 from app.ui.widgets.ToolBar import ToolBar
 
 
-class MidiDTWApp(QMainWindow):
+class virtuOS(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(AppConfig.APP_NAME)
