@@ -1,4 +1,4 @@
-# MIDI-templater
+# virtuOS
 
 Load a MIDI file, an audio file, and see/playback the differences!
 
