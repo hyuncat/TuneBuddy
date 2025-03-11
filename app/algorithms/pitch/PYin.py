@@ -1,141 +1,143 @@
 import numpy as np
-from numba import njit
-import scipy
+import scipy.signal
+import scipy.stats
+from math import ceil
 
-from .Yin import Yin
-# from app.algorithms.pitch.Pitch import PitchConfig, Pitch
-from app.core.recording.PitchDf import PitchDf, PitchConfig, Pitch
-from .Filter import Filter
-from app.core.audio.AudioData import AudioData
-from app.config import AppConfig
+from app.algorithms.pitch.Yin import Yin
+from app.core.recording.Pitch import PitchConfig, Pitch
 
 class PYin:
-    def __init__(self):
-        pass
-
-    # Question: How is voicing determined within this function?
-    #   -> global_min? n_thresholds_below_min?
-    @njit
-    def _pthreshold(trough_prior: np.ndarray, trough_threshold_matrix: np.ndarray, beta_pdf, no_trough_prob: float=0.01):
-        """
-        Compute the probabilities of each trough using the prior distribution
-        and beta distribution of thresholds, optimized with Numba.
-
-        Args:
-            trough_prior: The prior distribution of troughs.
-            trough_threshold_matrix: A boolean matrix indicating threshold presence.
-            beta_pdf: The probability density function of the beta distribution.
-            no_trough_prob: The probability of no troughs being present.
-
-        Returns:
-            A 1D array of probabilities for each trough.
-        """
-        trough_probs = trough_prior.dot(beta_pdf)
-        global_min = np.argmin(trough_probs)
-        n_thresholds_below_min = np.count_nonzero(~trough_threshold_matrix[global_min, :])
-        trough_probs[global_min] += no_trough_prob * np.sum(beta_pdf[:n_thresholds_below_min])
-        return trough_probs
-
-    def probabilistic_thresholding(cmndf_frame: np.ndarray, thresholds, beta_pdf) -> tuple[list[float], list[float]]:
-        """
-        Get all possible pitch candidates + probabilities for a given audio frame's CMNDF.
-        Corresponds to the probabilistic thresholding step in the PYIN algorithm.
-        
-        Args:
-            cmndf_frame: The CMNDF function for a single audio frame.
-            thresholds: The thresholds to use for probabilistic thresholding.
-            beta_pdf: The probability density function of the beta distribution.
-        
-        Returns:
-            A tuple with lists of pitch candidates and their respective probabilities.
-        """
-        base_trough_indices = scipy.signal.argrelmin(cmndf_frame, order=1)[0]
-        troughs = [Yin.parabolic_interpolation(cmndf_frame, i) for i in base_trough_indices]
-
-        trough_x_vals = np.array([trough[0] for trough in troughs])
-        trough_y_vals = np.array([trough[1] for trough in troughs])
-
-        trough_threshold_matrix = np.less.outer(trough_y_vals, thresholds)
-        trough_ranks = np.cumsum(trough_threshold_matrix, axis=0) - 1 # count how many troughs are below threshold
-        n_troughs = np.count_nonzero(trough_threshold_matrix, axis=0)
-
-        BOLTZMANN_PARAM = 2.0
-        trough_prior = scipy.stats.boltzmann.pmf(trough_ranks, BOLTZMANN_PARAM, n_troughs)
-        trough_prior[~trough_threshold_matrix] = 0
-
-        trough_probabilities = PYin._pthreshold(trough_prior, trough_threshold_matrix, beta_pdf, no_trough_prob=0.01)
-
-        SAMPLE_RATE = 44100
-        trough_frequencies = SAMPLE_RATE / trough_x_vals
-
-        return trough_frequencies, trough_probabilities
     
-    def calculate_alpha_beta(mean_threshold, total=20):
+    def __init__(self, sr: int=44100, f0_min: float=196.0, f0_max: float=5000.0, tuning: float=440.0):
         """
-        Calculate alpha and beta for a beta distribution given a desired mean 
-        and a total sum of alpha and beta.
+        Initialize the pitch detection parameters, like the tuning, frequency range, etc.
+        Best to make it as specific as possible to your desired use case to improve accuracy of the detection.
         """
-        alpha = mean_threshold * total
-        beta = total - alpha
-        return alpha, beta
+        # --- frame iteration variables ---
+        self.SAMPLE_RATE = sr
+        self.FRAME_SIZE = 4096
+        self.HOP_SIZE = 128
+
+        # --- pitch config variables ---
+        # ensure max lag is big enough to detect lowest f0 (largest period)
+        # defaults to violin min
+        self.tau_max = int(sr / f0_min) 
+        self.tau_min = int(sr / f0_max)
+        # pitch config to associate tuning / fmin / fmax params for each pitch
+        self.pitch_config = PitchConfig(tuning=tuning, fmin=f0_min, fmax=f0_max)
+
+        # initialize beta distribution parameters
+        self.UNVOICED_PROB = 0.01
+        self.N_THRESHOLDS = 100
+        self.beta_pdf, self.thresholds = PYin.threshold_prior(n_thresholds=self.N_THRESHOLDS)
 
     @staticmethod
-    def pyin(audio_data: np.ndarray, mean_threshold: float=0.3, 
-             sr: int=44100, fmin: int=196, fmax: int=3000):
-        
-        audio_data = Filter.high_pass_iir_filter(audio_data, cutoff_freq=fmin)
-        
-        # config variables
-        FRAME_SIZE = 2048
-        HOP_SIZE = 128
+    def threshold_prior(n_thresholds: int=100, a: float=2, b: float=34/3) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Returns a beta distribution modeling the pdf for YIN thresholds,
+        represented as a numpy array of size N_THRESHOLDS corresponding to the pdf values.
+        Also returns the array of thresholds.
 
-        N_THRESHOLDS = 100
-        thresholds = np.linspace(0, 1, N_THRESHOLDS) 
-        cdf_thresholds = np.linspace(0, 1, N_THRESHOLDS + 1) # add one because we create using np.diff of a cdf
+        Possible a,b parameters from paper:
+            - mean=0.1 beta(a=2, b=18)
+            - mean=0.15 beta(a=2, b=11.33)
+            - mean=0.2 beta(a=2, b=8)
 
-        # Create beta distribution centered around the desired mean threshold
-        alpha, beta = PYin.calculate_alpha_beta(mean_threshold, total=20)
-        beta_cdf = scipy.stats.beta.cdf(x=cdf_thresholds, a=alpha, b=beta) # How are alpha and beta calculated?
-        beta_pdf = np.diff(beta_cdf) # where we know the total mass = 1
+        Not yet sure how these parameters are determined but I got them from the paper.
+        """
+        # all thresholds
+        thresholds = np.linspace(0, 1, n_thresholds+1)
+        thresholds = thresholds[1:] # remove the 0 threshold
+        beta_pdf = scipy.stats.beta.pdf(thresholds, a, b) / n_thresholds
+        # print(f"initializing pyin with thresholds {thresholds}\nand beta_pdf {beta_pdf}")
+        return beta_pdf, thresholds
+    
+    def prob_thresholding(self, troughs: np.ndarray, cmndf: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        Given all relative minima of the difference curve (the 'troughs') we 
+        compute the probability of all possible period = 1/f_0 estimates. Where 
+        the x-position of the trough corresponds to the period estimate of the 
+        audio signal (in samples).
 
-        # Prepare variables for frame iteration
+        Args:
+            troughs (np.ndarray): indices of all relative minima of the diff_fct
+            cmndf (np.ndarray): cumulative mean normalized difference function, which 
+                                biases smaller periods and makes us less likely to choose 
+                                the zero lag
+
+        Returns:
+            tau_probs (np.ndarray): array of same shape as troughs, where corresponding
+                                    indices represent associated probabilities
+            unvoiced_prob (float): 1 - sum(tau_probs), eg adding up all the times we had to 
+                                   take the global min because nothing was below the threshold
+        """
+        tau_probs = np.zeros_like(troughs)
+        for i, threshold in enumerate(self.thresholds):
+            tau_0, tau_idx, is_voiced = Yin.absolute_threshold(cmndf, troughs, threshold)
+            # ensure the tau is within our frequency range (trying to minimize harmonic errors)
+            if is_voiced and tau_0 <= self.tau_max and tau_0 >= self.tau_min:
+                tau_probs[tau_idx] += self.beta_pdf[i]
+            else:
+                tau_probs[tau_idx] += self.beta_pdf[i] * self.UNVOICED_PROB
+            
+        unvoiced_prob = 1 - np.sum(tau_probs)
+        return tau_probs, unvoiced_prob
+
+    def pyin(self, audio_data: np.ndarray):
+        """
+        Computes the PYIN algorithm on an audio array of samples.
+        Mauch, Dixon 2014
+        """
+
+        # get memory efficient frames with np pointer c++ magic
+        frames = np.lib.stride_tricks.sliding_window_view(audio_data, self.FRAME_SIZE)[::self.HOP_SIZE]
+        n_frames = 1 + (len(audio_data) - self.FRAME_SIZE) // self.HOP_SIZE 
+
         pitches = []
-        most_likely_pitches = []
-        
-        pitch_config = PitchConfig( # Defines resolution of pitch bins
-            bins_per_semitone=10, tuning=440.0, fmin=fmin, fmax=fmax
-        )
-        num_frames = (len(audio_data) - FRAME_SIZE) // HOP_SIZE
+        # most_likely_pitches = []
 
-        for frame_idx in range(num_frames):
-            # Print the frame count in place
-            print(f"\rProcessing frame {frame_idx + 1}/{num_frames}", end='')
+        for i, frame in enumerate(frames):
+            print(f"\rProcessing frame {i+1}/{n_frames}", end='')
 
-            i = frame_idx*HOP_SIZE
-            time = i/sr
+            time = (i*self.HOP_SIZE)/self.SAMPLE_RATE # elapsed time of the frame
 
-            # Compute the CMNDF function for each frame
-            audio_frame = audio_data[i:i+FRAME_SIZE]
+            diff_frame, amplitudes = Yin.difference_function(frame, self.tau_max)
+            cmndf_frame = Yin.cmndf(diff_frame, self.tau_max, self.tau_min)
 
-            volume = np.sqrt(np.mean(audio_frame ** 2)) # Computed with
+            prominence = ceil((np.max(cmndf_frame) - np.min(diff_frame))/2)
 
-            cmndf_frame, amplitudes = Yin.cmndf(audio_frame, FRAME_SIZE//2)
-            # cmndf_frame, power_spec, amplitudes = Yin.difference_function(audio_frame, FRAME_SIZE//2)
+            # prominence picking - set prominence as 1/2 amplitude
+            # and keep trying to find peaks until at least one valid peak found
+            while True:
+                trough_indices, _ = scipy.signal.find_peaks(-cmndf_frame, prominence=prominence, distance=5)
+                if len(trough_indices) > 0 or prominence==0: # stop when we have at least 1 peak
+                    break
+                prominence -= 0.5
             
-            # Compute all possible pitch candidates for the frame
-            frequencies, probabilities = PYin.probabilistic_thresholding(cmndf_frame, thresholds, beta_pdf)
+            # parabolic interpolation for final candidates
+            tau_candidates = [Yin.parabolic_interpolation(diff_frame, t) for t in trough_indices]
+            freq_estimates = [self.SAMPLE_RATE/t for t in tau_candidates]
+            tau_probs, unvoiced_prob = self.prob_thresholding(trough_indices, cmndf_frame)
 
-            for freq, prob in zip(frequencies, probabilities):
-                pitch = Pitch(time=time, frequency=freq, probability=prob, volume=volume, audio_idx=i, config=pitch_config)
-                pitches.append(pitch)
-
-            # Append the most likely pitch candidate for the frame to a separate list
-            i = np.argmax(probabilities)
-            best_prob = probabilities[i]
-            best_freq = frequencies[i]
-            most_likely_pitch = Pitch(time=time, frequency=best_freq, probability=best_prob, volume=volume, audio_idx=i, config=pitch_config)
-
-            most_likely_pitches.append(most_likely_pitch)
+            volume = np.sqrt(np.mean(frame ** 2)) # get volume as mean |amplitude| of the frame
             
-        print("\nDone!")
-        return pitches, most_likely_pitches
+            # create pitch objects and format into the pitch_list
+            current_pitches = []
+            for freq, prob in zip(freq_estimates, tau_probs):
+                pitch = Pitch(time=time, frequency=freq, probability=prob, volume=volume, config=self.pitch_config)
+                current_pitches.append(pitch)
+
+            current_pitches.sort(key=lambda p: p.probability, reverse=True)
+            pitches.append(current_pitches)
+
+            # i = np.argmax(tau_probs)
+            # best_prob = tau_probs[i]
+            # best_freq = freq_estimates[i]
+            # most_likely_pitch = Pitch(time=time, frequency=best_freq, probability=best_prob, volume=volume, config=self.pitch_config)
+
+            # most_likely_pitches.append(most_likely_pitch)
+            
+            
+        print('\nDone!')
+
+        return pitches

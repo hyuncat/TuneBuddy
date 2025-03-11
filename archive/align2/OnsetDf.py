@@ -6,8 +6,8 @@ from math import ceil
 
 from app.core.audio.AudioData import AudioData
 from app.core.midi.MidiData import MidiData 
-from app.core.recording.PitchDf import PitchDf
-from app.algorithms.pitch.Pitch import Pitch
+from notebooks.archive.PitchDf import PitchDf
+from app.core.recording.Pitch import Pitch
 from app.config import AppConfig
 from app.algorithms.align.CQT import CQT
 

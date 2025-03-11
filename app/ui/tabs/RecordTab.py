@@ -15,12 +15,12 @@ from app.core.audio.AudioPlayer import AudioPlayer
 from app.core.midi.MidiData import MidiData
 from app.core.midi.MidiSynth import MidiSynth
 from app.core.midi.MidiPlayer import MidiPlayer
-from app.core.recording.PitchDf import PitchDf
+from notebooks.archive.PitchDf import PitchDf
 # Algorithm modules
 from app.algorithms.align.DTW import DTW
 from app.algorithms.align.OnsetDf import UserOnsetDf
-from app.algorithms.pitch.PYin import PYin
-from app.algorithms.pitch.Pitch import PitchConfig
+from archive.PYin import PYin
+from app.core.recording.Pitch import PitchConfig
 # UI
 from app.ui.widgets.Slider import Slider
 from app.ui.plots.PitchPlot import PitchPlot

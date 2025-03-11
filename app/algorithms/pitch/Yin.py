@@ -1,6 +1,5 @@
 import numpy as np
 from numba import njit
-from app.config import AppConfig
 
 class Yin:
 
@@ -44,32 +43,6 @@ class Yin:
         # (type II autocorrelation)
         return autocorrelation[:w-tau_max],amplitudes
     
-    # def difference_function(audio_frame: np.ndarray, tau_max: int):
-    #     """
-    #     The square difference function implemented in the seminal YIN paper
-    #     """
-    #     x = np.array(audio_frame, np.float64)  # Ensure float64 precision
-    #     w = x.size
-    #     tau_max = min(tau_max, w)  # Ensure tau_max is within the window size
-
-    #     autocorr, power_spec, amplitudes = Yin.autocorrelation_fft(x, tau_max)
-        
-    #     # Compute m'(tau) - terminology from McLeod
-    #     m_0 = 2*np.sum(x ** 2) # initial m'(0)
-
-    #     # Compute m'(tau) for each possible tau (McLeod 3.3.4)
-    #     m_primes = np.zeros(tau_max)
-    #     m_primes[0] = m_0
-    #     for tau in range(1, tau_max):
-    #         m_primes[tau] = m_primes[tau-1] - x[tau-1]**2 + x[w-tau]**2
-
-    #     # Slice m_primes to only contain valid overlapping values
-    #     m_primes = m_primes[:w-tau_max]
-
-    #     # Compute the square difference function
-    #     sdf = m_primes - 2*autocorr
-    #     return sdf, power_spec, amplitudes
-    
     @staticmethod
     def difference_function(audio_frame: np.ndarray, tau_max: int) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -96,10 +69,12 @@ class Yin:
 
         diff_fct = energy[0] + energy - 2*autocorr
         diff_fct[0] = 0
+        diff_fct = np.abs(diff_fct)
 
         return diff_fct, amplitudes
+        
     
-    def cmndf(diff_fct: np.ndarray, tau_max: int) -> np.ndarray:
+    def cmndf(diff_fct: np.ndarray, tau_max: int, tau_min: int) -> np.ndarray:
         """
         Cumulative Mean Normalized Difference Function (CMNDF).
 
@@ -118,12 +93,41 @@ class Yin:
 
         # Compute the Cumulative Mean Normalized Difference Function (CMNDF)
         cmndf = np.zeros(tau_max)
-        cmndf[0] = 1  
-        total_diff = 0.0
+        cmndf[:tau_min] = 1
+        total_diff = tau_min
+
+        for tau in range(tau_min, tau_max):
+            total_diff += diff_fct[tau]
+            avg_diff = total_diff / tau 
+            cmndf[tau] = diff_fct[tau] / avg_diff
+
+        return cmndf
+
+    def cmndf_old(diff_fct: np.ndarray, tau_max: int, tau_min: int) -> np.ndarray:
+        """
+        Cumulative Mean Normalized Difference Function (CMNDF).
+
+        The idea is to normalize each d_t(tau) value for all lags based on the mean of the
+        cumulative sum of all differences leading up to that point. YIN solution to not
+        picking the zero-lag peak.
+
+        Args:
+            audio_frame: The current frame of audio samples in Yin algorithm
+            tau_max: Check for all time lags up to this value for in autocorr
+
+        Returns:
+            cmndf: Array of values where index=tau and value=CMNDF(tau)
+        """
+        tau_max = min(tau_max, diff_fct.size)  # ensure tau_max is within the window size
+
+        # Compute the Cumulative Mean Normalized Difference Function (CMNDF)
+        cmndf = np.zeros(tau_max)
+        cmndf[0] = 1
+        total_diff = tau_min
 
         for tau in range(1, tau_max):
             total_diff += diff_fct[tau]
-            avg_diff = total_diff / tau
+            avg_diff = total_diff / tau 
             cmndf[tau] = diff_fct[tau] / avg_diff
 
         return cmndf
@@ -155,30 +159,32 @@ class Yin:
             return float(x)
         
         x_interpolated = x + (y_1 - y_3) / denominator
-        # y_interpolated = y_2 - ((y_1 - y_3)**2) / (4 * denominator)
-
         return x_interpolated
     
     @staticmethod
-    def absolute_threshold(cmndf_frame: np.ndarray, local_minima: list[int], threshold: float=0.1) -> tuple[int, bool]:
+    def absolute_threshold(cmndf_frame: np.ndarray, local_minima: np.ndarray, threshold: float=0.1) -> tuple[int, bool]:
         """
         Apply the absolute thresholding step by searching for the first trough
-        below a certain 'absolute threshold'
+        below a certain 'absolute threshold'. Ideally should be run with y-values from cmndf
+        but the algorithm runs better with diff_fct?..
 
         Args:
             cmndf_frame: Output from applying CMNDF over a frame of audio samples
-            local_minima: Indices of local minima of the raw diff_fct
+            local_minima: Ordered list of indices of local minima of the raw diff_fct
             threshold: Take the first trough below this value of d'(tau)
         
         Returns:
             tau_0 (int): The fundamental period estimate. If possible, the first tau st. 
                          d'(tau) < threshold. Else, the x of the global minima
+            tau_idx (int): Index of the chosen trough in the local_minima array
             is_voiced (bool): False if we return the global min
         """
-        for min in local_minima:
+        for i, min in np.ndenumerate(local_minima):
             if cmndf_frame[min] <= threshold:
-                return min, True
+                # print(f"found yin{i} at tau={min} and threshold={threshold}")
+                return min, i, True
         
         # no min found below threshold, return the global minima
-        global_min = np.argmin(cmndf_frame)
-        return global_min, False
+        i = np.argmin(cmndf_frame[local_minima])
+        global_min = local_minima[i]
+        return global_min, i, False

@@ -12,7 +12,7 @@ from app.core.midi.MidiData import MidiData
 from typing import Optional, List
 from app.config import AppConfig
 from archive.PitchAnalyzer import PitchAnalyzer
-from app.algorithms.pitch.PYin import PYin
+from archive.PYin import PYin
 
 
 @dataclass

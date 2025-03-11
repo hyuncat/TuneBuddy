@@ -7,7 +7,7 @@ from PyQt6.QtCore import pyqtSignal
 import threading
 from app.config import AppConfig
 from app.core.audio.AudioData import AudioData
-from app.algorithms.pitch.PYin import PYin
+from archive.PYin import PYin
 
 class AudioRecorder:
     """

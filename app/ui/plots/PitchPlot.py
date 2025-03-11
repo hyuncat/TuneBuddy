@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QApplication
 from PyQt6.QtGui import QColor
 
 from app.core.midi.MidiData import MidiData
-from app.algorithms.pitch.Pitch import Pitch
+from app.core.recording.Pitch import Pitch
 
 
 class PitchPlot(QWidget):
@@ -93,7 +93,7 @@ class PitchPlot(QWidget):
 
         # Add y-axis ticks for each staff line
         y_axis = self.plot.getAxis('left')
-        ticks = [(midi_number, note) for note, midi_number in self.all_staff_lines.items()]
+        ticks = [(midi_number, str(midi_number)) for midi_number in self.all_staff_lines.values()]
         y_axis.setTicks([ticks])
         y_axis.setStyle(tickTextOffset=10, tickFont=pg.QtGui.QFont('Arial', 8))
 
@@ -174,7 +174,7 @@ class PitchPlot(QWidget):
             color = QColor.fromHsv(int(hue), 255, 255)  # Full saturation and value for bright colors
 
             # Set opacity based on pitch probability
-            color.setAlphaF(pitch.probability)  # Opacity (alpha) based on pitch probability (0 to 1)
+            color.setAlphaF(1)  # Opacity (alpha) based on pitch probability (0 to 1)
             brushes.append(pg.mkBrush(color))  # Use mkBrush to create the brush with color
 
 
@@ -189,17 +189,31 @@ class PitchPlot(QWidget):
         self.plot.addItem(self.pitches)
         print("Done!")
 
-    def plot_notes(self, note_df: pd.DataFrame):
+    def plot_notes(self, note_string):
         """Plot the detected notes on the pitch plot."""
 
-        self.note_lines = []
-        if len(note_df) > 1:
-            for j in range(len(note_df) - 1):
+        self.note_lines = [] # empty out existing notes
+        if len(note_string.notes) == 0:
+            return # return if malformed
+        
+        # iterate through and create note curve items
+        for note in note_string.notes:
+
+            for i, n in enumerate(note):
+
+                if i==1:
+                    break
+
+                opacity = 1.0 - (i / 4)
+                color = QColor(self.colors['notes'])
+                color.setAlphaF(opacity)
+                pen = pg.mkPen(color, width=25)
+
                 note_line = pg.PlotCurveItem(
-                    x=[note_df.iloc[j]['time'], note_df.iloc[j + 1]['time']],
-                    y=[note_df.iloc[j]['pitch'], note_df.iloc[j]['pitch']],
-                    pen=pg.mkPen(self.colors['notes'], width=25),
-                    name='Notes'
+                    x=[n.start, n.end],
+                    y=[n.pitch, n.pitch],
+                    pen=pen,
+                    name='Notes' 
                 )
                 self.plot.addItem(note_line)
                 self.note_lines.append(note_line)
@@ -278,7 +292,7 @@ class PitchPlot(QWidget):
 
 
 class RunPitchPlot:
-    def __init__(self, app=None, midi_data: MidiData=None, pitches: list[Pitch]=None, onsets: np.ndarray=None, note_df: pd.DataFrame=None, align_df: pd.DataFrame=None):
+    def __init__(self, app=None, midi_data: MidiData=None, pitches: list[Pitch]=None, onsets: np.ndarray=None, note_string=None, align_df: pd.DataFrame=None):
         import sys
         sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
         from app.config import AppConfig
@@ -315,8 +329,8 @@ class RunPitchPlot:
             self.pitch_plot.plot_midi(midi_data)
         if onsets is not None:
             self.pitch_plot.plot_onsets(onsets)
-        if note_df is not None:
-            self.pitch_plot.plot_notes(note_df)
+        if note_string is not None:
+            self.pitch_plot.plot_notes(note_string)
         if pitches is not None:
             self.pitch_plot.plot_pitches(pitches)
         if align_df is not None:
