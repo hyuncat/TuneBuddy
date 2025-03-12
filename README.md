@@ -1,4 +1,4 @@
-# virtuOS
+# Synchrony
 
 Load a MIDI file, an audio file, and see/playback the differences!
 
