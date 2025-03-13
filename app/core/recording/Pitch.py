@@ -120,7 +120,7 @@ class Pitches:
         pitch_idx = round(sample_idx / self.pyinner.HOP_SIZE)
         return self.pitches[pitch_idx][rank]
     
-    def get_pitches(self, start_time: float, end_time: float=None, rank: int=0):
+    def get_pitches(self, start_time: float=0, end_time: float=None, rank: int=0):
         """
         Gets all the pitches from the given start to the end time.
         Tries to get the rank of the pitch provided, but defaults to what's available.

@@ -15,7 +15,7 @@ class NoteDetector:
 
         # get the slope + intercept
         A = np.vstack([x, np.ones_like(x)]).T
-        slope, intercept = np.linalg.lstsq(A, window)[0]
+        slope, intercept = np.linalg.lstsq(A, window, rcond=None)[0]
 
         # now use it to reconstruct what the pitches should be
         predicted_window = slope*x + intercept
@@ -28,7 +28,7 @@ class NoteDetector:
 
         # again! slope + intercept for real this time 😎
         A = np.vstack([x, np.ones_like(x)]).T
-        slope, intercept = np.linalg.lstsq(A, window)[0]
+        slope, intercept = np.linalg.lstsq(A, window, rcond=None)[0]
         return slope, intercept
         
 

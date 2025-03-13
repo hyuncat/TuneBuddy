@@ -14,9 +14,9 @@ class Recording:
         self.pitches = None
         self.note_detector = NoteDetector(self)
 
-    def load_audio(self, audio_filepath: str=None):
+    def load_audio(self, audio_filepath: str=None, sr=44100):
         """Load the audio from a filepath and create AudioData for it"""
-        self.audio_data.load_data(audio_filepath)
+        self.audio_data.load_data(audio_filepath, sr=sr)
 
     def load_midi(self, midi_filepath: str=None):
         """Load the midi file from a filepath and create MidiData for it"""
@@ -35,6 +35,5 @@ class Recording:
             start_time=0, end_time=None, rank=0, 
             pitch_thresh=0.6, slope_thresh=1)
         self.midi_string = MidiString(self.midi_data)
-        print(f'user_string {self.user_string}\nmidi_string {self.midi_string}')
         self.alignment = StringEditor.string_edit(self.user_string, self.midi_string)
 

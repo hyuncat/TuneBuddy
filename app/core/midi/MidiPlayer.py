@@ -42,11 +42,11 @@ class MidiPlayer:
         self.MidiSynth = MidiSynth
         self.midi_data = None
 
-        # Threading variables
+        # threading variables
         self.playback_thread = None
         self.thread_stop_event = threading.Event()
 
-        # Other playback variables
+        # other playback variables
         self.current_time = 0
         self.is_playing = False
         self.playback_speed = 1.0

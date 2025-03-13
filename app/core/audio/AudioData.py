@@ -35,7 +35,7 @@ class AudioData:
         # as AudioRecorder and AudioPlayer will be accessing it
         self.lock = threading.Lock()
 
-    def load_data(self, audio_filepath: str):
+    def load_data(self, audio_filepath: str, sr: float=44100):
         """
         Load audio data into the recording data array.
         Args:
@@ -43,7 +43,7 @@ class AudioData:
         """
         # app_directory = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         # audio_file_path = os.path.join(app_directory, 'resources', 'audio', audio_filepath)
-        loader = es.MonoLoader(filename=audio_filepath, sampleRate=self.sample_rate)
+        loader = es.MonoLoader(filename=audio_filepath, sampleRate=sr)
         audio_data = loader()
 
         # Set the loaded audio from file as the new self.audio_data and update capacity

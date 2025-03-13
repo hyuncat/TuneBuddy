@@ -17,11 +17,11 @@ class MidiLoader:
         pass
 
     @staticmethod
-    def parse_midi(midi_file_path: str, tempo_factor=1) -> tuple[dict, dict, pd.DataFrame]:
+    def parse_midi(midi_filepath: str, tempo_factor=1) -> tuple[dict, dict, pd.DataFrame]:
         """
         Parse a MIDI file into a message_dict, program_dict, and pitch_df.
         """
-        midi_data = mido.MidiFile(midi_file_path) # Creates array of Message objects
+        midi_data = mido.MidiFile(midi_filepath) # Creates array of Message objects
 
         message_dict = {}
         program_dict = {}
@@ -110,13 +110,13 @@ class MidiData:
         - get_channels() -> list: returns the list of channels in the MIDI file
     """
 
-    def __init__(self, midi_file_path: str):
+    def __init__(self, midi_filepath: str):
         """
         Initialize the MidiData object by parsing the given MIDI file.
         """
-        self.midi_file_path = midi_file_path
+        self.midi_filepath = midi_filepath
         self.tempo_factor = 1
-        self.message_dict, self.program_dict, self.pitch_df = MidiLoader.parse_midi(midi_file_path)
+        self.message_dict, self.program_dict, self.pitch_df = MidiLoader.parse_midi(midi_filepath)
 
     def get_length(self) -> float:
         """Get the length of the MIDI file in seconds."""
@@ -159,7 +159,7 @@ class MidiData:
 
         # Update message_dict: scale all elapsed times
         self.tempo_factor = tempo_factor
-        self.message_dict, self.program_dict, self.pitch_df = MidiLoader.parse_midi(self.midi_file_path, tempo_factor)
+        self.message_dict, self.program_dict, self.pitch_df = MidiLoader.parse_midi(self.midi_filepath, tempo_factor)
 
         print(f"Tempo change applied. New MIDI length is {self.get_length()} seconds.")
 

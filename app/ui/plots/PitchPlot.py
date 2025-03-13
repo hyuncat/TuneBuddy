@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 import pyqtgraph as pg
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QApplication
+from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtGui import QColor
 
 from app.core.midi.MidiData import MidiData
@@ -32,13 +32,6 @@ class PitchPlot(QWidget):
         self.user_config = {
             'pitch_color': '#F57C9C',  # Pink
         }
-        # self.staff_lines = {
-        #     'E4': 64,
-        #     'G4': 67,
-        #     'B4': 71,
-        #     'D5': 74,
-        #     'F5': 77
-        # }
 
         self.current_time = 0
         self.x_range = 5
@@ -280,7 +273,7 @@ class PitchPlot(QWidget):
         self.current_time = current_time
         self.current_timeline.setPos(self.current_time)
 
-        # Set the range of the plot
+        # set the range of the plot
         x_lower = self.current_time - (self.timeline_xpos * self.x_range)
         x_upper = self.current_time + ((1 - self.timeline_xpos) * self.x_range)
         self.plot.setXRange(x_lower, x_upper)
