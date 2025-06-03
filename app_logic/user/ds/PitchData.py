@@ -1,3 +1,5 @@
+import threading
+from math import floor, ceil
 import numpy as np
 
 class PitchConfig:
@@ -22,56 +24,66 @@ class PitchConfig:
         return self.tuning * (2 ** ((midi_num - 69) / 12))
 
 class Pitch:
-    def __init__(self, time: float, frequency: float, probability: float, volume: float, config: PitchConfig):
-        """just stores the different pitch attributes"""
+    def __init__(self, time: float, candidates: list[tuple[float, float]], volume: float, config: PitchConfig):
+        """
+        The quintessential pitch object for the app.
+        ---
+        Corresponds to a given [time] in the PitchData and stores all possible 
+        pitch [candidates] = [(midi_num, prob), ...] sorted from most --> least probable    
+        as well as the volume and a reference to the settings (config) with which it was computed
+        """
         self.config = config # tuning / fmin/fmax
-
-        # essential variables
+        # -- essential variables --
         self.time = time
-        self.frequency = frequency
-        self.probability = probability
+        self.candidates = candidates # [(midi_num, prob), ...]; sorted
         self.volume = volume
-        self.midi_num = self.config.freq_to_midi(frequency)
 
 class PitchData:
-    #TODO: change to store a reference to its parent userdata to handle the pitch-getting
-    def __init__(self, pitches: list[Pitch], pitch_detector):
-        self.pitches = pitches
-        self.pitch_detector = pitch_detector
-
-    def get_pitch(self, time: float=None, rank: int=0):
+    def __init__(self, pitch_detector):
         """
-        Get a pitch from the user's pitches, based on the closest time 
-        to the one provided. Returns an error if the rank (0 > 1 > 2 > ... probability of pitch)
-        is invalid.
+        an audio data-like pitch data
+        """
+        self.pd = pitch_detector # reference to the pitchdetector object which computed it
+        self.time_to_index = lambda sec: floor(sec*(self.pd.SR / self.pd.HOP_SIZE))
         
-        Args:
-            time: The time of the pitch you want to query
-            rank: 0 for most probable, 1 for second most probable, etc.
-        """
-        sample_idx = int(time * self.pitch_detector.SAMPLE_RATE)
-        pitch_idx = round(sample_idx / self.pitch_detector.HOP_SIZE)
-        return self.pitches[pitch_idx][rank]
+        DEFAULT_LENGTH = 60 # (sec)
+        self.data: list[Pitch] = [None] * ceil(self.time_to_index(DEFAULT_LENGTH))
+        self.lock = threading.Lock()
+
+    def resize(self, resize_factor=2):
+        """increase the capacity of the current pitch array"""
+        with self.lock:
+            new_data = [None] * (len(self.data) * resize_factor)
+            self.data.extend(new_data)
+
+    def load(self, pitches: list[Pitch]):
+        """load in an entire pitch array"""
+        self.data = pitches
+
+    def write(self, pitches: list[Pitch] | Pitch, start_time: float=None):
+        """write the pitches to the data at the given time index"""
+        if isinstance(pitches, Pitch):
+            pitches = [pitches]
+        if not start_time:
+            start_time = pitches[0].time
+
+        # get indices into data array
+        i = self.time_to_index(start_time)
+        j = i+len(pitches)
+
+        if j > len(self.data)*0.8: # if close enough to end
+            self.resize()
+
+        with self.lock:
+            self.data[i:j] = pitches
+
+    def read(self, start_time: float=0, end_time: float=0) -> list[Pitch]:
+        """returns the array of pitches corresponding to start_time <--> end_time"""
+        i = self.time_to_index(start_time)
+        j = min(self.time_to_index(end_time), len(self.data)-1)
+        return self.data[i:j]
     
-    def get_pitches(self, start_time: float=0, end_time: float=None, rank: int=0):
-        """
-        Gets all the pitches from the given start to the end time.
-        Tries to get the rank of the pitch provided, but defaults to what's available.
-        (ie, not all times may have multiple pitch estimates)
-        """
-        if not end_time:
-            end_time = len(self.pitches) * self.pitch_detector.HOP_SIZE / self.pitch_detector.SAMPLE_RATE
-        
-        start_idx = round(start_time * self.pitch_detector.SAMPLE_RATE / self.pitch_detector.HOP_SIZE)
-        end_idx = round(end_time * self.pitch_detector.SAMPLE_RATE / self.pitch_detector.HOP_SIZE)
-
-        # clamp
-        start_idx = max(0, min(start_idx, len(self.pitches) - 1))
-        end_idx = max(0, min(end_idx, len(self.pitches) - 1))
-
-        pitches = self.pitches[start_idx:end_idx]
-        pitches = [
-            next((p[max(rank-k, 0)] for k in range(rank + 1) if len(p) > max(rank-k, 0)), None)
-            for i, p in enumerate(pitches) if p
-        ]
-        return pitches
+    def read_pitch(self, start_time: float=0) -> Pitch:
+        """returns the closest pitch to the start_time"""
+        i = self.time_to_index(start_time)
+        return self.data[i]

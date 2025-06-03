@@ -58,6 +58,10 @@ class PitchPlot(QWidget):
         # plot items
         self.midi_notes = []
         self.pitches = []
+        self.pitch_scatter = pg.ScatterPlotItem(
+            size=5, pen=None, brush=pg.mkBrush(0, 100, 255)
+        )
+        self.plot.addItem(self.pitch_scatter)
 
 
     def plot_timeline(self, current_time: float):
@@ -143,7 +147,7 @@ class PitchPlot(QWidget):
 
         self.pitches = pg.ScatterPlotItem(
             x=[pitch.time for pitch in pitches],
-            y=[pitch.midi_num for pitch in pitches],
+            y=[pitch.candidates[0][0] for pitch in pitches],
             size=5,
             pen=None,
             brush=brushes,
@@ -151,7 +155,13 @@ class PitchPlot(QWidget):
         )
         self.plot.addItem(self.pitches)
         print("Done!")
-    
+
+    def plot_pitch(self, pitch: Pitch):
+        self.pitch_scatter.addPoints(
+            x=[pitch.time],
+            y=[pitch.candidates[0][0]]
+        )
+        
     def move_plot(self, current_time: float):
         """move the plot to the specified time"""
         self.current_time = current_time

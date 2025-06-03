@@ -18,6 +18,7 @@ from app_logic.user.AudioPlayer import AudioPlayer
 from app_logic.midi.MidiData import MidiData
 from app_logic.midi.MidiPlayer import MidiPlayer
 
+from algorithms.PitchDetector import PitchDetector
 class RecordTab(QWidget):
     """ interface / handles ui for the recording tab
     
@@ -27,7 +28,7 @@ class RecordTab(QWidget):
 
     also handles cross-talk between settings and recording / playback
     """
-    def __init__(self, user_data: UserData, midi_data: MidiData, audio_player: AudioPlayer, audio_recorder: AudioRecorder, midi_player: MidiPlayer):
+    def __init__(self, user_data: UserData, midi_data: MidiData, audio_player: AudioPlayer, audio_recorder: AudioRecorder, midi_player: MidiPlayer, pitch_detector: PitchDetector):
         super().__init__()
         self._layout = QVBoxLayout(self)
         self.setLayout(self._layout)
@@ -38,6 +39,7 @@ class RecordTab(QWidget):
         self.midi_player = midi_player
         self.audio_player = audio_player
         self.audio_recorder = audio_recorder
+        self.pitch_detector = pitch_detector
 
         # --- UI INITIALIZATIONS ---
         # split the tab into settings / recording
@@ -63,9 +65,12 @@ class RecordTab(QWidget):
         self.splitter.setSizes([200, 700])
 
         # playback variables
-        self.is_playing = False
+        self.slider_is_moving = False
         self.user_can_play = True
-        self.user_is_playing = False
+        self.is_recording = False
+
+        # pitch detected signal
+        self.pitch_detector.pitch_detected.connect(self.on_pitch_detected)
 
 
     def init_recording_panel_ui(self):
@@ -105,7 +110,7 @@ class RecordTab(QWidget):
         self.record_button = QPushButton()
         self.record_button.setIcon(self.record_icon)
         self.record_button.setFixedSize(QSize(26, 26))
-        # self.record_button.clicked.connect(self.toggle_recording)
+        self.record_button.clicked.connect(self.toggle_recording)
         self.slider_layout.addWidget(self.record_button)
 
         # init the slider!
@@ -145,11 +150,11 @@ class RecordTab(QWidget):
     def pyin_settings_changed(self, value, type: str):
         """called whenever we detect the pyin settings in the settings_panel have changed"""
         if type == "fmin":
-            self.pyinner.re_init(f0_min=value)
+            self.pitch_detector.re_init(f0_min=value)
         elif type == "fmax":
-            self.pyinner.re_init(f0_max=value)
+            self.pitch_detector.re_init(f0_max=value)
         elif type == "tuning":
-            self.pyinner.re_init(tuning=value)
+            self.pitch_detector.re_init(tuning=value)
         else:
             logging.error("invalid pyin setting type (how did this happen lol?)")
 
@@ -159,32 +164,71 @@ class RecordTab(QWidget):
 
     def handle_slider_end(self):
         """make sure slider ends gracefully"""
-        if self.is_playing:
+        if self.slider_is_moving:
             self.toggle_playback()
 
     def toggle_playback(self):
         current_time = self.slider.get_time()
 
-        if not self.is_playing:
+        if not self.slider_is_moving:
             self.slider.start_timer()
-            self.is_playing = True
+            self.slider_is_moving = True
 
-            if self.midi_data is not None:
+            if self.is_recording:
+                # pause everything else just in case
+                if self.midi_player.midi_data:
+                    self.midi_player.pause()
+                if self.audio_player.audio_data:
+                    self.audio_player.pause()
+
+                self.slider_is_moving = False
+                self.is_recording = False
+                # run the pitch detection stuff
+                self.pitch_detector.run(self.user_data, self.slider.get_time())
+
+            if self.midi_data is not None and not self.is_recording:
                 self.midi_player.play(start_time=current_time)
-            if self.user_can_play:
+
+            if self.user_can_play and not self.is_recording:
                 self.audio_player.play(start_time=current_time)
-                self.user_is_playing = True
+            
             else:
                 self.audio_player.pause()
 
         else:
             self.slider.stop_timer()
             self.midi_player.pause()
-            self.is_playing = False
-            self.user_is_playing = False
+            self.slider_is_moving = False
+            self.is_recording = False
 
             # just always pause just in case
             self.audio_player.pause()
+    
+    def toggle_recording(self):
+        current_time = self.slider.get_time()
+
+        if not self.slider_is_moving:
+            self.slider.start_timer()
+            self.slider_is_moving = True
+            self.recording = True
+
+            # pause everything else just in case
+            if self.midi_player.midi_data:
+                self.midi_player.pause()
+            if self.audio_player.audio_data:
+                self.audio_player.pause()
+
+            # run the pitch detection stuff
+            print(f"starting recording at {current_time}")
+            self.audio_recorder.run(current_time)
+            self.pitch_detector.run(current_time)
+            
+        else:
+            self.slider.stop_timer()
+            self.audio_recorder.stop()
+            self.pitch_detector.stop()
+            self.slider_is_moving = False
+            self.is_recording = False
 
     def load_midi(self, midi_data: MidiData):
         self.midi_data = midi_data
@@ -195,5 +239,10 @@ class RecordTab(QWidget):
     def load_audio(self, user_data: UserData):
         self.user_data = user_data
         self.audio_player.load_audio(user_data.audio_data)
-        pitch_line = [p[0] for p in self.user_data.pitch_data]
-        self.pitch_plot.plot_pitches(pitch_line, from_scratch=True)
+        # pitch_line = [p[0] for p in self.user_data.pitch_data]
+        self.pitch_plot.plot_pitches(self.user_data.pitch_data, from_scratch=True)
+
+    def on_pitch_detected(self, pitch_time: float):
+        """plots the newly detected pitch onto pitchplot"""
+        pitch = self.user_data.pitch_data.read_pitch(pitch_time)
+        self.pitch_plot.plot_pitch(pitch)

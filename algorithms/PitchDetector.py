@@ -1,16 +1,20 @@
 import numpy as np
 from scipy.signal import find_peaks, iirfilter, sosfilt
 from scipy.stats import beta
-from numba import njit
+import threading
 from app_logic.user.ds.PitchData import PitchConfig, Pitch
+from app_logic.user.ds.UserData import UserData
 
+from PyQt6.QtCore import QObject, pyqtSignal
 
-class PitchDetector:
-    def __init__(self, pitch_config: PitchConfig=PitchConfig(), sr: int=44100):
+class PitchDetector(QObject):
+    pitch_detected = pyqtSignal(float) # returns the index of the pitch into PitchData
+    def __init__(self, pitch_config: PitchConfig=PitchConfig(), sr: int=44100, parent: QObject|None=None):
         """
         Initialize the pitch detection parameters, like the tuning, frequency range, etc.
         Best to make it as specific as possible to your desired use case to improve accuracy of the detection.
         """
+        super().__init__(parent)
         self.SR = sr # for sample-to-frequency conversion
 
         # --- pitch config variables ---
@@ -29,14 +33,53 @@ class PitchDetector:
         self.FRAME_SIZE = 4096
         self.HOP_SIZE = 128
 
+        # threading variables
+        self.pda_thread: threading.Thread = None
+        self.stop_event = threading.Event()
+
+    def init_user_data(self, user_data: UserData):
+        self.user_data = user_data
+
+    def run(self, start_time: float=None):
+        """keep trying to detect pitches while we can"""
+        self.stop()
+        self.stop_event.clear()
+        self.user_data.a2p_queue.init_start_time(start_time)
+        self.pda_thread = threading.Thread(
+            target=self._run, daemon=True
+        )
+        self.pda_thread.start()
+    
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                x = self.user_data.a2p_queue.pop(self.FRAME_SIZE, self.HOP_SIZE)
+
+                if x is None: # returns none if not enough to detect
+                    self.stop_event.wait(0.002)
+                    continue
+                x, t = x[0], x[1]
+                pitch = self.detect_pitch(x, t)
+                self.user_data.pitch_data.write(pitch, t)
+                print(f'detected pitch @ {pitch.time}, midi_num: {pitch.candidates[0][0]}')
+                self.pitch_detected.emit(pitch.time)
+            except Exception as e:
+                print(f"[PitchDetector] frame skipped due to error: {e}")
+                continue
+
+    def stop(self):
+        if self.pda_thread and self.pda_thread.is_alive():
+            self.stop_event.set()
+            self.pda_thread.join() # pause the main thread until recording thread recognizes the stop event
+
     
     # THE DETECTION ALGORITHM
-    def detect_pitch(self, x: np.ndarray, start_time: float=None) -> list[Pitch]:
+    def detect_pitch(self, x: np.ndarray, start_time: float=None) -> Pitch:
         """a method to call pitch detection on a single frame
         requires an explicit reference to the start time
 
         Args:
-            x: the x of audio to perform pitch detection on
+            x: the array of audio to perform pitch detection on
             start_time: for when we run on longer audio and keeping track of the frame
         """
         # preprocess audio to center and get rid of low frequency noise
@@ -52,17 +95,18 @@ class PitchDetector:
 
         # interpolate + compute final freq estimates
         freq_estimates = [self.SR/self.parabolic_interpolation(acf, t) for t in acf_peaks]
+        midi_estimates = [self.pitch_config.freq_to_midi(f) for f in freq_estimates]
         volume = np.sqrt(np.mean(x ** 2))  # get volume as mean |amplitude| of the x
 
-        # create + return our final pitch objects
-        pitches = []
-        for freq, prob in zip(freq_estimates, pitch_probs):
-            pitch = Pitch(time=start_time, frequency=freq, probability=prob, volume=volume, config=self.pitch_config)
-            pitches.append(pitch)
-        pitches.sort(key=lambda p: p.probability, reverse=True)
-        return pitches #, acf_peaks, acf, cdf
+        # create + return the final pitch object
+        candidates = list(zip(midi_estimates, pitch_probs))
+        candidates.sort(key=lambda c: c[1], reverse=True) # sort from most to least probable
+        pitch = Pitch(time=start_time, candidates=candidates, 
+                      volume=volume, config=self.pitch_config)
+        return pitch
 
-    def detect_pitches(self, x: np.ndarray) -> list[list[Pitch]]:
+
+    def detect_pitches(self, x: np.ndarray) -> list[Pitch]:
         """
         Computes multi-frame pitch detection on an arbitrary length array of audio data.
         Returns a nested list of pitches, each corresponding to the freq estimates (probabilistic)
@@ -73,17 +117,18 @@ class PitchDetector:
         n_frames = 1 + (len(x) - self.FRAME_SIZE) // self.HOP_SIZE 
 
         pitches = []
-        # most_likely_pitches = []
 
         for i, frame in enumerate(frames):
             print(f"\rProcessing frame {i+1}/{n_frames}", end='')
 
             start_time = (i*self.HOP_SIZE)/self.SR # elapsed time of the frame
-            current_pitches = self.detect_pitch(frame, start_time)
-            pitches.append(current_pitches)
+            pitch = self.detect_pitch(frame, start_time)
+            pitches.append(pitch)
             
         print('\nDone!')
         return pitches
+
+
 
     # METHODS TO IMPLEMENT THE ALGORITHM
     # ---
@@ -205,6 +250,13 @@ class PitchDetector:
             acf_peaks, _ = find_peaks(acf, prominence=p)
             if len(acf_peaks) > 0:
                 break
+
+        # fallback if still empty
+        if acf_peaks.size == 0:
+            # look for the global ACF max in [tau_min, tau_max)
+            region = acf[self.tau_min : self.tau_max]
+            best = np.argmax(region) + self.tau_min
+            acf_peaks = np.array([best], dtype=int)
 
         return acf_peaks
 
@@ -331,12 +383,13 @@ class PitchDetector:
         x = sosfilt(sos, x)
         return x
 
-    def preprocess_audio(self, x: np.ndarray, iir_cutoff_freq: float=150):
+    def preprocess_audio(self, x: list, iir_cutoff_freq: float=150):
         """
         centers the audio around mean, normalizes, 
         and applies high pass iir filter to prepare for pitch detection
         """
-        x = x.astype(float)
+        x = np.asarray(x, dtype=float)
+        # x = x.astype(float)
         x = x - np.mean(x)
         x = x/np.max(np.abs(x))
         x = self.high_pass_iir_filter(x, iir_cutoff_freq)
