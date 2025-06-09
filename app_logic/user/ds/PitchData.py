@@ -24,7 +24,7 @@ class PitchConfig:
         return self.tuning * (2 ** ((midi_num - 69) / 12))
 
 class Pitch:
-    def __init__(self, time: float, candidates: list[tuple[float, float]], volume: float, config: PitchConfig):
+    def __init__(self, time: float, candidates: list[tuple[float, float]], volume: float, unvoiced_prob: float, config: PitchConfig):
         """
         The quintessential pitch object for the app.
         ---
@@ -37,6 +37,7 @@ class Pitch:
         self.time = time
         self.candidates = candidates # [(midi_num, prob), ...]; sorted
         self.volume = volume
+        self.unvoiced_prob = unvoiced_prob
 
 class PitchData:
     def __init__(self, pitch_detector):
@@ -60,7 +61,7 @@ class PitchData:
         """load in an entire pitch array"""
         self.data = pitches
 
-    def write(self, pitches: list[Pitch] | Pitch, start_time: float=None):
+    def write(self, pitches: list[Pitch] | Pitch, start_time: float=0):
         """write the pitches to the data at the given time index"""
         if isinstance(pitches, Pitch):
             pitches = [pitches]

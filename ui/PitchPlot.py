@@ -1,29 +1,34 @@
 from PyQt6.QtGui import QColor
+from PyQt6.QtCore import QRectF
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 import pyqtgraph as pg
+import json
 
 from app_logic.midi.MidiData import MidiData
 from app_logic.user.ds.PitchData import Pitch
+from app_logic.NoteData import NoteData, Note
 
 class PitchPlot(QWidget):
-    def __init__(self):
+    def __init__(self, clef: str="treble"):
         super().__init__()
 
         self.current_time = 0
         self.window_time = 0
         self.x_range = (-1, 4)
         self.y_range = (40, 90)
+        self.clef = clef
 
         self.colors = {
-            'background': '#1D1D1D',    # dark gray
-            'label_text': '#A4A4A4',    # black
+            'background': "#ffffff",    # dark gray
+            'label_text': '#454444',    # black
+            'staff_lines': '#C4C4C4',   # grey
             'timeline': '#FF0000',      # red
             'pitch': '#F57C9C'          # pink
         }
 
         self.midi_config = {
-            'normal_color': '#53555C',  # Grey
-            'played_color': '#3A3B40',  # Darker grey
+            'normal_color': '#53555C',  # grey
+            'played_color': '#3A3B40',  # darker grey
             'bar_height': 1
         }
 
@@ -52,17 +57,44 @@ class PitchPlot(QWidget):
         self.plot.setXRange(self.x_range[0], self.x_range[1])
         self.plot.setYRange(self.y_range[0], self.y_range[1])
 
-        # add our timeline
+        # add our staff+timeline
+        self.plot_staff_lines(clef)
         self.plot_timeline(self.current_time)
 
         # plot items
         self.midi_notes = []
         self.pitches = []
+        self.user_notes = []
         self.pitch_scatter = pg.ScatterPlotItem(
             size=5, pen=None, brush=pg.mkBrush(0, 100, 255)
         )
         self.plot.addItem(self.pitch_scatter)
 
+
+    def plot_staff_lines(self, clef: str="treble"):
+        """plots the staff lines as according to the given clef"""
+        with open('resources/staff_lines.json', 'r') as file:
+            data = json.load(file)
+
+        staff_lines = data['clefs'][clef]['staff_lines']
+
+        self.staff_lines = []
+        for line in staff_lines:
+            y = line['midi']
+            # name = line['note']
+            line = pg.InfiniteLine(
+                pos=y,
+                angle=0,
+                pen=self.colors['staff_lines'],
+                # label=name,
+                # labelOpts={
+                #     'position': 0.1,        # left end of the line
+                #     'anchor': (1, 0.5),     # right-aligned, vertically centered
+                #     'color': self.colors['staff_lines']
+                # }
+            )
+            self.staff_lines.append(line)
+            self.plot.addItem(line)
 
     def plot_timeline(self, current_time: float):
         """plots a thin red line at the specified time"""
@@ -112,45 +144,43 @@ class PitchPlot(QWidget):
 
         # clear other pitches
         if from_scratch:
-            for pitch in self.pitches:
-                self.plot.removeItem(pitch)
-            self.pitches = []
+            self.clear_plot()
 
         # normalize volumes (min-max normalization)
-        volumes = [pitch.volume for pitch in pitches]
-        min_vol = min(volumes)
-        max_vol = max(volumes)
+        # volumes = [pitch.volume for pitch in pitches]
+        # min_vol = min(volumes)
+        # max_vol = max(volumes)
         
-        # avoid division by zero in case all volumes are the same
-        if max_vol == min_vol:
-            normalized_volumes = [0.5] * len(pitches)
-        else:
-            normalized_volumes = [(v-min_vol) / (max_vol-min_vol) for v in volumes]
+        # # avoid division by zero in case all volumes are the same
+        # if max_vol == min_vol:
+        #     normalized_volumes = [0.5] * len(pitches)
+        # else:
+        #     normalized_volumes = [(v-min_vol) / (max_vol-min_vol) for v in volumes]
 
-        brushes = []
-        for i, pitch in enumerate(pitches):
-            volume = normalized_volumes[i]
+        # brushes = []
+        # for i, pitch in enumerate(pitches):
+            # volume = normalized_volumes[i]
 
             # convert volume to hue:
             # 0 -> blue (HSV hue ~240), 0.5 -> yellow (HSV hue ~60) 1 -> red (HSV hue ~0)
-            if volume < 0.5:
-                hue = 240 - (240-180) * (volume/0.5)  # blue to yellow
-            else:
-                hue = 180 - (180 - 0) * ((volume-0.5) / 0.5)  # yellow to red
+            # if volume < 0.5:
+            #     hue = 240 - (240-180) * (volume/0.5)  # blue to yellow
+            # else:
+            #     hue = 180 - (180 - 0) * ((volume-0.5) / 0.5)  # yellow to red
 
             # QColor uses HSV (hue, saturation, value)
-            color = QColor.fromHsv(int(hue), 255, 255) 
+            # color = QColor.fromHsv(int(hue), 255, 255) 
 
             # set opacity based on pitch probability
-            color.setAlphaF(1)  # opacity (alpha) based on pitch probability (0 to 1)
-            brushes.append(pg.mkBrush(color))  # Use mkBrush to create the brush with color
+            # color.setAlphaF(1)  # opacity (alpha) based on pitch probability (0 to 1)
+            # brushes.append(pg.mkBrush(color))  # Use mkBrush to create the brush with color
 
         self.pitches = pg.ScatterPlotItem(
             x=[pitch.time for pitch in pitches],
             y=[pitch.candidates[0][0] for pitch in pitches],
             size=5,
             pen=None,
-            brush=brushes,
+            brush=self.colors['pitch'],
             name='Pitch'
         )
         self.plot.addItem(self.pitches)
@@ -161,6 +191,54 @@ class PitchPlot(QWidget):
             x=[pitch.time],
             y=[pitch.candidates[0][0]]
         )
+
+    def clear_plot(self):
+        """clears user stuff - pitches, notes - from plot"""
+        for pitch in self.pitches:
+            self.plot.removeItem(pitch)
+        self.pitches = []
+        for note in self.user_notes:
+            self.plot.removeItem(note)
+        self.user_notes = []
+
+    def plot_notes(self, note_data: NoteData, from_scratch: bool=False):
+        """plotting the notes in a note data as lines"""
+        if from_scratch:
+            self.clear_plot()
+
+        bar_h = self.midi_config["bar_height"]  # e.g. 0.8 or 1.0
+
+        for note in note_data.data.values():
+            x0 = note.start_time
+            w  = note.end_time - note.start_time
+            y0 = note.midi_num - bar_h / 2
+            h  = bar_h
+
+            rect = pg.QtWidgets.QGraphicsRectItem(QRectF(x0, y0, w, h))
+            rect.setPen   (pg.mkPen(None))                    # no outline
+            rect.setBrush (pg.mkBrush(self.colors["staff_lines"]))  # your chosen color
+
+            self.plot.addItem(rect)
+            self.user_notes.append(rect)
+
+    def plot_note(self, note: Note, from_scratch: bool=False):
+        """plotting the note in a note data as lines"""
+        if from_scratch:
+            self.clear_plot()
+
+        bar_h = self.midi_config["bar_height"]  # e.g. 0.8 or 1.0
+
+        x0 = note.start_time
+        w  = note.end_time - note.start_time
+        y0 = note.midi_num - bar_h / 2
+        h  = bar_h
+
+        rect = pg.QtWidgets.QGraphicsRectItem(QRectF(x0, y0, w, h))
+        rect.setPen   (pg.mkPen(None))                    # no outline
+        rect.setBrush (pg.mkBrush(self.colors["staff_lines"]))  # your chosen color
+
+        self.plot.addItem(rect)
+        self.user_notes.append(rect)
         
     def move_plot(self, current_time: float):
         """move the plot to the specified time"""

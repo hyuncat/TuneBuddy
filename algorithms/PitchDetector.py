@@ -60,8 +60,8 @@ class PitchDetector(QObject):
                     continue
                 x, t = x[0], x[1]
                 pitch = self.detect_pitch(x, t)
-                self.user_data.pitch_data.write(pitch, t)
-                print(f'detected pitch @ {pitch.time}, midi_num: {pitch.candidates[0][0]}')
+                self.user_data.write_pitch_data([pitch], t)
+                print(f'detected pitch @ {pitch.time}, midi_num: {pitch.candidates[0][0]}, unvoiced_prob: {pitch.unvoiced_prob}')
                 self.pitch_detected.emit(pitch.time)
             except Exception as e:
                 print(f"[PitchDetector] frame skipped due to error: {e}")
@@ -102,7 +102,7 @@ class PitchDetector(QObject):
         candidates = list(zip(midi_estimates, pitch_probs))
         candidates.sort(key=lambda c: c[1], reverse=True) # sort from most to least probable
         pitch = Pitch(time=start_time, candidates=candidates, 
-                      volume=volume, config=self.pitch_config)
+                      volume=volume, unvoiced_prob=unvoiced_prob, config=self.pitch_config)
         return pitch
 
 
@@ -118,6 +118,7 @@ class PitchDetector(QObject):
 
         pitches = []
 
+        print("Starting pitch detection...")
         for i, frame in enumerate(frames):
             print(f"\rProcessing frame {i+1}/{n_frames}", end='')
 

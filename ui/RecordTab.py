@@ -2,7 +2,7 @@ import os
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QPushButton
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel, QPushButton, QSizePolicy
 )
 import logging
 
@@ -19,6 +19,7 @@ from app_logic.midi.MidiData import MidiData
 from app_logic.midi.MidiPlayer import MidiPlayer
 
 from algorithms.PitchDetector import PitchDetector
+from algorithms.NoteDetector import NoteDetector
 class RecordTab(QWidget):
     """ interface / handles ui for the recording tab
     
@@ -28,7 +29,9 @@ class RecordTab(QWidget):
 
     also handles cross-talk between settings and recording / playback
     """
-    def __init__(self, user_data: UserData, midi_data: MidiData, audio_player: AudioPlayer, audio_recorder: AudioRecorder, midi_player: MidiPlayer, pitch_detector: PitchDetector):
+    def __init__(self, user_data: UserData, midi_data: MidiData, audio_player: 
+                 AudioPlayer, audio_recorder: AudioRecorder, midi_player: MidiPlayer, 
+                 pitch_detector: PitchDetector, note_detector: NoteDetector):
         super().__init__()
         self._layout = QVBoxLayout(self)
         self.setLayout(self._layout)
@@ -40,6 +43,7 @@ class RecordTab(QWidget):
         self.audio_player = audio_player
         self.audio_recorder = audio_recorder
         self.pitch_detector = pitch_detector
+        self.note_detector = note_detector
 
         # --- UI INITIALIZATIONS ---
         # split the tab into settings / recording
@@ -71,6 +75,8 @@ class RecordTab(QWidget):
 
         # pitch detected signal
         self.pitch_detector.pitch_detected.connect(self.on_pitch_detected)
+        self.note_detector.note_detected.connect(self.on_note_detected)
+        self.SENSITIVITY = 0.9 # higher = more sensitive pitch detection
 
 
     def init_recording_panel_ui(self):
@@ -80,10 +86,10 @@ class RecordTab(QWidget):
 
         # title
         self.recording_layout.addWidget(QLabel("Record"))
-        self.recording_layout.addStretch()
 
         # pitch plot
         self.pitch_plot = PitchPlot()
+        self.pitch_plot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.recording_layout.addWidget(self.pitch_plot)
 
         # the playback layout
@@ -91,9 +97,9 @@ class RecordTab(QWidget):
 
         # get the play/pause button icons
         app_directory = os.path.dirname(os.path.dirname(__file__)) # directory one level higher than this (root)
-        play_filepath = os.path.join(app_directory, 'resources', 'icons', 'play.png')
-        pause_filepath = os.path.join(app_directory, 'resources', 'icons', 'pause.png')
-        record_filepath = os.path.join(app_directory, 'resources', 'icons', 'record.png')
+        play_filepath = os.path.join(app_directory, 'resources', 'icons', 'play2.png')
+        pause_filepath = os.path.join(app_directory, 'resources', 'icons', 'pause2.png')
+        record_filepath = os.path.join(app_directory, 'resources', 'icons', 'record2.png')
 
         self.play_icon = QIcon(play_filepath)
         self.pause_icon = QIcon(pause_filepath)
@@ -222,13 +228,18 @@ class RecordTab(QWidget):
             print(f"starting recording at {current_time}")
             self.audio_recorder.run(current_time)
             self.pitch_detector.run(current_time)
+            self.note_detector.run(current_time)
             
         else:
             self.slider.stop_timer()
             self.audio_recorder.stop()
             self.pitch_detector.stop()
+            self.note_detector.stop()
             self.slider_is_moving = False
             self.is_recording = False
+
+            nd = self.note_detector.detect_notes(self.user_data.pitch_data.data)
+            self.pitch_plot.plot_notes(nd, from_scratch=False)
 
     def load_midi(self, midi_data: MidiData):
         self.midi_data = midi_data
@@ -240,9 +251,18 @@ class RecordTab(QWidget):
         self.user_data = user_data
         self.audio_player.load_audio(user_data.audio_data)
         # pitch_line = [p[0] for p in self.user_data.pitch_data]
-        self.pitch_plot.plot_pitches(self.user_data.pitch_data, from_scratch=True)
+        self.pitch_plot.plot_notes(self.user_data.note_data, from_scratch=True)
+        self.pitch_plot.plot_pitches(self.user_data.pitch_data.data, from_scratch=False)
 
     def on_pitch_detected(self, pitch_time: float):
         """plots the newly detected pitch onto pitchplot"""
         pitch = self.user_data.pitch_data.read_pitch(pitch_time)
-        self.pitch_plot.plot_pitch(pitch)
+
+        if pitch.unvoiced_prob < self.SENSITIVITY:
+            self.pitch_plot.plot_pitch(pitch)
+
+    def on_note_detected(self, note_time: float):
+        """plots the newly detected pitch onto pitchplot"""
+        note = self.user_data.note_data.read_note(note_time)
+        print(f"plotting note: {note.midi_num} @ {note.start_time}")
+        self.pitch_plot.plot_note(note, from_scratch=False)

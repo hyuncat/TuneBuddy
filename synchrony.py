@@ -14,6 +14,7 @@ from app_logic.midi.MidiSynth import MidiSynth
 from app_logic.midi.MidiPlayer import MidiPlayer
 
 from algorithms.PitchDetector import PitchDetector
+from algorithms.NoteDetector import NoteDetector
 
 # ui imports
 from ui.Toolbar import Toolbar
@@ -21,12 +22,14 @@ from ui.RecordTab import RecordTab
 
 class Synchrony(QMainWindow):
     def __init__(self):
-        # pitch detector
+        # algorithms
         self.pitch_detector: PitchDetector = PitchDetector()
+        self.note_detector: NoteDetector = NoteDetector()
 
         # user / midi data
-        self.user_data = UserData(self.pitch_detector)
+        self.user_data = UserData(self.pitch_detector, self.note_detector)
         self.pitch_detector.init_user_data(self.user_data)
+        self.note_detector.init_user_data(self.user_data)
         self.midi_data = None
 
         # important midi playback things
@@ -48,7 +51,7 @@ class Synchrony(QMainWindow):
         # the main window atop which everything is drawn upon
         super().__init__() # init the mainwindow it inherits from
         self.setWindowTitle("Synchrony")
-        app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
+        # app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
         self.setGeometry(100, 100, 800, 600)
 
         # central widget for everything
@@ -61,7 +64,9 @@ class Synchrony(QMainWindow):
         self._layout.addWidget(self.tab_manager)
 
         # record tab
-        self.record_tab = RecordTab(self.user_data, self.midi_data, self.audio_player, self.audio_recorder, self.midi_player, self.pitch_detector)
+        self.record_tab = RecordTab(self.user_data, self.midi_data, 
+                                    self.audio_player, self.audio_recorder, self.midi_player, 
+                                    self.pitch_detector, self.note_detector)
         self.tab_manager.addTab(self.record_tab, "Record")
         self.analyze_tab = QWidget()
         self.tab_manager.addTab(self.analyze_tab, "Analyze")
