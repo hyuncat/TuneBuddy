@@ -1,4 +1,4 @@
-## TuneBuddy (/ Attune? Name in progress...)
+## Attune
 To download the code on your machine, pull the repository and run the following commands:
 
 Install the required packages:
