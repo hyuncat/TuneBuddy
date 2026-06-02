@@ -210,6 +210,7 @@ class Attune(QMainWindow):
         self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
         self.mistake_widget.selected.connect(self.on_mistake_selected)
         self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
+        self.settings_dialog.settings_panel.settings_applied.connect(self.on_settings_applied)
 
         # settings dialog signals
 
@@ -380,6 +381,33 @@ class Attune(QMainWindow):
         self.user_playback_enabled = checked
         if not checked:
             self.audio_player.pause()
+
+    def on_settings_applied(self, settings: dict):
+        new_bpm = int(settings.get("tempo", self.score_data.bpm))
+
+        #update bpm from input
+        if not self.is_playing and new_bpm != self.score_data.bpm:
+            self.score_data.change_tempo(new_bpm)
+            self.toolbar.tempo_spinbox.setValue(new_bpm)
+            self.guitar_hero.update_view_items()
+            self.score_viewer.load_score(self.score_data)
+            self.slider.update_range(score_data=self.score_data, recording=self.active_recording)
+
+        #playback settings
+        self.user_playback_enabled = settings.get("user_playback", self.user_playback_enabled)
+        if not self.user_playback_enabled:
+            self.audio_player.pause()
+
+        active_channels = settings.get("active_channels")
+        if active_channels is not None:
+            self.score_data.playing_instruments = set(active_channels)
+            
+        if self.active_recording is not None:
+            cfg = self.active_recording.config
+            cfg.fmin = settings.get("fmin", cfg.fmin)
+            cfg.fmax = settings.get("fmax", cfg.fmax)
+            cfg.tuning = settings.get("tuning", cfg.tuning)
+            self.active_recording.pitch_detector.load_config(cfg)
 
     def on_tempo_changed(self, new_bpm: int):
         """Called when user changes the tempo in the toolbar. Update the score data and 
