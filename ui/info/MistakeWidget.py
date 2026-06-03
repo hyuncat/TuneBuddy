@@ -13,6 +13,16 @@ def _midi_to_name(midi_num: float) -> str:
     n = int(round(midi_num))
     return f"{_NOTE_NAMES[n % 12]}{n // 12 - 1}"
 
+#converts number of seconds to a well-formatted time to display to the user in the mistake widget
+def _format_time(seconds: float) -> str:
+    #Convert seconds to decimal notation if under a minute, MM:SS for over a minute.
+    if seconds < 60:
+        return f"{seconds:.2f}"
+    else:
+        minutes = int(seconds) // 60
+        secs = int(seconds) % 60
+        return f"{minutes}:{secs:02d}"
+
 
 class MistakeWidget(QWidget):
     """
@@ -41,12 +51,12 @@ class MistakeWidget(QWidget):
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(6)
-        self.tree.setHeaderLabels(["#", "Pair", "Type", "Intended", "Actual", ""])
+        self.tree.setHeaderLabels(["#", "Time", "Type", "Intended", "Actual", ""])
         self.tree.setIndentation(0)
         self.tree.setRootIsDecorated(False)
 
         self.tree.setColumnWidth(0, 30)
-        self.tree.setColumnWidth(1, 36)
+        self.tree.setColumnWidth(1, 50)
         self.tree.setColumnWidth(2, 54)
         self.tree.setColumnWidth(3, 60)
         self.tree.setColumnWidth(4, 60)
@@ -101,12 +111,13 @@ class MistakeWidget(QWidget):
         return _midi_to_name(val)
 
     def _make_item(self, idx: int, mistake: Mistake) -> QTreeWidgetItem:
-        pair = str(mistake.pair_index) if mistake.pair_index >= 0 else "—"
+        #time is based on the MIDI Note rather than the user note
+        time = _format_time(mistake.midi_note.start_time) if mistake.midi_note else "—"
         intended = self._note_name(mistake.midi_note)
         actual = self._note_name(mistake.user_note)
         type_label = self._TYPE_ABBREV.get(mistake.type, mistake.type)
 
-        item = QTreeWidgetItem([str(idx), pair, type_label, intended, actual, ""])
+        item = QTreeWidgetItem([str(idx), time, type_label, intended, actual, ""])
         item.setData(0, Qt.ItemDataRole.UserRole, idx)
         for col in range(5):
             item.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
