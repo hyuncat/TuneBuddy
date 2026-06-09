@@ -1,17 +1,10 @@
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem, QPushButton,
+    QWidget, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
 )
 from app_logic.Alignment import Mistake
 
-
-_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-
-
-def _midi_to_name(midi_num: float) -> str:
-    """Convert a MIDI number to a letter name like C4 or F#3."""
-    n = int(round(midi_num))
-    return f"{_NOTE_NAMES[n % 12]}{n // 12 - 1}"
 
 
 class MistakeWidget(QWidget):
@@ -19,9 +12,16 @@ class MistakeWidget(QWidget):
     Right-side panel listing all analyzed mistakes for the active recording.
 
     Columns: Index | Pair | Type | Intended | Actual | Override
+
+    The Override column is rendered as plain cell text (rather than an
+    embedded QPushButton per row) and the cell click is captured via the
+    tree's itemClicked signal. This avoids the macOS-specific GPU pressure
+    of creating N native widgets when there are many mistakes — which on
+    long pieces was starving the QtWebEngine GPU process and causing
+    segfaults on resize/repaint.
     """
     selected = pyqtSignal(int)         # emits mistake index on row click
-    override_toggled = pyqtSignal(int) # emits mistake index when Override is clicked
+    override_toggled = pyqtSignal(int) # emits mistake index when Override cell is clicked
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,7 +29,7 @@ class MistakeWidget(QWidget):
         self._layout.setContentsMargins(6, 6, 6, 6)
 
         self._mistakes: list[Mistake] = []
-        self._override_buttons: dict[int, QPushButton] = {}
+        self._OVERRIDE_COL = 5
 
         self.init_ui()
         self.init_signals()
@@ -41,7 +41,7 @@ class MistakeWidget(QWidget):
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(6)
-        self.tree.setHeaderLabels(["#", "Pair", "Type", "Intended", "Actual", ""])
+        self.tree.setHeaderLabels(["#", "Pair", "Type", "Intended", "Actual", "Override"])
         self.tree.setIndentation(0)
         self.tree.setRootIsDecorated(False)
 
@@ -50,7 +50,7 @@ class MistakeWidget(QWidget):
         self.tree.setColumnWidth(2, 54)
         self.tree.setColumnWidth(3, 60)
         self.tree.setColumnWidth(4, 60)
-        self.tree.setColumnWidth(5, 72)
+        self.tree.setColumnWidth(5, 90)
 
         self._layout.addWidget(self.tree)
 
@@ -59,46 +59,44 @@ class MistakeWidget(QWidget):
 
     def init_signals(self):
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
+        self.tree.itemClicked.connect(self._on_item_clicked)
 
     # --- PUBLIC API ---
-
     def load_mistakes(self, mistakes: list[Mistake]):
         """Populate the tree with a new list of mistakes."""
         self._mistakes = mistakes
-        self._override_buttons = {}
         self.tree.clear()
-        for idx, mistake in enumerate(mistakes):
-            item = self._make_item(idx, mistake)
-            self.tree.addTopLevelItem(item)
-            btn = self._make_override_button(idx, mistake)
-            self.tree.setItemWidget(item, 5, btn)
-            self._override_buttons[idx] = btn
+        # Batch the inserts: addTopLevelItems is much cheaper than N calls
+        # to addTopLevelItem when the model is being watched.
+        items = [self._make_item(idx, m) for idx, m in enumerate(mistakes)]
+        self.tree.addTopLevelItems(items)
 
     def clear(self):
         self._mistakes = []
-        self._override_buttons = {}
         self.tree.clear()
 
     def refresh_override(self, idx: int):
-        """Update the override button appearance for a single mistake."""
-        btn = self._override_buttons.get(idx)
-        if btn is None or idx >= len(self._mistakes):
+        """Update the override-cell appearance for a single mistake."""
+        if not (0 <= idx < len(self._mistakes)):
             return
-        overridden = self._mistakes[idx].is_overridden()
-        btn.setText("Overridden" if overridden else "Override")
-        btn.setStyleSheet("color: #888;" if overridden else "")
+        item = self.tree.topLevelItem(idx)
+        if item is None:
+            return
+        self._set_override_cell(item, self._mistakes[idx].is_overridden())
 
     # --- INTERNAL ---
-
     _TYPE_ABBREV = {"insertion": "INS", "deletion": "DEL", "substitution": "SUB"}
+    _GREY = QColor("#888888")
+    # default foreground for the Override cell — readable on the qdarktheme
+    # dark background. (Qt's "default" foreground from QColor() resolves to
+    # black, which disappears against the dark theme.)
+    _WHITE = QColor("#ffffff")
 
     @staticmethod
     def _note_name(note) -> str:
         if note is None:
             return "—"
-        midi = note.midi_num
-        val = midi[0] if isinstance(midi, (list, tuple)) and len(midi) > 0 else midi
-        return _midi_to_name(val)
+        return note.get_note_name()
 
     def _make_item(self, idx: int, mistake: Mistake) -> QTreeWidgetItem:
         pair = str(mistake.pair_index) if mistake.pair_index >= 0 else "—"
@@ -108,17 +106,14 @@ class MistakeWidget(QWidget):
 
         item = QTreeWidgetItem([str(idx), pair, type_label, intended, actual, ""])
         item.setData(0, Qt.ItemDataRole.UserRole, idx)
-        for col in range(5):
+        for col in range(6):
             item.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
+        self._set_override_cell(item, mistake.is_overridden())
         return item
 
-    def _make_override_button(self, idx: int, mistake: Mistake) -> QPushButton:
-        overridden = mistake.is_overridden()
-        btn = QPushButton("Overridden" if overridden else "Override")
-        if overridden:
-            btn.setStyleSheet("color: #888;")
-        btn.clicked.connect(lambda: self.override_toggled.emit(idx))
-        return btn
+    def _set_override_cell(self, item: QTreeWidgetItem, overridden: bool):
+        item.setText(self._OVERRIDE_COL, "Overridden" if overridden else "Override")
+        item.setForeground(self._OVERRIDE_COL, self._GREY if overridden else self._WHITE)
 
     def _on_selection_changed(self):
         item = self.tree.currentItem()
@@ -127,3 +122,10 @@ class MistakeWidget(QWidget):
         idx = item.data(0, Qt.ItemDataRole.UserRole)
         if idx is not None:
             self.selected.emit(idx)
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, column: int):
+        if column != self._OVERRIDE_COL:
+            return
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if idx is not None:
+            self.override_toggled.emit(idx)
