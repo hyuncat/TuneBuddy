@@ -1,8 +1,20 @@
 import os
+# Force QtWebEngine's Chromium GPU process to use software rasterization. On
+# macOS, the embedded WebEngine, pyqtgraph, and Qt's native compositor all
+# share the same Metal memory pool, and a busy splitter (e.g. lots of rows
+# with QTreeWidget.setItemWidget(QPushButton)) can starve Chromium's GPU
+# process — it reports "Insufficient Memory" / "GL_OUT_OF_MEMORY", loses its
+# context, and the next paint segfaults. Software rasterization sidesteps
+# that contention entirely. Must be set BEFORE QApplication is constructed.
+os.environ.setdefault(
+    "QTWEBENGINE_CHROMIUM_FLAGS",
+    "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer=false",
+)
+
 from pathlib import Path
 import sys
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QStatusBar, QPushButton, QLabel, QTreeWidget, QTreeWidgetItem, QSplitter,
     QInputDialog, QMenu, QMessageBox, QStackedLayout
 )
@@ -430,6 +442,7 @@ class Attune(QMainWindow):
         self.guitar_hero.update_view_items()
 
     def on_mistake_selected(self, idx: int):
+        """When mistake selected, highlight corresponding note in guitar hero plot"""
         if self.active_recording is None:
             return
         mistakes = self.active_recording.alignment.mistakes

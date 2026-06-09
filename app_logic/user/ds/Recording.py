@@ -20,10 +20,10 @@ class Recording:
 
         # algorithms!!
         from algorithms.PitchDetector import PitchDetector
-        from algorithms.NoteDetector2 import NoteDetector2
+        from algorithms.NoteDetector import NoteDetector
         from algorithms.StringEditor import StringEditor
         self.pitch_detector = PitchDetector(recording=self)
-        self.note_detector = NoteDetector2(recording=self)
+        self.note_detector = NoteDetector(recording=self)
         self.string_editor = StringEditor(recording=self)
 
         # essential data variables
