@@ -10,6 +10,15 @@ class Note:
         self.midi_num = midi_num
         self.velocity = velocity # might change to a list of peaks later?
         self.instrument = instrument
+        self._NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+    def get_note_name(self) -> str:
+        """Convert the most-likely MIDI note to a letter name like C4 or F#3."""
+        if len(self.midi_num) == 0:
+            return "—"
+        n = int(round(self.midi_num[0]))
+        return f"{self._NOTE_NAMES[n % 12]}{n // 12 - 1}"
 
 class NoteData:
     """Data to store and retrieve notes efficiently (indexing + binary search)
