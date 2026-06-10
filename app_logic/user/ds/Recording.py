@@ -41,33 +41,16 @@ class Recording:
     def update_config(self, config: Config=None):
         """initialize the config, either with a provided one or a default one"""
         if config is None:
-            config = {
-                'sr': 44100,    # sample rate
-                'w1': 1024 * 2,  # frame size
-                'h1': 128,       # hop size
-                'fmin': 196.0,
-                'fmax': 3000.0,
-                'tuning': 440.0,
-                'unv_thresh': 0.9, # if unvoiced_prob > unv_thresh, consider the frame unvoiced
-
-                # --- NOTE DETECTION PARAMETERS ---
-                'w2': 21, # frame size (NOTE: should always be odd)
-                'h2': 19, # hop size
-                'pitch_thresh': 0.5,
-                'slope_thresh': 0.75 / 21,
-                'unv_ratio': 0.8, # proportion of unvoiced pitches in a window to consider the window unvoiced
-
-                # --- STRING EDIT PARAMETERS ---
-                'ins_cost': 1.5,
-                'del_cost': 2,
-                'sub_cost': 1,
-                'tolerance': 1,
-                # tiger-mom parameter
-                'tiger_level': 1
-            }
-            self.config = Config(**config)
+            self.config = Config()
         else:
             self.config = config
+            
+        if hasattr(self, 'pitch_detector'):
+            self.pitch_detector.load_config(self.config)
+        if hasattr(self, 'note_detector'):
+            self.note_detector.update_config(self.config)
+        if hasattr(self, 'string_editor'):
+            self.string_editor.update_config(self.config)
 
     # def on_pitches_detected(self, pitches):
     #     self.pitch_data.data = pitches

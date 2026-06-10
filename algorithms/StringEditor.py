@@ -18,6 +18,16 @@ class StringEditor:
         # tiger-mom parameter
         self.TIGER_LEVEL = self.config.tiger_level
 
+    def update_config(self, config: Config):
+        """update the config and all relevant parameters"""
+        self.config = config
+        self.INSERTION_COST = self.config.ins_cost
+        self.DELETION_COST = self.config.del_cost
+        self.SUBSTITUTION_COST = self.config.sub_cost
+        self.TOLERANCE = self.config.tolerance
+
+        self.TIGER_LEVEL = self.config.tiger_level
+
     def string_edit(self, user_string: NoteData, midi_string: NoteData):
         """run string editing on the two user and midi strings.
         returns the alignment object as the result of string editing

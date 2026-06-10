@@ -1,26 +1,22 @@
 import numpy as np
 from dataclasses import dataclass
-
 @dataclass
 class Config:
     # --- PITCH DETECTION PARAMETERS ---
     sr: int = 44100    # sample rate
-    w1: int = 1024 * 6  # frame size
+    w1: int = 1024 * 4  # frame size
     h1: int = 128       # hop size
     fmin: float = 196.0
-    fmax: float = 5000.0
+    fmax: float = 3000.0
     tuning: float = 440.0
-    unv_thresh: float = 0.05 # if unvoiced_prob > unv_thresh, consider the frame unvoiced
+    unv_thresh: float = 0.9 # if unvoiced_prob > unv_thresh, consider the frame unvoiced
 
     # --- NOTE DETECTION PARAMETERS ---
-    w2: int = 30 # frame size
-    h2: int = 27 # hop size
+    w2: int = 29 # frame size (NOTE: should always be odd)
+    h2: int = 19 # hop size
     pitch_thresh: float = 0.75
-    slope_thresh: float = 1.5
-    unv_ratio: float = 0.5 # proportion of unvoiced pitches in a window to consider the window unvoiced
-
-    # --- SCORE-GUIDED NOTE DETECTION PARAMETERS ---
-    prox_window: float = 1.0 # semitones; max distance from expected MIDI for a candidate to be preferred over top-prob
+    slope_thresh: float = 0.75 / 29
+    unv_ratio: float = 0.8 # proportion of unvoiced pitches in a window to consider the window unvoiced
 
     # --- STRING EDIT PARAMETERS ---
     ins_cost: float = 1.5
@@ -44,8 +40,8 @@ class Config:
         self.w2 = config.get("w2", self.w2)
         self.h2 = config.get("h2", self.h2)
         self.pitch_thresh = config.get("pitch_thresh", self.pitch_thresh)
-        self.slope_thresh = config.get("slope_thresh", self.slope_thresh)
-        self.prox_window = config.get("prox_window", self.prox_window)
+        self.slope_thresh = 0.75 / self.w2 # rk: 0.75 is not set in stone
+        # self.slope_thresh = config.get("slope_thresh", self.slope_thresh)
 
         self.ins_cost = config.get("ins_cost", self.ins_cost)
         self.del_cost = config.get("del_cost", self.del_cost)

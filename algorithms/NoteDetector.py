@@ -30,6 +30,17 @@ class NoteDetector(QObject):
         self.nda_thread: threading.Thread = None
         self.stop_event = threading.Event()
 
+    def update_config(self, config: Config):
+        """update the config and all relevant parameters"""
+        self.config = config
+        self.w = self.config.w2
+        self.hop = self.config.h2
+        self.PITCH_THRESH = self.config.pitch_thresh
+        self.SLOPE_THRESH = self.config.slope_thresh
+        
+        self.UNVOICED_PROP = self.config.unv_ratio # if more than 50% of pitches are unvoiced
+        self.UNV_THRESH = self.config.unv_thresh # unvoiced pitches have unv_prob > sens
+
     def stop(self):
         if self.nda_thread and self.nda_thread.is_alive():
             self.stop_event.set()
@@ -69,13 +80,12 @@ class NoteDetector(QObject):
         N = 3
         medians = [-1] * N
 
-        # Select only voiced frames
+        # select only voiced frames
         voiced = [p for p in pitches if p and p.unvoiced_prob < self.UNV_THRESH]
-
         if not voiced:
             return medians
 
-        # Collect candidates in each column
+        # collect candidates in each column
         cols = [[] for _ in range(N)]
 
         for p in voiced:
@@ -85,7 +95,7 @@ class NoteDetector(QObject):
                 if pitch_val != -1:
                     cols[i].append(pitch_val)
 
-        # Compute medians
+        # compute medians
         for i in range(N):
             if cols[i]:
                 medians[i] = float(np.median(cols[i]))
@@ -115,7 +125,7 @@ class NoteDetector(QObject):
         nd = NoteData()
         prev_note = None
         prev_time = None
-        prev_good_time = None
+        # prev_good_time = None
         note_index = 0
 
         # iterate through all pitches
@@ -131,16 +141,19 @@ class NoteDetector(QObject):
             if prev_note is None:
                 if is_unv:
                     prev_note = [-1, -1, -1]
-                    prev_time = t
                 elif is_flat:
                     prev_note = med_pitches
-                    prev_time = t
+                prev_time = t
+                # prev_good_time = t
             else:
                 # if different enough...
                 if abs(prev_note[0] - med_pitches[0]) > self.PITCH_THRESH:
                     if not is_flat and not is_unv:
                         # it's okay to not be 'flat' if unvoiced
+                        # in the case it's not, skip to next window
+                        # prev_time = t
                         continue
+                    # and FLAT !
                     n = Note(
                         i=note_index,
                         start_time=prev_time, 
@@ -150,15 +163,16 @@ class NoteDetector(QObject):
                     nd.write_note(n)
                     # update iteration variables
                     prev_note = [-1, -1, -1] if is_unv else med_pitches
-                    prev_time = t
                     note_index += 1
-                prev_good_time = t
+                    # prev_good_time = t
+                
+                    prev_time = t
 
         # write the last note! :,)
         n = Note(
             i=i,
             start_time=prev_time, 
-            end_time=prev_good_time,
+            end_time=t,
             midi_num=prev_note
         )
         nd.write_note(n)

@@ -143,3 +143,13 @@ class Alignment:
             self.overridden_pair_indices.add(index)
         else:
             self.overridden_pair_indices.discard(index)
+
+    def __repr__(self):
+        mistakes = []
+        for mis in self.mistakes:
+            n = mis.user_note
+            m = mis.midi_note
+            mistakes.append(f"({m.start_time:.2f} | {mis.type}) u: {n.get_note_name()}, m: {m.get_note_name()}")
+        mistakes_str = "\n".join(mistakes)
+        n_mis = len(self.mistakes)
+        return f"alignment ({n_mis} mistakes):\n{mistakes_str}"

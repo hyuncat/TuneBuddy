@@ -312,14 +312,46 @@ class Attune(QMainWindow):
         self.midi_player.stop()
         self.active_recording.pitch_detector.stop()
 
+    def _find_best_w2(self):
+        """refactor later but essentially
+        finds the best note detection frame size by minimizing mistakes
+        then sets the config to that
+        """
+        # parameter sweep for ND
+        W2_SIZES = [33, 31, 29, 27, 25, 23, 21, 19, 17]
+
+        min_mistake, best_w2 = float('inf'), None
+        for w2 in W2_SIZES:
+            print(f"result for w2 = {w2}\n---")
+            self.active_recording.config.w2 = w2
+            self.active_recording.config.h2 = w2 - 2
+            self.active_recording.update_config(self.active_recording.config)
+            # rec.detect_pitches()
+            self.active_recording.detect_notes()
+            self.active_recording.detect_mistakes()
+            # print(self.active_recording.alignment)
+
+            if len(self.active_recording.alignment.mistakes) < min_mistake:
+                min_mistake = len(self.active_recording.alignment.mistakes)
+                best_w2 = w2
+        
+        print(f"best ND frame-size: {best_w2}, min mistakes: {min_mistake}")
+
+        self.active_recording.config.w2 = best_w2
+        self.active_recording.config.h2 = best_w2 - 2
+        self.active_recording.update_config(self.active_recording.config)
+
     def analyze(self):
         print("analyzing... ")
+
+        self._find_best_w2()
+
         # detect notes
         self.active_recording.detect_notes()
         # update midi length to match recording length
             # update p.distances to reflect new midi note durations
-        l = self.active_recording.get_length()
-        self.active_recording.resize(new_length = l)
+        length = self.active_recording.get_length()
+        self.active_recording.resize(new_length = length)
         # string edit
         self.active_recording.detect_mistakes()
 

@@ -8,6 +8,7 @@ from tqdm import tqdm
 from app_logic.user.ds.PitchData import Pitch
 from app_logic.user.ds.Recording import Recording
 from algorithms.Config import Config
+from algorithms.PitchSmoother import PitchSmoother
 
 class PitchDetector(QObject):
     
@@ -23,6 +24,7 @@ class PitchDetector(QObject):
             raise ValueError("Must provide either a recording or a config to initialize the PitchDetector.")
         self.recording = recording
         self.config = config if config else recording.config
+        self.pitch_smoother = PitchSmoother(config=self.config)
         self.SR = self.config.sr # for sample-to-frequency conversion
 
         # --- pitch config variables ---
@@ -156,6 +158,7 @@ class PitchDetector(QObject):
             pitch = self.detect_pitch(frame, start_time)
             pitches.append(pitch)
             
+        
         return pitches
 
 
