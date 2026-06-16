@@ -3,3 +3,5 @@ at-venv*/
 *__pycache__/
 *.pyc
 resources/benchmark*/
+CLAUDE.md
+.claude/

@@ -108,8 +108,8 @@ class MistakeWidget(QWidget):
     def _make_item(self, idx: int, mistake: Mistake) -> QTreeWidgetItem:
         #time is based on the MIDI Note rather than the user note
         time = _format_time(mistake.midi_note.start_time) if mistake.midi_note else "—"
-        intended = self._note_name(mistake.midi_note)
-        actual = self._note_name(mistake.user_note)
+        intended = "—" if mistake.type == "insertion" else self._note_name(mistake.midi_note)
+        actual = "—" if mistake.type == "deletion" else self._note_name(mistake.user_note)
         type_label = self._TYPE_ABBREV.get(mistake.type, mistake.type)
 
         item = QTreeWidgetItem([str(idx), time, type_label, intended, actual, ""])

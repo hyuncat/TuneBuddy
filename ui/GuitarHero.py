@@ -545,11 +545,19 @@ class GuitarHero(QWidget):
 
     def highlight_mistake(self, mistake):
         """Pan to and highlight the note(s) involved in a mistake."""
-        note = mistake.user_note or mistake.midi_note
-        if note is None:
+        if not mistake.user_note and not mistake.midi_note:
             return
-        self.move_plot(0.5 * (note.start_time + note.end_time))
-        notes = [n for n in (mistake.user_note, mistake.midi_note) if n is not None]
+        
+        notes = []
+        if mistake.type == "substitution":
+            notes.extend([mistake.user_note, mistake.midi_note])
+        elif mistake.type == "insertion":
+            notes.append(mistake.user_note)
+        elif mistake.type == "deletion":
+            notes.append(mistake.midi_note)
+
+        med_time = np.mean([0.5*(n.start_time + n.end_time) for n in notes])
+        self.move_plot(med_time)
         starts = np.array([n.start_time for n in notes], dtype=np.float64)
         ends   = np.array([n.end_time   for n in notes], dtype=np.float64)
         midis  = np.array([n.midi_num[0] for n in notes], dtype=np.float64)
