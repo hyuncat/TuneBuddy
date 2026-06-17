@@ -194,7 +194,10 @@ class PracticeAttune(QMainWindow):
     def pitch_detected(self, t: float):
         """t = time at which a new pitch was detected"""
         # else, have the following logic:
-        u = self.recording.pitch_data.read_pitch(t).candidates[0][0] # how to deal with the fact we don't know if this works all the time
+        p = self.recording.pitch_data.read_pitch(t)
+        if p is None or not p.candidates:  # no frame, or unvoiced (empty after smoothing)
+            return
+        u = p.candidates[0][0]
         m = self.score_data.note_datas[self.score_data.active_instrument].read_current_note(t)
         if m is None:
             return

@@ -3,6 +3,7 @@ from algorithms.Config import Config
 from app_logic.Alignment import Alignment, Mistake
 from app_logic.NoteData import NoteData, Note
 from app_logic.user.ds import Recording
+import time
 
 class StringEditor:
     def __init__(self, recording: Recording=None, config: Config=None):
@@ -23,7 +24,7 @@ class StringEditor:
         self.config = config
         self.INSERTION_COST = self.config.ins_cost
         self.DELETION_COST = self.config.del_cost
-        self.SUBSTITUTION_COST = self.config.sub_cost
+        self.SUBSTITUTION_COST = 1
         self.TOLERANCE = self.config.tolerance
 
         self.TIGER_LEVEL = self.config.tiger_level
@@ -35,7 +36,8 @@ class StringEditor:
         # user_string = self.recording.NoteData
         # midi_string = self.recording.score_data.note_data
 
-        print("Starting string editing...")
+        start = time.time()
+        # print("Starting string editing... ", end="", flush=True)
         user_notes = list(user_string.data.values())
         user_notes = [n for n in user_notes if n.midi_num[0] != -1]
         
@@ -61,9 +63,11 @@ class StringEditor:
                 user_note = user_notes[j-1]
                 # print(f"user notes: {user_note.midi_num}")
                 note_distance = self.get_distance(user_note, midi_note)
-                SUB_COST = self.SUBSTITUTION_COST
-                if abs(note_distance) < self.TOLERANCE: # being generous, the NoteCorrector.TOLERANCE
-                    SUB_COST = 0 # same note pitch
+                if abs(note_distance) < self.TOLERANCE: # within tolerance = same note pitch
+                    SUB_COST = 0
+                else:
+                    # weight the substitution by how far (semitones) the user note is off
+                    SUB_COST = min(abs(note_distance), 10)
 
                 top_three = np.array([
                     top + self.DELETION_COST,
@@ -122,7 +126,7 @@ class StringEditor:
 
         notes = list(reversed(notes))
         mistakes = list(reversed(mistakes))
-        print("Done!")
+        # print(f"Done! Took {time.time() - start:.2f} seconds")
         for mistake in mistakes:
             mistake.set_pair_index(len(notes) - 1 - mistakes_to_reverse_position[mistake])
         return notes, mistakes

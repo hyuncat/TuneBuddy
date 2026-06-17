@@ -57,6 +57,7 @@ class Attune(QMainWindow):
         self.score_data = ScoreData()
         self.recordings: dict[str, Recording] = {}  # name -> Recording
         self.active_recording: Recording | None = None
+        # self._detection_wired: set = set()  # pitch_detectors whose signals we've connected
         # rk: each recording comes with their own algorithms
 
         # PLAYBACK stuff
@@ -222,8 +223,17 @@ class Attune(QMainWindow):
         self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
         self.mistake_widget.selected.connect(self.on_mistake_selected)
         self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
+        self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
+
+        self.init_pitch_detector_signals()
 
         # settings dialog signals
+    
+    def init_pitch_detector_signals(self):
+        # pitch detector signals
+        if self.active_recording:
+            self.active_recording.pitch_detector.status_changed.connect(self.status_bar.update_status)
+            self.active_recording.pitch_detector.detection_finished.connect(self._on_detection_finished)
 
     # --- LOAD SCORE / AUDIO ---
     def load_score(self, filepath: str):
@@ -250,11 +260,21 @@ class Attune(QMainWindow):
         if self.active_recording is None:
             QMessageBox.warning(self, "No recording selected", "Please select a recording to load the audio into.")
             return
-        self.active_recording.load_audio(filepath)
+        rec = self.active_recording
+        self.init_pitch_detector_signals() # just in case
+        # loads the audio (fast) and starts pitch detection in the background;
+        # phase text appears in the status bar, cleared in _on_detection_finished
+        rec.load_audio(filepath)
+        # UI that only needs the raw audio can refresh right away
+        self.slider.update_range(score_data=self.score_data, recording=rec)
+        self.audio_player.load_audio(rec.audio_data)
+
+    def _on_detection_finished(self):
+        """Offline pitch detection finished (queued onto the main thread): clear
+        the status message and load the now-ready pitch data into the view."""
+        self.status_bar.update_status("")
         self.guitar_hero.load_user(self.active_recording)
-        self.slider.update_range(score_data=self.score_data, recording=self.active_recording)
-        self.audio_player.load_audio(self.active_recording.audio_data)
-        
+
     # --- PLAYBACK / RECORDING TOGGLES ---
     def toggle_playback(self):
         t = self.slider.get_time()
@@ -322,7 +342,6 @@ class Attune(QMainWindow):
 
         min_mistake, best_w2 = float('inf'), None
         for w2 in W2_SIZES:
-            print(f"result for w2 = {w2}\n---")
             self.active_recording.config.w2 = w2
             self.active_recording.config.h2 = w2 - 2
             self.active_recording.update_config(self.active_recording.config)
@@ -354,9 +373,32 @@ class Attune(QMainWindow):
         self.active_recording.resize(new_length = length)
         # string edit
         self.active_recording.detect_mistakes()
+        # self.active_recording.correct_mistakes()
+
+        n_mistakes = len(self.active_recording.alignment.mistakes)
+        print(f"initial mistakes: {n_mistakes}")
+        while True:
+            # keep the current (best-so-far) state in case this pass regresses
+            prev_nd = self.active_recording.note_data
+            prev_alignment = self.active_recording.alignment
+
+            self.active_recording.correct_mistakes()
+            new_n_mistakes = len(self.active_recording.alignment.mistakes)
+            print(f" > mistakes after correction: {new_n_mistakes}")
+
+            if new_n_mistakes >= n_mistakes:
+                # correction stopped helping (plateaued or got worse) -> revert
+                # to the better previous result and stop
+                self.active_recording.note_data = prev_nd
+                self.active_recording.alignment = prev_alignment
+                print("no improvement after correction, breaking loop")
+                break
+            n_mistakes = new_n_mistakes  # made progress -> raise the baseline
 
         # update scoreplot
-        # update guitar hero bounds
+        # update guitar hero bounds and reload user data (in case note/alignment was overwritten)
+        self.guitar_hero.load_alignment(self.active_recording.alignment)
+        self.guitar_hero.load_user(self.active_recording)
         self.guitar_hero.update_view_items()
         self.slider.update_range(score_data=self.score_data, recording=self.active_recording)
         self.mistake_widget.load_mistakes(self.active_recording.alignment.mistakes)
@@ -406,6 +448,7 @@ class Attune(QMainWindow):
             print(f"No recording named '{recording_name}' was found.")
             return
         self.active_recording = self.recordings[recording_name]
+        self.init_pitch_detector_signals()
         # print(f"Setting active recording to '{recording_name}'")
         self.status_bar.update_name(recording_name)
         self.mistake_widget.clear()

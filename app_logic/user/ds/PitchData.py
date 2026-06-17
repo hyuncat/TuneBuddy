@@ -102,7 +102,7 @@ class PitchData:
             j = min(self.time_to_index(end_time), len(self.data)-1)
 
         if clean:
-            return [p for p in self.data[i:j] if p is not None and p.unvoiced_prob < self.UNVOICED_THRESHOLD]
+            return [p for p in self.data[i:j] if p is not None and p.candidates!=[] and p.unvoiced_prob < self.UNVOICED_THRESHOLD]
 
         return self.data[i:j]
     

@@ -8,12 +8,14 @@ from tqdm import tqdm
 from app_logic.user.ds.PitchData import Pitch
 from app_logic.user.ds.Recording import Recording
 from algorithms.Config import Config
-from algorithms.PitchSmoother import PitchSmoother
 
 class PitchDetector(QObject):
-    
+
     pitch_detected = pyqtSignal(float)
-    
+    # offline (whole-file) detection: per-phase status text + a done signal
+    status_changed = pyqtSignal(str)
+    detection_finished = pyqtSignal()
+
     def __init__(self, recording: Recording=None, config: Config=None, parent: QObject|None=None):
         """
         Initialize the pitch detection parameters, like the tuning, frequency range, etc.
@@ -24,7 +26,6 @@ class PitchDetector(QObject):
             raise ValueError("Must provide either a recording or a config to initialize the PitchDetector.")
         self.recording = recording
         self.config = config if config else recording.config
-        self.pitch_smoother = PitchSmoother(config=self.config)
         self.SR = self.config.sr # for sample-to-frequency conversion
 
         # --- pitch config variables ---
@@ -44,6 +45,7 @@ class PitchDetector(QObject):
 
         # threading variables
         self.pda_thread: threading.Thread = None
+        self.offline_thread: threading.Thread = None  # for detect_pitches_async
         self.stop_event = threading.Event()
 
         # block variable for stalling buffer
@@ -96,7 +98,30 @@ class PitchDetector(QObject):
             self.stop_event.set()
             self.pda_thread.join() # pause the main thread until recording thread recognizes the stop event
 
-    
+    # OFFLINE (whole-file) detection, run on a background thread so the Qt event
+    # loop stays free (e.g. to animate a loading spinner while we wait).
+    def detect_pitches_async(self):
+        """Run the recording's full offline pitch pipeline (detect + smooth) on a
+        background daemon thread. Emits `status_changed(text)` as each phase
+        begins and `detection_finished` when the recording's pitch_data is ready.
+        Both fire from the worker thread, so Qt queues the connected slots onto
+        the main thread automatically."""
+        if self.offline_thread and self.offline_thread.is_alive():
+            return  # a detection is already in flight
+        self.offline_thread = threading.Thread(target=self._detect_pitches_offline, daemon=True)
+        self.offline_thread.start()
+
+    def _detect_pitches_offline(self):
+        """Worker body: detect + smooth the whole recording, then signal done.
+        Phase changes are surfaced via `status_changed` (see detect_pitches)."""
+        try:
+            self.recording.detect_pitches(on_phase=self.status_changed.emit)
+        except Exception as e:
+            print(f"[PitchDetector] offline detection failed: {e}")
+        finally:
+            self.detection_finished.emit()
+
+
     # THE DETECTION ALGORITHM
     def detect_pitch(self, x: np.ndarray, start_time: float=None) -> Pitch:
         """a method to call pitch detection on a single frame
@@ -132,7 +157,7 @@ class PitchDetector(QObject):
         candidates = list(zip(midi_estimates, pitch_probs))
         candidates.sort(key=lambda c: c[1], reverse=True) # sort from most to least probable
         _note = self.recording.score_data.current_note() if self.recording.score_data else None
-        distance = _note.midi_num[0] - candidates[0][0] if _note else None
+        distance = _note.midi_num[0] - candidates[0][0] if _note and candidates else None
         # print(f"detected pitch @ {start_time:.2f} sec, midi_num: {candidates[0][0]:.2f}, unvoiced_prob: {unvoiced_prob:.2f}, distance to target: {distance:.2f}")
         pitch = Pitch(time=start_time, candidates=candidates, 
                       volume=volume, unvoiced_prob=unvoiced_prob, 
@@ -157,8 +182,7 @@ class PitchDetector(QObject):
             start_time = (i*self.HOP_SIZE)/self.SR # elapsed time of the frame
             pitch = self.detect_pitch(frame, start_time)
             pitches.append(pitch)
-            
-        
+             
         return pitches
 
 

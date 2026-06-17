@@ -1,9 +1,11 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtGui import QColor
+from PyQt6.QtCore import pyqtSignal
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
 import numpy as np
 import qdarktheme
+
 
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.user.ds.Recording import Recording
@@ -158,6 +160,7 @@ class MidiAxis(pg.AxisItem):
         return f"{MidiAxis.NOTE_NAMES[pitch]}{octave}"
 
 class GuitarHero(QWidget):
+    plot_moved = pyqtSignal(float) # emits plot time in seconds
     def __init__(self, recording: Recording=None):
         super().__init__()
         self._layout = QVBoxLayout()
@@ -349,6 +352,7 @@ class GuitarHero(QWidget):
 
         self.is_moving = False # now we good
         self.update_view_items()
+        self.plot_moved.emit(t)
 
 
     # ---------- DATA LOADING ----------

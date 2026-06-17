@@ -19,13 +19,14 @@ class Config:
     unv_ratio: float = 0.8 # proportion of unvoiced pitches in a window to consider the window unvoiced
 
     # --- STRING EDIT PARAMETERS ---
-    ins_cost: float = 1.5
-    del_cost: float = 2
+    ins_cost: float = 1
+    del_cost: float = 1
     sub_cost: float = 1
-    tolerance: float = 1
+    tolerance: float = 1.25
 
     # tiger-mom parameter
     tiger_level: int = 1
+    min_close: int = 10 # min number of close frames to consider split viable
 
     # --- loader ---
     def load_config(self, config: dict):
@@ -49,7 +50,7 @@ class Config:
         self.tolerance = config.get("tolerance", self.tolerance)
 
         self.tiger_level = config.get("tiger_level", self.tiger_level)
-
+        self.min_close = config.get("min_close", self.min_close)
     # --- pitch conversion methods ---
     def freq_to_midi(self, freq: float) -> float:
         """

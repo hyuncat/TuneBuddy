@@ -27,6 +27,15 @@ class Mistake:
     def get_pair_index(self):
         return(self.pair_index)
 
+    def __repr__(self):
+        # u = self.user_note.get_note_name()
+        # m = self.midi_note.get_note_name()
+        u = "-" if self.type=="deletion" else self.user_note.get_note_name()
+        m = "-" if self.type=="insertion" else self.midi_note.get_note_name()
+        time = self.midi_note.start_time if self.type=="deletion" else self.user_note.start_time
+
+        return f"({time:.2f} | {self.type}) u: {u}, m: {m}"
+
 class Alignment:
     def __init__(self, config: Config, notes: list[tuple[Note, Note]]=None, mistakes: list[Mistake]=None):
         self.config = config
@@ -42,6 +51,7 @@ class Alignment:
         else:
             self.pairs_1, self.pairs_2 = {}, {}
             self.times_1, self.times_2 = [], []
+            self.match_user, self.match_score = {}, {}
         self.THRESH = 1 # same as StringEditor.TOLERANCE
 
     def load_alignment(self, notes: list[tuple[Note, Note]], mistakes: list[Mistake]):
@@ -56,12 +66,18 @@ class Alignment:
         in self.get_alignment"""
         self.pairs_1 = {}
         self.pairs_2 = {}
+        self.match_user = {}   # user_note.start_time -> aligned score Note (or None)
+        self.match_score = {}  # score_note.start_time -> aligned user Note (or None)
         times_1 = []
         times_2 = []
 
         for n, m in pairs: # go through and dissect the pairs
             if n is None and m is None:
                 continue
+            if n is not None:
+                self.match_user[n.start_time] = m
+            if m is not None:
+                self.match_score[m.start_time] = n
             if n is None:
                 tmin = m.start_time
                 tmax = m.end_time
@@ -122,7 +138,18 @@ class Alignment:
 
         # the end
         return goods, subs, ins, dels
-    
+
+    def get_match(self, user_note: Note=None, score_note: Note=None) -> Note:
+        """Return the note paired with the given one in this alignment.
+        Pass a user_note to get the score note it aligned to, or a score_note to
+        get the user note it aligned to. Returns None if the note had no match
+        (an insertion or deletion) or isn't part of this alignment."""
+        if user_note is not None:
+            return self.match_user.get(user_note.start_time)
+        if score_note is not None:
+            return self.match_score.get(score_note.start_time)
+        return None
+
     def reapply_overrides(self, overridden_mistake_indices: set[int]):
         self.reset_overrides()
         for index in overridden_mistake_indices:

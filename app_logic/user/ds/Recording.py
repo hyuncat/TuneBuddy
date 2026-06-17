@@ -20,11 +20,15 @@ class Recording:
 
         # algorithms!!
         from algorithms.PitchDetector import PitchDetector
+        from algorithms.PitchSmoother import PitchSmoother
         from algorithms.NoteDetector import NoteDetector
         from algorithms.StringEditor import StringEditor
+        from algorithms.MistakeChecker import MistakeChecker
         self.pitch_detector = PitchDetector(recording=self)
+        self.pitch_smoother = PitchSmoother(recording=self)
         self.note_detector = NoteDetector(recording=self)
         self.string_editor = StringEditor(recording=self)
+        self.mistake_checker = MistakeChecker(recording=self)
 
         # essential data variables
         self.audio_data = AudioData(config=self.config)
@@ -47,24 +51,33 @@ class Recording:
             
         if hasattr(self, 'pitch_detector'):
             self.pitch_detector.load_config(self.config)
+        if hasattr(self, 'pitch_smoother'):
+            self.pitch_smoother.update_config(self.config)
         if hasattr(self, 'note_detector'):
             self.note_detector.update_config(self.config)
         if hasattr(self, 'string_editor'):
             self.string_editor.update_config(self.config)
-
+        if hasattr(self, 'mistake_checker'):
+            self.mistake_checker.update_config(self.config)
     # def on_pitches_detected(self, pitches):
     #     self.pitch_data.data = pitches
 
     def load_audio(self, audio_filepath: str):
-        """load in a pre-recorded audio file from a filepath
-        also computes pitches on the entire file"""
+        """load in a pre-recorded audio file from a filepath, then kick off pitch
+        detection on the whole file in the background. Listen on
+        `pitch_detector.detection_finished` to know when pitch_data is ready."""
         self.audio_data.load_data(audio_filepath)
-        self.detect_pitches()
+        self.pitch_detector.detect_pitches_async()
         # self.detect_notes()
 
-    def detect_pitches(self):
-        """run pitch detection on the current audio data"""
+    def detect_pitches(self, on_phase=None):
+        """run pitch detection, then smoothing, on the current audio data.
+        `on_phase(text)`, if given, is called at the start of each stage so a
+        caller can surface progress (e.g. a status-bar message)."""
+        if on_phase: on_phase("Detecting pitches...")
         self.pitch_data.data = self.pitch_detector.detect_pitches(self.audio_data.data)
+        if on_phase: on_phase("Smoothing pitches...")
+        self.pitch_data.data = self.pitch_smoother.smooth(self.pitch_data.data)
 
     def detect_notes(self):
         """run note detection on the current pitch data"""
@@ -75,6 +88,11 @@ class Recording:
         notes, mistakes = self.string_editor.string_edit(user_string=user_notes, midi_string=midi_notes)
         self.alignment.load_alignment(notes, mistakes)
         self.alignment.reapply_overrides(self.overridden_mistake_indices)
+    
+    def correct_mistakes(self):
+        nd, alignment = self.mistake_checker.check_mistakes(recording=self)
+        self.note_data = nd
+        self.alignment = alignment
 
     def write_data(self, indata: np.ndarray, start_time: float):
         """write indata to the audio_data at the given start_time

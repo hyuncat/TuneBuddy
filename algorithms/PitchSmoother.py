@@ -39,12 +39,15 @@ hmmlearn.
 
 from __future__ import annotations
 
+import time
 import numpy as np
 from scipy.sparse import diags
 from hmmlearn.base import BaseHMM
+from tqdm import tqdm
 
 from algorithms.Config import Config
 from app_logic.user.ds.PitchData import Pitch
+from app_logic.user.ds.Recording import Recording
 
 
 class _PrecomputedHMM(BaseHMM):
@@ -93,16 +96,7 @@ class PitchSmoother:
     `unvoiced_prob = 1.0` (unvoiced). Time / volume / distance are preserved.
     """
 
-    def __init__(
-        self,
-        config: Config,
-        fmin: float | None = None,
-        fmax: float | None = None,
-        resolution_cents: float = 10.0,
-        max_jump_cents: float = 250.0,
-        switch_prob: float = 0.01,
-        yin_trust: float = 0.5,
-    ):
+    def __init__(self, recording: Recording=None, config: Config=None):
         """
         Args:
             config: app Config (used for tuning + the freq<->midi conversion,
@@ -117,14 +111,23 @@ class PitchSmoother:
             yin_trust: weight on the YIN candidate mass when voiced (the 0.5 of
                 eq. 6 / MonoPitchHMM's m_yinTrust).
         """
+        self.recording = recording
+        self.config = config if config else recording.config
+        if self.config:
+            self.update_config(self.config)
+
+    def update_config(self, config: Config):
+        """update the config and all relevant parameters"""
         self.config = config
-        self.resolution = resolution_cents / 100.0  # in semitones
-        self.switch_prob = float(switch_prob)
-        self.yin_trust = float(yin_trust)
+        RESOLUTION_CENTS = 10.0
+        self.resolution = RESOLUTION_CENTS / 100.0  # in semitones
+        self.switch_prob = 0.01
+        self.yin_trust = 0.5
+        MAX_JUMP_CENTS = 250.0
 
         # --- build the pitch grid (bin index <-> midi number) ---
-        fmin = config.fmin if fmin is None else fmin
-        fmax = config.fmax if fmax is None else fmax
+        fmin = config.fmin
+        fmax = config.fmax
         midi_lo = config.freq_to_midi(fmin)
         midi_hi = config.freq_to_midi(fmax)
         # snap to the resolution grid so bin centres land on nice values
@@ -134,7 +137,7 @@ class PitchSmoother:
         self.bin_midis = self.midi_min + self.resolution * np.arange(self.n_bins)
 
         # max jump in bins (each side of the diagonal)
-        self.max_jump = int(round(max_jump_cents / resolution_cents))
+        self.max_jump = int(round(MAX_JUMP_CENTS / RESOLUTION_CENTS))
 
         self.n_states = 2 * self.n_bins  # voiced bins, then unvoiced bins
 
@@ -234,9 +237,12 @@ class PitchSmoother:
         if not pitches:
             return np.empty(0, dtype=int)
 
+
+
         log_obs = self._observation_logprobs(pitches)
         hmm = _PrecomputedHMM(self.n_states, self._startprob, self._transmat)
         _logprob, states = hmm.decode(log_obs, algorithm="viterbi")
+
         return states
 
     def smooth_to_arrays(self, pitches: list[Pitch]):
@@ -270,10 +276,13 @@ class PitchSmoother:
         frame has no candidates and unvoiced_prob 1.0. Frame time, volume and
         distance are copied from the corresponding input pitch.
         """
+        print("Starting pitch smoothing... ", end="", flush=True)
+        start = time.time()
+
         states = self.decode(pitches)
         out: list[Pitch] = []
 
-        for p, s in zip(pitches, states):
+        for p, s in tqdm(zip(pitches, states), total=len(pitches)):
             is_voiced = s < self.n_bins
             if p is None:
                 # keep the time grid intact even if the frame was empty
@@ -296,6 +305,8 @@ class PitchSmoother:
                 distance=p.distance,
                 config=p.config,
             ))
+        
+        print(f"Done! Took {time.time() - start:.2f} sec.")
         return out
 
     # convenience: operate directly on a PitchData container
