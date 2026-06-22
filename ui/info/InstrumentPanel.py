@@ -56,6 +56,7 @@ class InstrumentPanel(QWidget):
     """
     instrument_applied = pyqtSignal(int)   # emits the active-instrument channel
     range_applied = pyqtSignal(int, int)   # emits (lowest_midi, highest_midi)
+    tuning_applied = pyqtSignal(float)     # emits the A4 reference tuning in Hz
     full_score_toggled = pyqtSignal(bool)  # True = show full score, False = active instrument only
 
     # the discretized note bins the range inputs auto-complete to (MIDI 0..127)
@@ -110,6 +111,22 @@ class InstrumentPanel(QWidget):
         self.range_apply = self._make_apply_button("Apply frequency range")
         self.range_apply.clicked.connect(self._on_range_apply)
         row.addWidget(self.range_apply)
+        self._layout.addLayout(row)
+
+        # --- TUNING UI ---
+        # the A4 reference pitch (Hz) the pitch detector tunes to; applying it
+        # updates the Config and re-runs pitch detection.
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Tuning:"))
+        self.tuning_input = QLineEdit()
+        self.tuning_input.setPlaceholderText("440")
+        self.tuning_input.setText("440")
+        row.addWidget(self.tuning_input, 1)
+        row.addWidget(QLabel("Hz"))
+
+        self.tuning_apply = self._make_apply_button("Apply tuning")
+        self.tuning_apply.clicked.connect(self._on_tuning_apply)
+        row.addWidget(self.tuning_apply)
         self._layout.addLayout(row)
 
         # --- FULL SCORE toggle (vs just active) ---
@@ -204,3 +221,21 @@ class InstrumentPanel(QWidget):
         if low > high:
             low, high = high, low  # be forgiving if the inputs are swapped
         self.range_applied.emit(low, high)
+
+    def set_tuning(self, tuning: float):
+        """Reflect the active recording's current tuning (Hz) in the input,
+        without emitting (no Apply). Mirrors the range defaults sync."""
+        self.tuning_input.setText(f"{tuning:g}")
+
+    def _on_tuning_apply(self):
+        try:
+            tuning = float(self.tuning_input.text().strip())
+        except ValueError:
+            tuning = None
+        if tuning is None or tuning <= 0:
+            QMessageBox.warning(
+                self, "Invalid tuning",
+                "Enter a positive number of Hz for the tuning (e.g. 440).",
+            )
+            return
+        self.tuning_applied.emit(tuning)

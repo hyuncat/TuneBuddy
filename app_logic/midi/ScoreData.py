@@ -18,6 +18,10 @@ class ScoreData:
         # score metadata
         self.length = 0.0 # sec
         self.bpm, self.bpm_og = 120, 120
+        # the score's display title (source of truth lives in the RecordingTree;
+        # defaults to the loaded file's stem). Always stamped onto the metadata
+        # so Verovio renders it — see to_musicxml_bytes / _stamp_title.
+        self.title: str = ""
 
         # instrument selection
         self.instruments: dict[int, int] = {} # {channel: program_number}
@@ -67,6 +71,9 @@ class ScoreData:
         p = Path(filepath)
         ext = p.suffix.lower()
         print(f"Loading score file: {filepath}")
+        # default the score title to the filename; the RecordingTree shows the
+        # same value and is the source of truth from here on (set_title).
+        self.title = p.stem
         
         if ext not in {'.mid', '.midi', '.mxl', '.musicxml', '.xml', '.mei'}:
             raise ValueError(f"Cannot handle file type: {ext}")
@@ -120,12 +127,16 @@ class ScoreData:
         if self.score is None:
             raise ValueError("No score loaded to export.")
 
+        # always stamp our source-of-truth title onto the score so Verovio
+        # renders the filename (see _stamp_title / _strip_engraving_credits).
+        self._stamp_title(self.score, self.title)
+
         part = self._part_for_channel(channel) if channel is not None else None
 
-        # fast path: full score still at the original tempo -> export as-is
-        # (byte-identical to the historical behavior / the initial page load).
+        # fast path: full score still at the original tempo -> export the score
+        # directly (cheapest, no deep copy), then clean the credits/title below.
         if part is None and round(self.bpm) == round(self.bpm_og):
-            return self._write_musicxml(self.score)
+            return self._strip_engraving_credits(self._write_musicxml(self.score))
 
         # otherwise build an isolated copy (single part or full) so we never
         # mutate self.score, then pin its tempo back to bpm_og before exporting.
@@ -141,7 +152,39 @@ class ScoreData:
             source.insert(0, copy.deepcopy(part))
 
         self._pin_tempo(source, self.bpm_og)
-        return self._write_musicxml(source)
+        return self._strip_engraving_credits(self._write_musicxml(source))
+
+    def set_title(self, title: str):
+        """Update the score's display title (the RecordingTree is the source of
+        truth and calls this on rename). The next render stamps it onto the
+        metadata so Verovio shows it; callers re-render the score viewer."""
+        self.title = title
+
+    @staticmethod
+    def _stamp_title(source, title: str):
+        """Force `source`'s metadata title to `title` so Verovio renders it as
+        the score title. music21 writes both <work-title> and <movement-title>;
+        we set both to the same value for a single, consistent heading."""
+        if not title:
+            return
+        from music21 import metadata
+        if source.metadata is None:
+            source.insert(0, metadata.Metadata())
+        source.metadata.title = title
+        source.metadata.movementName = title
+
+    @staticmethod
+    def _strip_engraving_credits(xml: bytes) -> bytes:
+        """Drop the absolutely-positioned <credit> blocks MuseScore exports (laid
+        out for a full page, they'd be Verovio's page header but get clipped by
+        our single-system page trimming) plus the placeholder composer creator.
+        With those gone, Verovio generates a clean header from the encoded
+        work/movement title — i.e. it always renders the filename."""
+        import re
+        text = xml.decode("utf-8")
+        text = re.sub(r"<credit\b[^>]*>.*?</credit>", "", text, flags=re.DOTALL)
+        text = re.sub(r'<creator type="composer">.*?</creator>', "", text, flags=re.DOTALL)
+        return text.encode("utf-8")
 
     def _part_for_channel(self, channel: int):
         """Resolve a MIDI instrument channel to its music21 Part, or None if it

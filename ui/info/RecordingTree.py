@@ -19,6 +19,7 @@ class RecordingTree(QWidget):
       - Signals emit names (str).
     """
     selected = pyqtSignal(str)          # emits str | None
+    score_renamed = pyqtSignal(str)     # emits the new score title (MIDI_ROOT renamed)
 
     def __init__(self, recordings: dict[str, Recording], parent=None):
         super().__init__(parent)
@@ -79,10 +80,16 @@ class RecordingTree(QWidget):
         # get the score name from filepath
         score_name = Path(filepath).stem
         self.MIDI_ROOT = QTreeWidgetItem([score_name])
+        # the root label is the Score Title (source of truth): store it so a
+        # rename can be diffed/reverted, like recording items do.
+        self.MIDI_ROOT.setData(0, Qt.ItemDataRole.UserRole, score_name)
 
-        # set root to not be selectable
+        # the root is editable (rename = retitle the score) but not selectable
+        # (it isn't a recording).
         flags = self.MIDI_ROOT.flags()
-        self.MIDI_ROOT.setFlags(flags & ~Qt.ItemFlag.ItemIsSelectable)
+        self.MIDI_ROOT.setFlags(
+            (flags & ~Qt.ItemFlag.ItemIsSelectable) | Qt.ItemFlag.ItemIsEditable
+        )
         self.tree.addTopLevelItem(self.MIDI_ROOT)
         self.MIDI_ROOT.setExpanded(True)
 
@@ -138,9 +145,10 @@ class RecordingTree(QWidget):
 
     def rename_recording(self, item: QTreeWidgetItem | None=None, col: int=0):
         """
-        Start in-place edit of the selected recording's name.
+        Start in-place edit of the item's name. Works for both recordings and
+        the MIDI_ROOT (whose label is the editable Score Title).
         """
-        if item is not None and item is not self.MIDI_ROOT:    
+        if item is not None:
             self.tree.editItem(item, col)
     
     def delete_recording(self, item: QTreeWidgetItem):
@@ -266,9 +274,13 @@ class RecordingTree(QWidget):
         """
         if self._suppress_item_changed:
             return
-        if item is None or item is self.MIDI_ROOT:
+        if item is None:
             return
-        
+        # the root label is the Score Title, handled separately
+        if item is self.MIDI_ROOT:
+            self._handle_score_rename(item, col)
+            return
+
         old_name = item.data(0, Qt.ItemDataRole.UserRole)
         new_name = item.text(col).strip()
 
@@ -301,6 +313,25 @@ class RecordingTree(QWidget):
         if self.active_recording == old_name:
             self.active_recording = new_name
             self.selected.emit(new_name)
+
+    def _handle_score_rename(self, item: QTreeWidgetItem, col: int):
+        """Apply an edit to the MIDI_ROOT label as a new Score Title. Reverts on
+        an empty name, otherwise stores it and emits `score_renamed` so the score
+        viewer re-renders with the new title."""
+        old_title = item.data(0, Qt.ItemDataRole.UserRole) or ""
+        new_title = item.text(col).strip()
+
+        if not new_title:
+            self._revert_item(item, old_title)
+            return
+        if new_title == old_title:
+            return
+
+        self._suppress_item_changed = True
+        item.setText(col, new_title)
+        item.setData(col, Qt.ItemDataRole.UserRole, new_title)
+        self._suppress_item_changed = False
+        self.score_renamed.emit(new_title)
 
     def _revert_item(self, item: QTreeWidgetItem, old_name: str):
         """

@@ -34,6 +34,7 @@ from ui.info.StatusBar import StatusBar
 from ui.info.RecordingTree import RecordingTree
 from ui.info.InstrumentPanel import InstrumentPanel
 from ui.info.MistakeWidget import MistakeWidget
+from ui.info.TolerancePanel import TolerancePanel
 from ui.info.Settings import SettingsDialog
 
 # app logic imports
@@ -97,7 +98,9 @@ class Attune(QMainWindow):
                 - center column (vertical splitter)
                     - score viewer (top)
                     - guitar hero (bottom)
-                - mistake widget
+                - right column (vertical splitter)
+                    - mistake widget (top)
+                    - tolerance panel (bottom)
             - slider layout
                 - play/pause button
                 - record button
@@ -147,6 +150,7 @@ class Attune(QMainWindow):
 
         self.guitar_hero = GuitarHero(self.active_recording)
         self.mistake_widget = MistakeWidget()
+        self.tolerance_panel = TolerancePanel()
 
         # center column: score viewer stacked ON TOP of the guitar hero, with a
         # vertical splitter between them so both are adjustable in height.
@@ -155,12 +159,27 @@ class Attune(QMainWindow):
         self.center_splitter.addWidget(self.guitar_hero)
         self.center_splitter.setStretchFactor(0, 1)  # score viewer grows
         self.center_splitter.setStretchFactor(1, 1)  # guitar hero grows
-        self.center_splitter.setSizes([250, 450])    # initial heights (resizable)
+        # start the score viewer compact so its single white page roughly fills
+        # the box (still user-resizable via the handle below it).
+        self.center_splitter.setSizes([180, 520])    # initial heights (resizable)
+
+        # right column: the mistake list (top) and a tolerance tuner (bottom),
+        # in a vertical splitter so the tuner's height is user-adjustable.
+        self.right_column = QSplitter(Qt.Orientation.Vertical)
+        self.right_column.addWidget(self.mistake_widget)
+        self.right_column.addWidget(self.tolerance_panel)
+        self.right_column.setStretchFactor(0, 1)  # mistake list takes the slack
+        self.right_column.setStretchFactor(1, 0)  # tolerance tuner stays compact
+        _tp_h = self.tolerance_panel.sizeHint().height()
+        self.right_column.setSizes([700, _tp_h])   # initial heights (resizable)
+        # keep the column as narrow as the (fixed-width) MistakeWidget
+        self.right_column.setMinimumWidth(self.mistake_widget.minimumWidth())
+        self.right_column.setMaximumWidth(self.mistake_widget.maximumWidth())
 
         # add the widgets
         self.splitter.addWidget(self.left_column)
         self.splitter.addWidget(self.center_splitter)
-        self.splitter.addWidget(self.mistake_widget)
+        self.splitter.addWidget(self.right_column)
         # set behavior controls
         self.splitter.setStretchFactor(0, 0)  # recordings tree is fixed-ish
         self.splitter.setStretchFactor(1, 1)  # center column grows
@@ -252,12 +271,15 @@ class Attune(QMainWindow):
         self.countdown_timer.finished.connect(self._start_recording)
 
         self.recordings_tree.selected.connect(self.on_recording_selected)
+        self.recordings_tree.score_renamed.connect(self.on_score_renamed)
         self.instrument_panel.instrument_applied.connect(self.on_instrument_applied)
         self.instrument_panel.range_applied.connect(self.on_range_applied)
+        self.instrument_panel.tuning_applied.connect(self.on_tuning_applied)
         self.instrument_panel.full_score_toggled.connect(self.on_full_score_toggled)
         self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
         self.mistake_widget.selected.connect(self.on_mistake_selected)
         self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
+        self.tolerance_panel.tolerance_applied.connect(self.on_tolerance_applied)
         self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
 
         self.init_pitch_detector_signals()
@@ -527,6 +549,9 @@ class Attune(QMainWindow):
         self.init_pitch_detector_signals()
         # print(f"Setting active recording to '{recording_name}'")
         self.instrument_panel.set_active_instrument(self.active_recording.active_instrument)
+        # reflect this recording's Config in the tunable inputs
+        self.instrument_panel.set_tuning(self.active_recording.config.tuning)
+        self.tolerance_panel.set_tolerance(self.active_recording.config.tolerance)
         self.status_bar.update_name(recording_name)
         self.mistake_widget.clear()
         self.guitar_hero.load_user(self.active_recording)
@@ -604,6 +629,44 @@ class Attune(QMainWindow):
         if rec.audio_data.end_index <= 0:
             return
         rec.pitch_detector.detect_pitches_async()
+
+    def on_tuning_applied(self, tuning: float):
+        """Set the active recording's Config tuning (A4 reference, Hz), then
+        re-compute pitches with it (tuning drives the freq<->MIDI conversion)."""
+        if self.active_recording is None:
+            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+            return
+        rec = self.active_recording
+        rec.config.tuning = tuning
+        rec.update_config(rec.config)
+
+        # re-run pitch detection on the existing audio (if any) with the new
+        # tuning; detection_finished -> _on_detection_finished refreshes the view.
+        if rec.audio_data.end_index <= 0:
+            return
+        rec.pitch_detector.detect_pitches_async()
+
+    def on_tolerance_applied(self, tolerance: float):
+        """Set the active recording's Config tolerance (semitone slack for a note
+        to count as correct), then re-run just the mistake-detection (string-edit)
+        step and refresh the mistake list + GuitarHero overlays."""
+        if self.active_recording is None:
+            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+            return
+        rec = self.active_recording
+        rec.config.tolerance = tolerance
+        rec.update_config(rec.config)
+
+        rec.detect_mistakes()
+        self.guitar_hero.load_alignment(rec.alignment)
+        self.guitar_hero.update_view_items()
+        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
+
+    def on_score_renamed(self, title: str):
+        """The Score Title was edited in the RecordingTree (the source of truth).
+        Push it to the score and re-render so Verovio shows the new title."""
+        self.score_data.set_title(title)
+        self.refresh_score_viewer()
 
     def on_score_viewer_loaded(self):
         """Called after score viewer is done loading JS and ready to receive data."""
