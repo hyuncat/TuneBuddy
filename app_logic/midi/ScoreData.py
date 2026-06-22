@@ -103,20 +103,85 @@ class ScoreData:
         self.playing_instruments = set(self.instruments.keys())
         self.metronome_channel = len(self.instruments.keys()) - 1 # last channel
 
-    def to_musicxml_bytes(self) -> bytes:
-        """Export the current score to MusicXML format as bytes.
-        For directly porting over to Verovio to view.
+    def to_musicxml_bytes(self, channel: int | None = None) -> bytes:
+        """Export the current score to MusicXML bytes for Verovio.
+
+        With `channel`, export ONLY that instrument's part (a single-instrument
+        score view); otherwise export the full score. The export is pinned to
+        the original tempo (`bpm_og`) so Verovio's timemap stays in the same
+        timeframe the playback cursor assumes (see app._score_viewer_time) — a
+        reload after a tempo change / Analyze would otherwise desync the cursor.
+
+        This is intentionally the *only* expensive step: it runs on instrument
+        change / full-score toggle / score load, never during playback. The
+        per-tick cursor path (set_playback_time -> window.timeChanged) is left
+        untouched, and a single-part layout makes its page flips cheaper.
         """
         if self.score is None:
             raise ValueError("No score loaded to export.")
-        
-        print("Converting score to MusicXML bytes...")
-        # musicxml_bytes = self.score.write('musicxml', fp=None)
-        
+
+        part = self._part_for_channel(channel) if channel is not None else None
+
+        # fast path: full score still at the original tempo -> export as-is
+        # (byte-identical to the historical behavior / the initial page load).
+        if part is None and round(self.bpm) == round(self.bpm_og):
+            return self._write_musicxml(self.score)
+
+        # otherwise build an isolated copy (single part or full) so we never
+        # mutate self.score, then pin its tempo back to bpm_og before exporting.
+        import copy
+        from music21 import stream
+
+        if part is None:
+            source = copy.deepcopy(self.score)
+        else:
+            source = stream.Score()
+            if self.score.metadata is not None:
+                source.insert(0, copy.deepcopy(self.score.metadata))
+            source.insert(0, copy.deepcopy(part))
+
+        self._pin_tempo(source, self.bpm_og)
+        return self._write_musicxml(source)
+
+    def _part_for_channel(self, channel: int):
+        """Resolve a MIDI instrument channel to its music21 Part, or None if it
+        can't be resolved (caller falls back to the full score).
+
+        Maps by position among the real (non-metronome) channels, which matches
+        the order music21 writes parts out to MIDI. This is the same channel-
+        ordering assumption the rest of the app already relies on.
+        """
+        if self.score is None:
+            return None
+        real_channels = [ch for ch in self.instruments if ch != self.metronome_channel]
+        if channel not in real_channels:
+            return None
+        idx = real_channels.index(channel)
+        parts = list(self.score.parts)
+        if 0 <= idx < len(parts):
+            return parts[idx]
+        return None
+
+    @staticmethod
+    def _pin_tempo(source, bpm: float):
+        """Force `source`'s tempo to `bpm` (flattening to a single mark) so its
+        Verovio timemap matches the original-tempo timeframe."""
+        marks = list(source.recurse().getElementsByClass(tempo.MetronomeMark))
+        if marks:
+            for m in marks:
+                m.number = bpm
+        else:
+            parts = list(source.parts) if hasattr(source, "parts") else []
+            target = parts[0] if parts else source
+            target.insert(0, tempo.MetronomeMark(number=bpm))
+
+    @staticmethod
+    def _write_musicxml(stream_obj) -> bytes:
+        """Write a music21 stream to MusicXML on disk and return its bytes."""
         # music21 writes to disk; capture the produced file path
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "score.musicxml"
-            written = self.score.write("musicxml", fp=str(out_path))
+            written = stream_obj.write("musicxml", fp=str(out_path))
 
             # music21 may return the path it actually wrote
             written_path = Path(written) if written else out_path

@@ -1,7 +1,7 @@
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QFontMetrics
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMenu, QSizePolicy, 
+    QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMenu, QSizePolicy,
     QSpinBox, QToolBar, QToolButton, QWidget, QWidgetAction
 )
 from ui.info.ToggleSwitch import ToggleSwitch
@@ -22,7 +22,7 @@ class Toolbar(QToolBar):
     show_settings = pyqtSignal(bool)
     show_clipper = pyqtSignal(bool)
     user_audio_toggled = pyqtSignal(bool) # value = user audio on/off
-    practice_toggled = pyqtSignal() 
+    practice_toggled = pyqtSignal()
     tempo_changed = pyqtSignal(int) # value = new tempo in BPM
 
     def __init__(self, score_data: ScoreData):
@@ -194,7 +194,7 @@ class Toolbar(QToolBar):
         """Dynamically populate the instrument multi-select dropdown
         based on the instruments present in the loaded score."""
         # clear existing menu items
-        self.instrument_menu.clear() 
+        self.instrument_menu.clear()
         self.instrument_checkboxes: dict[int, QCheckBox] = {}
 
         # ---> add a 'user' button
@@ -211,7 +211,7 @@ class Toolbar(QToolBar):
         user_action = QWidgetAction(self)
         user_action.setDefaultWidget(user_container)
         self.instrument_menu.addAction(user_action)
-        
+
         self.instrument_menu.addSeparator() # divider
 
         if len(self.score_data.instruments) == 0:
@@ -244,6 +244,10 @@ class Toolbar(QToolBar):
             ch for ch, cb in self.instrument_checkboxes.items()
             if cb.isChecked()
         }
+        # the metronome isn't one of our checkboxes; preserve its current state
+        # (it's toggled independently by the metronome switch).
+        if self.score_data.metronome_channel in self.score_data.playing_instruments:
+            selected_channels.add(self.score_data.metronome_channel)
         self.score_data.playing_instruments = selected_channels
         print(f"playing instruments: {self.score_data.playing_instruments}")
 

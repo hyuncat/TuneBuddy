@@ -118,6 +118,7 @@ class MistakeWidget(QWidget):
             "sharp": _svg_icon("sharpsign.svg"),
             "trash": _svg_icon("trash-2.svg"),
             "undo": _svg_icon("undo-2.svg"),
+            "pencil": _svg_icon("pencil.svg"),
         }
 
         self.init_ui()
@@ -138,17 +139,29 @@ class MistakeWidget(QWidget):
             _CenteredIconDelegate({self._TYPE_COL, self._OVERRIDE_COL}, parent=self.tree)
         )
 
-        self.tree.setColumnWidth(0, 30)
-        self.tree.setColumnWidth(1, 50)
-        self.tree.setColumnWidth(2, 44)
-        self.tree.setColumnWidth(3, 60)
-        self.tree.setColumnWidth(4, 60)
-        self.tree.setColumnWidth(5, 40)
+        self.tree.setColumnWidth(0, 24)   # "#"        — 1-2 digit index
+        self.tree.setColumnWidth(1, 50)   # "Time"     — "59:59" or "45.67"
+        self.tree.setColumnWidth(2, 38)   # "Type"     — icon only
+        self.tree.setColumnWidth(3, 72)   # "Intended" — header is the wide element
+        self.tree.setColumnWidth(4, 64)   # "Actual"
+        self.tree.setColumnWidth(5, 36)   # pencil     — icon only
+
+        # prevent the last column from stretching to fill remaining header width
+        self.tree.header().setStretchLastSection(False)
+
+        # center all column header labels
+        self.tree.header().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # pencil icon in the override column header
+        self.tree.headerItem().setIcon(self._OVERRIDE_COL, self._icons["pencil"])
 
         self._layout.addWidget(self.tree)
 
-        self.setMinimumWidth(200)
-        self.setMaximumWidth(380)
+        col_total = sum(self.tree.columnWidth(i) for i in range(self.tree.columnCount()))
+        m = self._layout.contentsMargins()
+        content_width = col_total + m.left() + m.right() + self.tree.frameWidth() * 2
+        self.setMinimumWidth(content_width)
+        self.setMaximumWidth(content_width)
 
     def init_signals(self):
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)

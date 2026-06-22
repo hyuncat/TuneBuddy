@@ -32,6 +32,7 @@ from ui.time.CountdownTimer import CountdownTimer
 from ui.info.Toolbar import Toolbar
 from ui.info.StatusBar import StatusBar
 from ui.info.RecordingTree import RecordingTree
+from ui.info.InstrumentPanel import InstrumentPanel
 from ui.info.MistakeWidget import MistakeWidget
 from ui.info.Settings import SettingsDialog
 
@@ -44,6 +45,7 @@ from app_logic.midi.ScoreData import ScoreData
 from app_logic.midi.MidiSynth import MidiSynth
 from app_logic.midi.MidiPlayer import MidiPlayer
 from app_logic.Alignment import Alignment
+from app_logic.NoteData import NoteData
 
 from algorithms.Config import Config
 from practice import PracticeAttune
@@ -78,6 +80,9 @@ class Attune(QMainWindow):
         # instrument control
         self.displayed_instruments: set[int] = set() # programs to display
         self.playing_instruments: set[int] = set() # channels to play
+        # score viewer: render only the active instrument's part (default) or
+        # the full score (toggled via the instrument panel).
+        self.viewer_show_full = False
 
         # initialize other important stuff
         self.init_ui()
@@ -115,7 +120,19 @@ class Attune(QMainWindow):
         # --- (splitter stuff) RECORDINGS TREE | [SCORE VIEWER / GUITAR HERO] | MISTAKES ---
         self.splitter = QSplitter(Qt.Orientation.Horizontal) # allows horizontal resizing
         self.recordings_tree = RecordingTree(self.recordings)
+        self.instrument_panel = InstrumentPanel()
         ABSOLUTE_PROJECT_ROOT = Path(__file__).resolve().parent
+
+        # left column: recordings tree (top) and the instrument/range panel
+        # below it, in a vertical splitter so each section's height is
+        # user-adjustable. (Playback controls live on the Toolbar.)
+        self.left_column = QSplitter(Qt.Orientation.Vertical)
+        self.left_column.addWidget(self.recordings_tree)
+        self.left_column.addWidget(self.instrument_panel)
+        self.left_column.setStretchFactor(0, 1)  # tree takes the slack
+        self.left_column.setStretchFactor(1, 0)  # instrument panel fixed-ish
+        self.left_column.setMinimumWidth(180)
+        self.left_column.setMaximumWidth(320)
         
         # score viewer requires a loading screen
         self.score_viewer_container = QWidget()
@@ -141,13 +158,16 @@ class Attune(QMainWindow):
         self.center_splitter.setSizes([250, 450])    # initial heights (resizable)
 
         # add the widgets
-        self.splitter.addWidget(self.recordings_tree)
+        self.splitter.addWidget(self.left_column)
         self.splitter.addWidget(self.center_splitter)
         self.splitter.addWidget(self.mistake_widget)
         # set behavior controls
         self.splitter.setStretchFactor(0, 0)  # recordings tree is fixed-ish
         self.splitter.setStretchFactor(1, 1)  # center column grows
         self.splitter.setStretchFactor(2, 0)  # mistake widget is fixed-ish
+        # default split: the side panels start compact (still user-resizable) so
+        # the center column fills the full width between them.
+        self.splitter.setSizes([240, 764, 296])
 
         self._layout.addWidget(self.splitter)
 
@@ -232,6 +252,9 @@ class Attune(QMainWindow):
         self.countdown_timer.finished.connect(self._start_recording)
 
         self.recordings_tree.selected.connect(self.on_recording_selected)
+        self.instrument_panel.instrument_applied.connect(self.on_instrument_applied)
+        self.instrument_panel.range_applied.connect(self.on_range_applied)
+        self.instrument_panel.full_score_toggled.connect(self.on_full_score_toggled)
         self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
         self.mistake_widget.selected.connect(self.on_mistake_selected)
         self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
@@ -255,15 +278,24 @@ class Attune(QMainWindow):
         filepath = Path(filepath)
         self.score_data.load(filepath)
 
+        # default to the first real (non-metronome) instrument channel
+        first_ch = next(
+            (ch for ch in self.score_data.instruments
+             if ch != self.score_data.metronome_channel),
+            0,
+        )
+        self.score_data.active_instrument = first_ch
+
         # load into important ui components
         self.toolbar.populate_instrument_menu()
+        self.instrument_panel.load_score(self.score_data)
         self.slider.update_range(score_data=self.score_data)
         self.recordings_tree.init_score(filepath=filepath, score_data=self.score_data)
         self.recordings_tree._add_recording(name="untitled_recording") # dummy init
         self.guitar_hero.load_score(self.score_data)
         self.practice_attune.load_score(self.score_data)
-        # wait for viewer to be ready
-        _ = self.score_viewer.load_score(self.score_data)
+        # render the score viewer (active instrument only, unless "full" is on)
+        self.refresh_score_viewer()
 
         # load into playback engines
         self.midi_player.load_score(self.score_data)
@@ -494,12 +526,84 @@ class Attune(QMainWindow):
         self.active_recording = self.recordings[recording_name]
         self.init_pitch_detector_signals()
         # print(f"Setting active recording to '{recording_name}'")
+        self.instrument_panel.set_active_instrument(self.active_recording.active_instrument)
         self.status_bar.update_name(recording_name)
         self.mistake_widget.clear()
         self.guitar_hero.load_user(self.active_recording)
         self.audio_player.load_audio(self.active_recording.audio_data)
         self.audio_recorder.load_recording(self.active_recording)
         self.slider.update_range(score_data=self.score_data, recording=self.active_recording)
+
+    def on_instrument_applied(self, channel: int):
+        """Make `channel` the active instrument for the active recording. Resets
+        all analysis-derived data (notes, alignment, mistakes/overrides), re-inits
+        the algorithms from the current Config, and refreshes the views."""
+        if self.active_recording is None:
+            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+            return
+        rec = self.active_recording
+
+        # the active instrument drives both display (score_data) and analysis
+        # (rec.active_instrument is what detect_mistakes / pitch distances key on)
+        self.score_data.active_instrument = channel
+        rec.active_instrument = channel
+
+        # reset analysis-related data for the recording
+        rec.note_data = NoteData()
+        rec.alignment = Alignment(config=rec.config)
+        rec.overridden_mistake_indices = set()
+
+        # apply the (re-init) config changes across the algorithm stages
+        rec.update_config(rec.config)
+
+        # refresh the views to the now-empty analysis
+        self.mistake_widget.clear()
+        self.guitar_hero.load_alignment(rec.alignment)
+        self.guitar_hero.load_user(rec)
+        self.guitar_hero.update_view_items()
+
+        # re-render the score viewer for the new instrument (no-op extra cost
+        # during playback: this only runs here, on the instrument change)
+        self.refresh_score_viewer()
+
+        # the range defaults follow the newly selected instrument's note range
+        self.instrument_panel.populate_range_from_score(self.score_data, channel)
+
+    def on_full_score_toggled(self, show_full: bool):
+        """Toggle the score viewer between the full score and the active
+        instrument's part. Re-render lag here is acceptable."""
+        self.viewer_show_full = show_full
+        self.refresh_score_viewer()
+
+    def refresh_score_viewer(self):
+        """(Re)render the score viewer to match the current instrument/full-score
+        state. The single expensive Verovio layout step — never called per tick."""
+        if self.score_data.score is None:
+            return
+        channel = None if self.viewer_show_full else self.score_data.active_instrument
+        self.score_viewer.load_score(self.score_data, channel=channel)
+
+    def on_range_applied(self, low_midi: int, high_midi: int):
+        """Set the active recording's Config frequency range from the chosen
+        lowest/highest notes, then re-compute pitches with the new Config."""
+        if self.active_recording is None:
+            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+            return
+        rec = self.active_recording
+        config = rec.config
+
+        # half-semitone padding so the boundary notes sit comfortably inside the
+        # detectable range. fmin/fmax drive the detector's tau_max/tau_min.
+        MARGIN = 0.5
+        config.fmin = config.midi_to_freq(low_midi - MARGIN)
+        config.fmax = config.midi_to_freq(high_midi + MARGIN)
+        rec.update_config(config)
+
+        # re-run pitch detection on the existing audio (if any) with the new
+        # range; detection_finished -> _on_detection_finished refreshes the view.
+        if rec.audio_data.end_index <= 0:
+            return
+        rec.pitch_detector.detect_pitches_async()
 
     def on_score_viewer_loaded(self):
         """Called after score viewer is done loading JS and ready to receive data."""

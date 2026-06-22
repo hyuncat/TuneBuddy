@@ -14,8 +14,9 @@ class Recording:
         each recording has its own audio data, pitch data, note data, and alignment
         as well as its own set of algorithms and parameters for processing that data"""
         self.score_data = score_data if score_data is not None else ScoreData()
-        # each recording is associated with an instrument (channel #) in the score
-        self.active_instrument = 0
+        # inherit the score's current active instrument so new recordings
+        # always target whichever channel was selected when they were created
+        self.active_instrument = self.score_data.active_instrument
         self.update_config(config)
 
         # algorithms!!

@@ -39,14 +39,19 @@ class ScoreViewer(QWebEngineView):
         self.load_finished.emit(ok)
 
     # --- JS API wrappers ---
-    def load_score(self, score: ScoreData) -> int:
+    def load_score(self, score: ScoreData, channel: int | None = None) -> int:
         """
-        Load a score file into the viewer. Supports MusicXML (.xml, .mxl) 
-        and MEI (.mei) formats. Reads file, encodes as base64 bytes, then
-        sends to js API to load into Verovio.
-        
+        Load a score into the viewer. Reads MusicXML bytes, encodes as base64,
+        then sends to the JS API to load into Verovio.
+
+        This is the expensive (re-layout) path and is only meant to run on
+        instrument change / full-score toggle / score load — never per playback
+        tick (that's set_playback_time).
+
         Args:
             score: ScoreData object to load into the viewer
+            channel: if given, render ONLY that instrument's part; otherwise
+                render the full score.
 
         Returns:
             0 on success, 1 if JS API not ready yet (score not loaded)
@@ -54,7 +59,7 @@ class ScoreViewer(QWebEngineView):
         if not self.js_ready:
             print("[ScoreViewer] load_score called before JS API ready, ignoring.")
             return 1
-        xml_bytes = score.to_musicxml_bytes()
+        xml_bytes = score.to_musicxml_bytes(channel=channel)
         b64 = base64.b64encode(xml_bytes).decode("ascii")
         self.page().runJavaScript(f'window.loadScore("{b64}");')
         return 0
