@@ -205,7 +205,68 @@ class RecordingTree(QWidget):
             print("Error parsing selected instrument:", e)
             QMessageBox.warning(self, "Invalid selection", "Could not parse the selected instrument.")
 
+    def set_recording_name(self, new_name: str, old_name: str | None = None) -> str | None:
+        """Rename a recording (the active one by default) to `new_name`.
+
+        Used to default a recording's label to an uploaded audio file's name.
+        Resolves collisions with a numeric suffix and no-ops when the name is
+        unchanged. Returns the final name applied, or None if there was no such
+        recording to rename.
+        """
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return None
+        if old_name is None:
+            old_name = self.active_recording
+        if old_name is None or old_name not in self.recordings:
+            return None
+
+        item = self._find_item(old_name)
+        if item is None:
+            return None
+
+        # keep names unique (the recordings dict is keyed by name)
+        new_name = self._unique_name(new_name, ignore=old_name)
+        if new_name == old_name:
+            return old_name
+
+        # move the dict entry to the new key (same Recording object)
+        self.recordings[new_name] = self.recordings.pop(old_name)
+
+        # update the tree label + stored name, suppressing the edit handler
+        self._suppress_item_changed = True
+        item.setText(0, new_name)
+        item.setData(0, Qt.ItemDataRole.UserRole, new_name)
+        self._suppress_item_changed = False
+
+        if self.active_recording == old_name:
+            self.active_recording = new_name
+        return new_name
+
     # --- INTERNAL ---
+    def _find_item(self, name: str) -> QTreeWidgetItem | None:
+        """Find the recording tree item whose stored name matches `name`."""
+        if self.MIDI_ROOT is None:
+            return None
+        for i in range(self.MIDI_ROOT.childCount()):
+            child = self.MIDI_ROOT.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole) == name:
+                return child
+        return None
+
+    def _unique_name(self, base: str, ignore: str | None = None) -> str:
+        """Return `base`, or `base (n)` with the smallest n>=2 that isn't already
+        a recording name. `ignore` is treated as available (the item being
+        renamed onto its own name shouldn't count as a collision)."""
+        taken = set(self.recordings.keys())
+        taken.discard(ignore)
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base} ({n})" in taken:
+            n += 1
+        return f"{base} ({n})"
+
     def confirm_delete(self, name: str) -> bool:
         """Ask the user to confirm deletion of the recording with the given name."""
         if not name:

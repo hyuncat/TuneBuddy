@@ -67,7 +67,7 @@ class StringEditor:
                     SUB_COST = 0
                 else:
                     # weight the substitution by how far (semitones) the user note is off
-                    SUB_COST = min(abs(note_distance)*1.5, 10)
+                    SUB_COST = min(abs(note_distance), 10)
 
                 top_three = np.array([
                     top + self.DELETION_COST,

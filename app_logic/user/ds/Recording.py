@@ -64,12 +64,10 @@ class Recording:
     #     self.pitch_data.data = pitches
 
     def load_audio(self, audio_filepath: str):
-        """load in a pre-recorded audio file from a filepath, then kick off pitch
-        detection on the whole file in the background. Listen on
-        `pitch_detector.detection_finished` to know when pitch_data is ready."""
+        """load in a pre-recorded audio file from a filepath into audio_data.
+        Pitch detection is kicked off separately by the caller (app.py runs the
+        cleanup + detection together so the views reset as one)."""
         self.audio_data.load_data(audio_filepath)
-        self.pitch_detector.detect_pitches_async()
-        # self.detect_notes()
 
     def detect_pitches(self, on_phase=None):
         """run pitch detection, then smoothing, on the current audio data.
@@ -86,6 +84,12 @@ class Recording:
 
     def detect_mistakes(self):
         user_notes, midi_notes = self.note_data, self.score_data.note_datas[self.active_instrument]
+        # [DIAG] dump the two strings actually fed to string_edit (pitch order is
+        # what alignment uses; the times reveal any cumulative resize drift)
+        u = [(round(n.start_time, 2), n.get_note_name()) for n in user_notes.data.values() if n.midi_num[0] != -1]
+        m = [(round(n.start_time, 2), n.get_note_name()) for n in midi_notes.data.values()]
+        print(f"[align] USER ({len(u)}): {u}")
+        print(f"[align] MIDI ({len(m)}): {m}")
         notes, mistakes = self.string_editor.string_edit(user_string=user_notes, midi_string=midi_notes)
         self.alignment.load_alignment(notes, mistakes)
         self.alignment.reapply_overrides(self.overridden_mistake_indices)
@@ -148,10 +152,29 @@ class Recording:
         # inverted the bpm, corrupting self.bpm after Analyze.)
         factor = new_length / self.score_data.midi_data.length_og
         new_bpm = round(self.score_data.bpm_og / factor)
+
+        # [DIAG] resize math + whether change_tempo will skip the rebuild
+        sd = self.score_data
+        nd = sd.note_datas.get(self.active_instrument)
+        starts_before = [round(n.start_time, 2) for n in nd.data.values()][:4] if nd else None
+        will_skip = (new_bpm == sd.bpm) or (sd.score is None)
+        print(f"[resize] new_length={new_length:.3f} length_og={sd.midi_data.length_og:.3f} "
+              f"factor={factor:.4f} -> new_bpm={new_bpm} (cur bpm={sd.bpm}); "
+              f"change_tempo SKIPS rebuild={will_skip}; first score starts={starts_before}")
+
         self.score_data.change_tempo(new_bpm)
         start_time = self._get_first_note(voiced=True).start_time
         # transpose all score notes by start_time
         self.score_data.transpose_notes(start_time)
+
+        # [DIAG] after transpose: show drift + the times/key desync
+        nd = sd.note_datas.get(self.active_instrument)
+        if nd and nd.times:
+            first = nd.read_note(i=0)
+            print(f"[resize] transposed by start_time={start_time:.3f}; "
+                  f"first note start_time={first.start_time:.3f} vs times[0]={nd.times[0]:.3f} "
+                  f"(DESYNC={abs(first.start_time - nd.times[0]) > 1e-6}); "
+                  f"new score starts={[round(n.start_time, 2) for n in nd.data.values()][:4]}")
         self._update_pitch_distances()
 
     def change_tempo(self, new_bpm: float):

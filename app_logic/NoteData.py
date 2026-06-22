@@ -7,6 +7,12 @@ class Note:
         self.id = i # used to keep track of note within the piece
         self.start_time = start_time
         self.end_time = end_time
+        # untransposed baseline times (at the current tempo, before any resize
+        # offset is applied). transpose_notes sets absolute times from these so
+        # repeated resizes don't accumulate; refreshed whenever notes are rebuilt
+        # at a new tempo (make_notedatas constructs new Notes).
+        self.base_start_time = start_time
+        self.base_end_time = end_time
         self.midi_num = midi_num
         self.velocity = velocity # might change to a list of peaks later?
         self.instrument = instrument

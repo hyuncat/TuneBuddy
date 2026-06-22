@@ -364,8 +364,19 @@ class ScoreData:
         return beats
     
     def transpose_notes(self, offset_sec: float):
-        """Transpose all notes in the score by offset_sec seconds. Used for resizing."""
+        """Shift all score notes so the piece starts `offset_sec` seconds in.
+
+        Sets each note's absolute time from its *untransposed baseline*
+        (`base_start_time`/`base_end_time`) rather than incrementing, so calling
+        this repeatedly with the same offset is idempotent — repeated resizes no
+        longer drift the score to the right. Also rebuilds each NoteData's `data`
+        dict keys and `times` list so they stay in sync with the notes' new
+        start_times (otherwise time-indexed lookups read stale keys)."""
         for notedata in self.note_datas.values():
+            new_data = {}
             for note in notedata.data.values():
-                note.start_time += offset_sec
-                note.end_time += offset_sec
+                note.start_time = note.base_start_time + offset_sec
+                note.end_time = note.base_end_time + offset_sec
+                new_data[note.start_time] = note
+            notedata.data = new_data
+            notedata.times = sorted(new_data.keys())

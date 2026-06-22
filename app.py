@@ -60,7 +60,9 @@ class Attune(QMainWindow):
         self.score_data = ScoreData()
         self.recordings: dict[str, Recording] = {}  # name -> Recording
         self.active_recording: Recording | None = None
-        # self._detection_wired: set = set()  # pitch_detectors whose signals we've connected
+        # pitch_detectors we've already wired signals for (one per recording),
+        # so init_pitch_detector_signals never double-connects the same detector
+        self._wired_detectors: set = set()
         # rk: each recording comes with their own algorithms
 
         # PLAYBACK stuff
@@ -287,10 +289,39 @@ class Attune(QMainWindow):
         # settings dialog signals
     
     def init_pitch_detector_signals(self):
-        # pitch detector signals
-        if self.active_recording:
-            self.active_recording.pitch_detector.status_changed.connect(self.status_bar.update_status)
-            self.active_recording.pitch_detector.detection_finished.connect(self._on_detection_finished)
+        """Wire the active recording's pitch detector signals. Each recording
+        owns its own detector, so we connect each only once (tracked in
+        `_wired_detectors`) to avoid duplicate slot invocations."""
+        rec = self.active_recording
+        if rec is None or rec.pitch_detector in self._wired_detectors:
+            return
+        rec.pitch_detector.status_changed.connect(self.status_bar.update_status)
+        rec.pitch_detector.detection_finished.connect(self._on_detection_finished)
+        self._wired_detectors.add(rec.pitch_detector)
+
+    # --- SHARED HELPERS / CLEANUP ---
+    def _require_recording(self, message: str = "Please select a recording first.") -> "Recording | None":
+        """Return the active recording, or warn (with `message`) and return None
+        when there isn't one. Centralizes the repeated no-recording guard."""
+        if self.active_recording is None:
+            QMessageBox.warning(self, "No recording selected", message)
+            return None
+        return self.active_recording
+
+    def cleanup(self):
+        """Reset all analysis-derived state so no stale artifacts survive an
+        input change (new score/audio, re-run detection, re-analyze). Clears the
+        active recording's notes/alignment/overrides, the mistake list, and the
+        GuitarHero overlays (user notes, alignment, highlight)."""
+        rec = self.active_recording
+        if rec is not None:
+            rec.note_data = NoteData()
+            rec.alignment = Alignment(config=rec.config)
+            rec.overridden_mistake_indices = set()
+            # reloading the now-empty recording wipes the user-note + alignment
+            # overlays and the highlight bar from the GuitarHero
+            self.guitar_hero.load_user(rec)
+        self.mistake_widget.clear()
 
     # --- LOAD SCORE / AUDIO ---
     def load_score(self, filepath: str):
@@ -314,6 +345,8 @@ class Attune(QMainWindow):
         self.slider.update_range(score_data=self.score_data)
         self.recordings_tree.init_score(filepath=filepath, score_data=self.score_data)
         self.recordings_tree._add_recording(name="untitled_recording") # dummy init
+        # fresh score => wipe any analysis/artifacts left over from the previous one
+        self.cleanup()
         self.guitar_hero.load_score(self.score_data)
         self.practice_attune.load_score(self.score_data)
         # render the score viewer (active instrument only, unless "full" is on)
@@ -323,17 +356,40 @@ class Attune(QMainWindow):
         self.midi_player.load_score(self.score_data)
 
     def load_audio(self, filepath: str):
-        if self.active_recording is None:
-            QMessageBox.warning(self, "No recording selected", "Please select a recording to load the audio into.")
+        rec = self._require_recording("Please select a recording to load the audio into.")
+        if rec is None:
             return
-        rec = self.active_recording
-        self.init_pitch_detector_signals() # just in case
-        # loads the audio (fast) and starts pitch detection in the background;
-        # phase text appears in the status bar, cleared in _on_detection_finished
-        rec.load_audio(filepath)
+        rec.load_audio(filepath)  # loads the raw waveform only
+        # default the recording's name to the uploaded audio file's name
+        self.recordings_tree.set_recording_name(Path(filepath).stem)
         # UI that only needs the raw audio can refresh right away
         self.slider.update_range(score_data=self.score_data, recording=rec)
         self.audio_player.load_audio(rec.audio_data)
+        # clear stale analysis, then detect pitches on the new audio in the
+        # background (phase text appears in the status bar, cleared in
+        # _on_detection_finished, which loads the fresh pitch data)
+        self.detect_pitches()
+
+    def detect_pitches(self):
+        """Clear stale analysis, then (re-)run offline pitch detection on the
+        active recording's audio in the background. Used whenever the pitch track
+        must be recomputed (new audio, range/tuning change). When detection
+        finishes, _on_detection_finished loads the fresh pitch data into view."""
+        rec = self.active_recording
+        if rec is None or rec.audio_data.end_index <= 0:
+            return
+        self.cleanup()
+        self.init_pitch_detector_signals() # just in case
+        rec.pitch_detector.detect_pitches_async()
+
+    def detect_notes(self):
+        """Run note detection on the active recording's current pitch data, then
+        refresh the user-note view."""
+        rec = self.active_recording
+        if rec is None:
+            return
+        rec.detect_notes()
+        self.guitar_hero.load_user(rec)
 
     def _on_detection_finished(self):
         """Offline pitch detection finished (queued onto the main thread): clear
@@ -363,8 +419,7 @@ class Attune(QMainWindow):
             self.play_button.setIcon(self.play_icon)
 
     def toggle_recording(self):
-        if self.active_recording is None:
-            QMessageBox.warning(self, "No recording selected", "Please select a recording to record into.")
+        if self._require_recording("Please select a recording to record into.") is None:
             return
         if self.is_counting_in:
             # clicking again during the count-in cancels it (un-arm recording)
@@ -464,28 +519,28 @@ class Attune(QMainWindow):
             n_mistakes = new_n_mistakes  # made progress -> raise the baseline
 
     def analyze(self):
+        rec = self._require_recording()
+        if rec is None:
+            return
         print("analyzing... ")
+        self.cleanup() # clear stale notes/alignment/mistakes before recomputing
 
+        # detect notes (at the best ND frame size), stretch the score to match
+        # the take's length (also rescales p.distances), then string-edit align
         self._find_best_w2()
-
-        # detect notes
-        self.active_recording.detect_notes()
-        # update midi length to match recording length
-            # update p.distances to reflect new midi note durations
-        length = self.active_recording.get_length(raw=True)
-        self.active_recording.resize(new_length = length)
-        # string edit
-        self.active_recording.detect_mistakes()
-        # self.active_recording.correct_mistakes()
+        self.detect_notes()
+        length = rec.get_length(raw=True)
+        rec.resize(new_length=length)
+        rec.detect_mistakes()
         self.mistake_correction_loop()
 
-        # update scoreplot
-        # update guitar hero bounds and reload user data (in case note/alignment was overwritten)
-        self.guitar_hero.load_alignment(self.active_recording.alignment)
-        self.guitar_hero.load_user(self.active_recording)
+        # reload every view with the fresh analysis (note/alignment may have been
+        # overwritten by the correction loop)
+        self.guitar_hero.load_alignment(rec.alignment)
+        self.guitar_hero.load_user(rec)
         self.guitar_hero.update_view_items()
-        self.slider.update_range(score_data=self.score_data, recording=self.active_recording)
-        self.mistake_widget.load_mistakes(self.active_recording.alignment.mistakes)
+        self.slider.update_range(score_data=self.score_data, recording=rec)
+        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
         
     # --- SIGNAL-RELATED ACTIONS ---
     def _score_viewer_time(self, t: float) -> float:
@@ -553,7 +608,9 @@ class Attune(QMainWindow):
         self.instrument_panel.set_tuning(self.active_recording.config.tuning)
         self.tolerance_panel.set_tolerance(self.active_recording.config.tolerance)
         self.status_bar.update_name(recording_name)
-        self.mistake_widget.clear()
+        # show this recording's own analysis (load_user draws its GuitarHero
+        # overlays; keep the mistake list in sync rather than blanking it)
+        self.mistake_widget.load_mistakes(self.active_recording.alignment.mistakes)
         self.guitar_hero.load_user(self.active_recording)
         self.audio_player.load_audio(self.active_recording.audio_data)
         self.audio_recorder.load_recording(self.active_recording)
@@ -563,29 +620,19 @@ class Attune(QMainWindow):
         """Make `channel` the active instrument for the active recording. Resets
         all analysis-derived data (notes, alignment, mistakes/overrides), re-inits
         the algorithms from the current Config, and refreshes the views."""
-        if self.active_recording is None:
-            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+        rec = self._require_recording()
+        if rec is None:
             return
-        rec = self.active_recording
 
         # the active instrument drives both display (score_data) and analysis
         # (rec.active_instrument is what detect_mistakes / pitch distances key on)
         self.score_data.active_instrument = channel
         rec.active_instrument = channel
 
-        # reset analysis-related data for the recording
-        rec.note_data = NoteData()
-        rec.alignment = Alignment(config=rec.config)
-        rec.overridden_mistake_indices = set()
-
-        # apply the (re-init) config changes across the algorithm stages
+        # wipe the analysis-derived data + views, then re-init the algorithm
+        # stages from the (unchanged) Config
+        self.cleanup()
         rec.update_config(rec.config)
-
-        # refresh the views to the now-empty analysis
-        self.mistake_widget.clear()
-        self.guitar_hero.load_alignment(rec.alignment)
-        self.guitar_hero.load_user(rec)
-        self.guitar_hero.update_view_items()
 
         # re-render the score viewer for the new instrument (no-op extra cost
         # during playback: this only runs here, on the instrument change)
@@ -611,10 +658,9 @@ class Attune(QMainWindow):
     def on_range_applied(self, low_midi: int, high_midi: int):
         """Set the active recording's Config frequency range from the chosen
         lowest/highest notes, then re-compute pitches with the new Config."""
-        if self.active_recording is None:
-            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+        rec = self._require_recording()
+        if rec is None:
             return
-        rec = self.active_recording
         config = rec.config
 
         # half-semitone padding so the boundary notes sit comfortably inside the
@@ -624,43 +670,32 @@ class Attune(QMainWindow):
         config.fmax = config.midi_to_freq(high_midi + MARGIN)
         rec.update_config(config)
 
-        # re-run pitch detection on the existing audio (if any) with the new
-        # range; detection_finished -> _on_detection_finished refreshes the view.
-        if rec.audio_data.end_index <= 0:
-            return
-        rec.pitch_detector.detect_pitches_async()
+        # re-run pitch detection on the existing audio (if any) with the new range
+        self.detect_pitches()
 
     def on_tuning_applied(self, tuning: float):
         """Set the active recording's Config tuning (A4 reference, Hz), then
         re-compute pitches with it (tuning drives the freq<->MIDI conversion)."""
-        if self.active_recording is None:
-            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+        rec = self._require_recording()
+        if rec is None:
             return
-        rec = self.active_recording
         rec.config.tuning = tuning
         rec.update_config(rec.config)
 
-        # re-run pitch detection on the existing audio (if any) with the new
-        # tuning; detection_finished -> _on_detection_finished refreshes the view.
-        if rec.audio_data.end_index <= 0:
-            return
-        rec.pitch_detector.detect_pitches_async()
+        # re-run pitch detection on the existing audio (if any) with the new tuning
+        self.detect_pitches()
 
     def on_tolerance_applied(self, tolerance: float):
         """Set the active recording's Config tolerance (semitone slack for a note
         to count as correct), then re-run just the mistake-detection (string-edit)
         step and refresh the mistake list + GuitarHero overlays."""
-        if self.active_recording is None:
-            QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
+        rec = self._require_recording()
+        if rec is None:
             return
-        rec = self.active_recording
         rec.config.tolerance = tolerance
         rec.update_config(rec.config)
 
-        rec.detect_mistakes()
-        self.guitar_hero.load_alignment(rec.alignment)
-        self.guitar_hero.update_view_items()
-        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
+        self.analyze()
 
     def on_score_renamed(self, title: str):
         """The Score Title was edited in the RecordingTree (the source of truth).

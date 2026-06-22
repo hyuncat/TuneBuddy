@@ -19,8 +19,8 @@ class Config:
     unv_ratio: float = 0.8 # proportion of unvoiced pitches in a window to consider the window unvoiced
 
     # --- STRING EDIT PARAMETERS ---
-    ins_cost: float = 1
-    del_cost: float = 1
+    ins_cost: float = 5
+    del_cost: float = 5
     sub_cost: float = 1
     tolerance: float = 0.3
 

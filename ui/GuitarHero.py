@@ -583,6 +583,10 @@ class GuitarHero(QWidget):
             self.user_notes_ins.setOpts(
                 x=x, width=width, y0=y0, height=height
             )
+        else:
+            # clear stale insertions (e.g. when switching to a recording that
+            # has none in view) — otherwise the old bars linger
+            self.user_notes_ins.setOpts(x=[], width=[], y0=[], height=[])
         # ---> MIDI DELETIONS OVERLAY --->
         if dels:
             starts = np.asarray([n.start_time for n in dels], dtype=np.float32)
@@ -597,6 +601,9 @@ class GuitarHero(QWidget):
             self.midi_notes_del.setOpts(
                 x=x, width=width, y0=y0, height=height
             )
+        else:
+            # clear stale deletions, same reasoning as insertions above
+            self.midi_notes_del.setOpts(x=[], width=[], y0=[], height=[])
 
     def highlight_mistake(self, mistake):
         """Pan to and highlight the note(s) involved in a mistake."""
