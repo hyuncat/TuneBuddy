@@ -45,6 +45,7 @@ class PracticeAttune(QMainWindow):
 
         self.is_playing = False
         self.is_recording = False
+        self.is_counting_in = False
 
         self.audio_recorder = AudioRecorder(self.recording)
         self.midi_synth = midi_synth if midi_synth is not None else MidiSynth("resources/MuseScore_General.sf3")
@@ -75,7 +76,7 @@ class PracticeAttune(QMainWindow):
         self.status_bar = StatusBar() # with default recording name
         self.status_bar.update_status("Ready...")
         self.setStatusBar(self.status_bar)
-        self.countdown_timer = CountdownTimer(self.status_bar, duration=2.0)
+        self.countdown_timer = CountdownTimer(self.status_bar, midi_synth=self.midi_synth)
 
     def init_slider_layout(self):
         """
@@ -150,17 +151,29 @@ class PracticeAttune(QMainWindow):
         self.play_button.setIcon(self.play_icon)
 
     def toggle_recording(self):
+        if self.is_counting_in:
+            # clicking again during the count-in cancels it (un-arm recording)
+            self.countdown_timer.cancel()
+            self.is_counting_in = False
+            self.record_button.setIcon(self.record_icon)
+            return
         if not self.is_recording:
-            # start the countdown timer, and once finished start the recording
-            self.countdown_timer.start()
+            # play a one-measure metronome count-in; _start_recording on finish
+            self.is_counting_in = True
+            self.record_button.setIcon(self.pause_icon)
+            self.countdown_timer.start(
+                beats=self.score_data.count_in_beats(),
+                channel=self.score_data.metronome_channel,
+            )
         else:
             self._stop_recording()
 
     def _start_recording(self):
-        """Called when the countdown timer finishes, to start the 
+        """Called when the countdown timer finishes, to start the
         recording and playback."""
         # update UI
         self.record_button.setIcon(self.pause_icon)
+        self.is_counting_in = False
         self.midi_player.stop() # stop things we don't want
         # reset stall variables
         self.wall_clock.stall = False

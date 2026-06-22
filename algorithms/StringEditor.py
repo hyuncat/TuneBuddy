@@ -67,7 +67,7 @@ class StringEditor:
                     SUB_COST = 0
                 else:
                     # weight the substitution by how far (semitones) the user note is off
-                    SUB_COST = min(abs(note_distance), 10)
+                    SUB_COST = min(abs(note_distance)*1.5, 10)
 
                 top_three = np.array([
                     top + self.DELETION_COST,
@@ -86,7 +86,15 @@ class StringEditor:
         notes = []
         mistakes_to_reverse_position = {}
         while i>0 or j>0:
-            mistake_type = backpointer[i, j]
+            # on the boundaries the backpointer is unset (0), so force the only
+            # legal move: all-insertions along the top row, all-deletions down
+            # the left column. otherwise the earliest notes get silently dropped.
+            if i == 0:
+                mistake_type = 2  # only user notes remain -> insertion
+            elif j == 0:
+                mistake_type = 0  # only score notes remain -> deletion
+            else:
+                mistake_type = backpointer[i, j]
             midi_note = midi_string.read_note(i=i-1) if i > 0 else None
             user_note = user_notes[j-1] if j > 0 else None
 

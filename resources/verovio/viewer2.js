@@ -36,10 +36,19 @@ window.loadScore = function(b64) {
     if (!tk) { setStatus("Verovio not ready"); return; }
     try {
         setStatus("Loading score...");
+        // lay the score out one system (line) per "page" so that paging
+        // through the score = scrolling line by line. adjustPageHeight trims
+        // each page down to the height of its single system, so the line fills
+        // the widget instead of floating in a tall blank page.
+        tk.setOptions({
+            systemMaxPerPage: 1,
+            adjustPageHeight: true,
+            breaks: "auto",
+        });
         // decode from base64 -> ascii and load into toolkit as string
         tk.loadData(atob(b64));
 
-        // now render the loaded page with verovio
+        // now render the loaded page (first line) with verovio
         currentPage = 1;
         renderPage(currentPage);
         setStatus("Ready");

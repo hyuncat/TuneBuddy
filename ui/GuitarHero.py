@@ -207,7 +207,9 @@ class GuitarHero(QWidget):
             'timeline': pg.mkPen(0, 255, 0, 255), # green
             'insertion': pg.mkBrush(0, 200, 0, 200), # green
             'deletion': pg.mkBrush(255, 0, 0, 200), # red
-            'substitution': pg.mkBrush(255, 220, 0, 60) # translucent yellow
+            'substitution': pg.mkBrush(255, 220, 0, 60), # translucent yellow
+            'measure': pg.mkPen(230, 230, 240, 20, width=4.0), # measure starts: thicker
+            'beat': pg.mkPen(230, 230, 240, 20, width=1.0), # beats: thinner
         }
         # new shit
         self.rest_brush = pg.mkBrush(140, 140, 140)
@@ -295,6 +297,14 @@ class GuitarHero(QWidget):
         self.plot.addItem(self.user_pitches)
         self.plot.addItem(self.timeline)
         self.plot.addItem(self.highlight_bar)
+
+        # --- beat / measure gridlines ---
+        # Pooled vertical InfiniteLines, generated from score_data.beats (the same
+        # beatmap used to drive the metronome). Downbeats (measure starts) are drawn
+        # with the thicker 'measure' pen, regular beats with the thinner 'beat' pen.
+        # The pool grows lazily to the max number of beats visible at once.
+        self.GRIDLINE_Z = 0  # above the MIDI background (-1), below the notes (1)
+        self.gridlines: list[pg.InfiniteLine] = []
 
     def init_view(self):
         """initialize the viewbox settings"""
@@ -394,6 +404,7 @@ class GuitarHero(QWidget):
         # print(f"Updating view items for x_range={x_range}...")
         
         # --- USER PITCHES + NOTES UPDATING ---
+        self.update_grid_items(x_range)
         self.update_user_items(x_range)
         self.update_midi_items(x_range)
         self.update_alignment_items(x_range)
@@ -484,6 +495,46 @@ class GuitarHero(QWidget):
         height = np.full_like(midis, self.NOTE_HEIGHT)
         
         self.midi_notes.setOpts(x=x, width=width, y0=y0, height=height)
+
+    def _get_gridline(self, idx: int) -> pg.InfiniteLine:
+        """Return the idx-th pooled gridline, lazily creating (and adding) it."""
+        while idx >= len(self.gridlines):
+            line = pg.InfiniteLine(angle=90, pen=self.colors['beat'])
+            line.setZValue(self.GRIDLINE_Z)
+            # ignoreBounds so the gridlines never affect autorange (like the bg)
+            self.plot.addItem(line, ignoreBounds=True)
+            self.gridlines.append(line)
+        return self.gridlines[idx]
+
+    def update_grid_items(self, x_range: tuple[float, float]):
+        """Update the beat/measure gridlines to fit the given x_range.
+
+        Reuses score_data.beats (the metronome beatmap): each entry is a
+        (time_sec, is_downbeat) tuple. Downbeats are measure starts and get the
+        thicker 'measure' pen; the rest get the thinner 'beat' pen.
+        """
+        beats = getattr(self.score_data, "beats", None) if self.score_data else None
+        if not beats:
+            for line in self.gridlines:
+                line.hide()
+            return
+
+        xmin, xmax = x_range
+        idx = 0
+        for i, (beat_time, is_downbeat) in enumerate(beats):
+            # if not is_downbeat:
+            #     continue
+            if beat_time < xmin or beat_time > xmax:
+                continue
+            line = self._get_gridline(idx)
+            line.setPos(beat_time)
+            line.setPen(self.colors['measure'] if is_downbeat else self.colors['beat'])
+            line.show()
+            idx += 1
+
+        # hide any pooled lines left over from a wider/denser view
+        for j in range(idx, len(self.gridlines)):
+            self.gridlines[j].hide()
 
     def update_alignment_items(self, x_range: tuple[float, float]):
         """Update the alignment overlay items (insertions, deletions, match lines)

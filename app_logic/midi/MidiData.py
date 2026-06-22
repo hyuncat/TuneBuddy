@@ -3,6 +3,13 @@ import mido
 
 from app_logic.NoteData import NoteData, Note
 
+# --- metronome / woodblock click constants ---
+# shared between init_metronome (embedded score clicks) and the count-in
+WOODBLOCK_PROGRAM = 115
+CLICK_DURATION = 0.1  # sec
+DOWNBEAT_NOTE = 80
+BEAT_NOTE = 40
+
 class MidiData:
     def __init__(self, filepath: str | Path):
         """
@@ -132,11 +139,6 @@ class MidiData:
         """Initialize the metronome by adding meta messages at the specified beat times.
         This allows us to visualize the beats in the piano roll and guitar hero view.
         """
-        WOODBLOCK_PROGRAM = 115
-        CLICK_DURATION = 0.1
-
-        DOWNBEAT_NOTE = 80
-        BEAT_NOTE = 40
         # add metronome on a new channel after all instruments
         channel = len(self.instruments.keys()) 
         pc = mido.Message(

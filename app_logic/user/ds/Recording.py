@@ -108,18 +108,49 @@ class Recording:
         self.pitch_data.write(indata, start_time)
         self.p2n_queue.push(indata)
 
-    def get_length(self):
-        if len(self.note_data.times) > 0:
-            return self.note_data.get_length()
-        else:
-            return self.audio_data.get_length()
+    def get_length(self, raw=True):
+        if raw:
+            if len(self.note_data.times) > 0:
+                return self.note_data.get_length()
+            else:
+                return self.audio_data.get_length()
+        # get start time of first VOICED note, end time of last note
+        start_time = self._get_first_note(voiced=True).start_time
+        end_time = self._get_last_note(voiced=True).end_time
+        return end_time - start_time
+    
+    def _get_first_note(self, voiced=True):
+        if not voiced:
+            return self.note_data.data[0] if self.note_data.data else None
+        for n in self.note_data.data.values():
+            if n.midi_num[0] != -1:
+                return n
+        return 0
+    
+    def _get_last_note(self, voiced=True):
+        if not voiced:
+            return self.note_data.data[-1] if self.note_data.data else None
+        for n in reversed(self.note_data.data.values()):
+            if n.midi_num[0] != -1:
+                return n
+        return 0
     
     def resize(self, new_length: float):
-        """Resize the score_data to a new length by changing the BPM of the score data, 
+        """Resize the score_data to a new length by changing the BPM of the score data,
         updating the note timings and pitch distances as well."""
-        factor = new_length / self.score_data.length
-        new_bpm = round(self.score_data.bpm * factor)
-        self.score_data.change_tempo(new_bpm, _factor=factor)
+        # Derive the target bpm against the ORIGINAL length/tempo and let
+        # change_tempo recompute the stretch factor from it (factor defaults to
+        # bpm_og / new_bpm). This makes a resize behave exactly like a manual
+        # tempo change, keeping self.bpm and self.length in the strict 1/bpm
+        # relationship the score-viewer's bpm/bpm_og time mapping relies on.
+        # (The old code anchored the factor to the *current* length and even
+        # inverted the bpm, corrupting self.bpm after Analyze.)
+        factor = new_length / self.score_data.midi_data.length_og
+        new_bpm = round(self.score_data.bpm_og / factor)
+        self.score_data.change_tempo(new_bpm)
+        start_time = self._get_first_note(voiced=True).start_time
+        # transpose all score notes by start_time
+        self.score_data.transpose_notes(start_time)
         self._update_pitch_distances()
 
     def change_tempo(self, new_bpm: float):

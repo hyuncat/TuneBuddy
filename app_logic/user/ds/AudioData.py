@@ -1,6 +1,8 @@
 import numpy as np
 import threading
 import soundfile as sf
+import librosa
+from pydub import AudioSegment
 
 from algorithms.Config import Config
 
@@ -31,10 +33,15 @@ class AudioData:
         Args:
             audio_filepath (str): A correct file path pointing to audio data to load
         """
-        data, sr = sf.read(audio_filepath, always_2d=True)
-
-        # collapse all channels to mono
-        data = data.mean(axis=1)
+        if audio_filepath.endswith(".m4a"):
+            seg = AudioSegment.from_file(audio_filepath, format="m4a")
+            sr = seg.frame_rate
+            samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+            samples = samples.reshape(-1, seg.channels).mean(axis=1)
+            data = samples / (2 ** (seg.sample_width * 8 - 1))
+        else:
+            data, sr = sf.read(audio_filepath, always_2d=True)
+            data = data.mean(axis=1)
 
         self.data = data
         self.sr = sr

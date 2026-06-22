@@ -72,6 +72,7 @@ class Attune(QMainWindow):
         # --> playback state variables
         self.is_playing = False
         self.is_recording = False
+        self.is_counting_in = False
         self.user_playback_enabled = True
 
         # instrument control
@@ -88,7 +89,10 @@ class Attune(QMainWindow):
             - main window (title + geom)
             - splitter
                 - recordings file tree
-                - score viewer
+                - center column (vertical splitter)
+                    - score viewer (top)
+                    - guitar hero (bottom)
+                - mistake widget
             - slider layout
                 - play/pause button
                 - record button
@@ -108,7 +112,7 @@ class Attune(QMainWindow):
         self.setCentralWidget(self.central_widget)
         self._layout = QVBoxLayout(self.central_widget)
 
-        # --- (splitter stuff) MAIN RECORDINGS TREE // SCORE VIEWER ---
+        # --- (splitter stuff) RECORDINGS TREE | [SCORE VIEWER / GUITAR HERO] | MISTAKES ---
         self.splitter = QSplitter(Qt.Orientation.Horizontal) # allows horizontal resizing
         self.recordings_tree = RecordingTree(self.recordings)
         ABSOLUTE_PROJECT_ROOT = Path(__file__).resolve().parent
@@ -126,17 +130,25 @@ class Attune(QMainWindow):
 
         self.guitar_hero = GuitarHero(self.active_recording)
         self.mistake_widget = MistakeWidget()
+
+        # center column: score viewer stacked ON TOP of the guitar hero, with a
+        # vertical splitter between them so both are adjustable in height.
+        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.center_splitter.addWidget(self.score_viewer_container)
+        self.center_splitter.addWidget(self.guitar_hero)
+        self.center_splitter.setStretchFactor(0, 1)  # score viewer grows
+        self.center_splitter.setStretchFactor(1, 1)  # guitar hero grows
+        self.center_splitter.setSizes([250, 450])    # initial heights (resizable)
+
         # add the widgets
         self.splitter.addWidget(self.recordings_tree)
-        self.splitter.addWidget(self.score_viewer_container)
-        self.splitter.addWidget(self.guitar_hero)
+        self.splitter.addWidget(self.center_splitter)
         self.splitter.addWidget(self.mistake_widget)
         # set behavior controls
         self.splitter.setStretchFactor(0, 0)  # recordings tree is fixed-ish
-        self.splitter.setStretchFactor(1, 1)  # score viewer grows
-        self.splitter.setStretchFactor(2, 1)  # guitar hero grows
-        self.splitter.setStretchFactor(3, 0)  # mistake widget is fixed-ish
-        
+        self.splitter.setStretchFactor(1, 1)  # center column grows
+        self.splitter.setStretchFactor(2, 0)  # mistake widget is fixed-ish
+
         self._layout.addWidget(self.splitter)
 
         # --- INIT SLIDER LAYOUT ---
@@ -145,7 +157,7 @@ class Attune(QMainWindow):
         # --- UTILITIES --- 
         self.status_bar = StatusBar(name="untitled_recording") # with default recording name
         self.setStatusBar(self.status_bar)
-        self.countdown_timer = CountdownTimer(self.status_bar, duration=2.0)
+        self.countdown_timer = CountdownTimer(self.status_bar, midi_synth=self.midi_synth)
         self.toolbar = Toolbar(score_data=self.score_data)
         self.addToolBar(self.toolbar)
         
@@ -300,18 +312,30 @@ class Attune(QMainWindow):
         if self.active_recording is None:
             QMessageBox.warning(self, "No recording selected", "Please select a recording to record into.")
             return
+        if self.is_counting_in:
+            # clicking again during the count-in cancels it (un-arm recording)
+            self.countdown_timer.cancel()
+            self.is_counting_in = False
+            self.record_button.setIcon(self.record_icon)
+            return
         if not self.is_recording:
-            # start the countdown timer, and once finished start the recording
-            self.countdown_timer.start()
+            # play a one-measure metronome count-in; _start_recording on finish
+            self.is_counting_in = True
+            self.record_button.setIcon(self.pause_icon)
+            self.countdown_timer.start(
+                beats=self.score_data.count_in_beats(),
+                channel=self.score_data.metronome_channel,
+            )
         else:
             self._stop_recording()
 
     def _start_recording(self):
-        """Called when the countdown timer finishes, to start the 
+        """Called when the countdown timer finishes, to start the
         recording and playback."""
         # update UI
         self.record_button.setIcon(self.pause_icon)
         # stuff
+        self.is_counting_in = False
         t = self.slider.get_time()
         self.is_recording = True
         self.audio_player.stop()
@@ -360,21 +384,11 @@ class Attune(QMainWindow):
         self.active_recording.config.h2 = best_w2 - 2
         self.active_recording.update_config(self.active_recording.config)
 
-    def analyze(self):
-        print("analyzing... ")
-
-        self._find_best_w2()
-
-        # detect notes
-        self.active_recording.detect_notes()
-        # update midi length to match recording length
-            # update p.distances to reflect new midi note durations
-        length = self.active_recording.get_length()
-        self.active_recording.resize(new_length = length)
-        # string edit
-        self.active_recording.detect_mistakes()
-        # self.active_recording.correct_mistakes()
-
+    def mistake_correction_loop(self):
+        """run mistake correction until it stops improving"""
+        if not self.active_recording or not self.active_recording.alignment:
+            print("No active recording or alignment to correct mistakes on.")
+            return
         n_mistakes = len(self.active_recording.alignment.mistakes)
         print(f"initial mistakes: {n_mistakes}")
         while True:
@@ -395,6 +409,22 @@ class Attune(QMainWindow):
                 break
             n_mistakes = new_n_mistakes  # made progress -> raise the baseline
 
+    def analyze(self):
+        print("analyzing... ")
+
+        self._find_best_w2()
+
+        # detect notes
+        self.active_recording.detect_notes()
+        # update midi length to match recording length
+            # update p.distances to reflect new midi note durations
+        length = self.active_recording.get_length(raw=True)
+        self.active_recording.resize(new_length = length)
+        # string edit
+        self.active_recording.detect_mistakes()
+        # self.active_recording.correct_mistakes()
+        self.mistake_correction_loop()
+
         # update scoreplot
         # update guitar hero bounds and reload user data (in case note/alignment was overwritten)
         self.guitar_hero.load_alignment(self.active_recording.alignment)
@@ -404,6 +434,20 @@ class Attune(QMainWindow):
         self.mistake_widget.load_mistakes(self.active_recording.alignment.mistakes)
         
     # --- SIGNAL-RELATED ACTIONS ---
+    def _score_viewer_time(self, t: float) -> float:
+        """Map a wall-clock time `t` (in the *current* tempo's timeframe) back
+        into the *original* score tempo's timeframe.
+
+        The Verovio render is never reloaded on a tempo change, so its internal
+        timemap (used by getElementsAtTime) stays in the original tempo. Playing
+        at a different tempo stretches/squeezes wall-clock time by
+        bpm_og / bpm, so we undo that here before driving the score cursor.
+        """
+        bpm_og = self.score_data.bpm_og or self.score_data.bpm
+        if not bpm_og:
+            return t
+        return t * self.score_data.bpm / bpm_og
+
     def update_time_label(self, t: float):
         """Update the time label based on current time t."""
         def format_time(seconds: float) -> str:
@@ -424,7 +468,7 @@ class Attune(QMainWindow):
             return
         # else, move the score and guitar hero plots
         self.score_data.update_time(t)
-        self.score_viewer.set_playback_time(t)
+        self.score_viewer.set_playback_time(self._score_viewer_time(t))
         self.guitar_hero.move_plot(t)
 
     def slider_changed(self, t: float):
@@ -435,7 +479,7 @@ class Attune(QMainWindow):
             return
         # else, move the score and guitar hero plots
         self.score_data.update_time(t)
-        self.score_viewer.set_playback_time(t)
+        self.score_viewer.set_playback_time(self._score_viewer_time(t))
         self.guitar_hero.move_plot(t)
 
     def slider_end(self, t: float):
@@ -476,7 +520,8 @@ class Attune(QMainWindow):
             return
         self.score_data.change_tempo(new_bpm)
         self.guitar_hero.update_view_items()
-        self.score_viewer.load_score(self.score_data) # reload score to update tempo changes
+        # don't reload the score viewer: Verovio keeps its original-tempo render
+        # and _score_viewer_time() maps the new wall-clock time back into it.
         self.slider.update_range(score_data=self.score_data, recording=self.active_recording)
 
     def on_mistake_override_toggled(self, idx: int):

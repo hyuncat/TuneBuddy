@@ -83,6 +83,10 @@ class ScoreData:
 
         self.length = self.midi_data.length_og
         self.bpm = self.score.metronomeMarkBoundaries()[0][2].number if self.score.metronomeMarkBoundaries() else 120
+        # remember the tempo Verovio renders the score at, so later tempo changes
+        # can be mapped back into the original timeframe (and so change_tempo /
+        # resize compute their factors against the true original tempo).
+        self.bpm_og = self.bpm
         self.bounds = (0.0, self.length)
 
         # initialize metronome beats from the score
@@ -154,9 +158,12 @@ class ScoreData:
     def resize(self, new_length: float):
         """Resize the score to a new length in seconds. Calls change_tempo
         under the hood with new BPM."""
+        # length is inversely proportional to bpm, anchored to the original
+        # length/tempo: a longer target => a slower (lower) bpm. Let change_tempo
+        # recompute the factor from new_bpm so bpm and length stay consistent.
         factor = new_length / self.midi_data.length_og
-        new_bpm = round(self.bpm_og * factor)
-        self.change_tempo(new_bpm, _factor=factor)
+        new_bpm = round(self.bpm_og / factor)
+        self.change_tempo(new_bpm)
 
     def get_bpm(self) -> float:
         """Get BPM from music21 score. If none, default to 120 BPM."""
@@ -217,4 +224,40 @@ class ScoreData:
             elapsed_time += (length_ql / beat_ql) * sec_per_beat
 
         return beat_events
+
+    def count_in_beats(self, measures: int = 1) -> list[tuple[float, bool]]:
+        """Beat offsets (sec) for a metronome count-in of `measures` measures,
+        based on the score's first time signature at the *current* tempo.
+
+        e.g. 4/4 -> 4 quarter-note clicks; 6/8 -> 2 dotted-quarter clicks.
+        The first beat of each measure is a downbeat.
+
+        Returns:
+            A list of (offset_sec, is_downbeat) tuples, starting at 0.0.
+        """
+        # find the first time signature, defaulting to 4/4
+        ts = None
+        if self.score is not None:
+            tss = list(self.score.flatten().getElementsByClass(meter.TimeSignature))
+            ts = tss[0] if tss else None
+        if ts is None:
+            ts = meter.TimeSignature('4/4')
+
+        beat_ql = float(ts.beatDuration.quarterLength)
+        measure_len_ql = float(ts.barDuration.quarterLength)
+        beats_per_measure = round(measure_len_ql / beat_ql)
+        sec_per_beat = beat_ql * (60.0 / self.bpm)  # bpm is quarter-note based
+
+        beats: list[tuple[float, bool]] = []
+        for k in range(beats_per_measure * measures):
+            offset = round(k * sec_per_beat, 9)
+            is_downbeat = (k % beats_per_measure == 0)
+            beats.append((offset, is_downbeat))
+        return beats
     
+    def transpose_notes(self, offset_sec: float):
+        """Transpose all notes in the score by offset_sec seconds. Used for resizing."""
+        for notedata in self.note_datas.values():
+            for note in notedata.data.values():
+                note.start_time += offset_sec
+                note.end_time += offset_sec
