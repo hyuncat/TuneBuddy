@@ -190,6 +190,54 @@ class Recording:
             pitches = self.pitch_data.read(start_time=note.start_time, end_time=note.end_time, clean=True)
             for p in pitches:
                 p.distance = note.midi_num[0] - p.candidates[0][0]
+
+    # default align_distance for voiced pitches that no aligned note covers
+    # (transitions / slides between notes): 0.0 => green. Don't penalize them.
+    TRANSITION_DISTANCE = 0.0
+
+    def update_alignment_distances(self):
+        """Recompute every pitch's `align_distance` from the current string-edit
+        alignment (call after analyze()/detect_mistakes()).
+
+        Unlike `_update_pitch_distances`, which keys each pitch off the score note
+        sitting at its absolute time, this keys off the note pairing the string
+        edit chose:
+          - deletion (no user note): nothing to color, skipped.
+          - insertion (user note, no score match): all its pitches -> inf (red).
+          - good / substitution: distance to the *aligned* score note's pitch.
+
+        Voiced pitches not covered by any aligned note (transitions between notes)
+        default to green (TRANSITION_DISTANCE) rather than the live per-frame
+        distance. Truly empty/unvoiced frames stay None. So in post-analysis every
+        *drawn* pitch has an align_distance and nothing falls back to live coloring;
+        while recording (pitches detected fresh) they're all None -> live coloring."""
+        # reset first so stale post-analysis colors never linger
+        for p in self.pitch_data.data:
+            if p is not None:
+                p.align_distance = None
+
+        for user_note, midi_note in self.alignment.pairs:
+            if user_note is None:
+                continue  # deletion: score note with no user pitches to color
+            pitches = self.pitch_data.read(
+                start_time=user_note.start_time,
+                end_time=user_note.end_time,
+                clean=True,
+            )
+            if midi_note is None:
+                # insertion: a note that isn't in the score at all -> all red
+                for p in pitches:
+                    p.align_distance = float('inf')
+            else:
+                target = midi_note.midi_num[0]
+                for p in pitches:
+                    p.align_distance = target - p.candidates[0][0]
+
+        # transitions: any remaining voiced (drawable) pitch no note covered.
+        # color these green by default instead of leaving them to live coloring.
+        for p in self.pitch_data.data:
+            if p is not None and p.align_distance is None and p.candidates:
+                p.align_distance = self.TRANSITION_DISTANCE
     
     def toggle_mistake_override(self, mistake_index: int):
         #error checking

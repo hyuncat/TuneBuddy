@@ -48,7 +48,13 @@ class Pitch:
         self.volume = volume # mean |amplitude| of the frame
         self.unvoiced_prob = unvoiced_prob # how messy the signal was (no clean periodicity)
 
-        self.distance = distance # distance to target note
+        self.distance = distance # distance to target note (live / absolute-time)
+
+        # post-analysis distance, assigned from the string-edit alignment rather
+        # than the score note at this frame's absolute time. None until analyze()
+        # runs; GuitarHero falls back to `distance` (live coloring) when it's None.
+        # A pitch inside an insertion gets float('inf') so it always colors red.
+        self.align_distance = None
 
 class PitchData:
     def __init__(self, config: Config):

@@ -79,6 +79,10 @@ class Attune(QMainWindow):
         self.is_recording = False
         self.is_counting_in = False
         self.user_playback_enabled = True
+        # set when Analyze is pressed while offline pitch detection is still
+        # running; _on_detection_finished runs the deferred analyze once the
+        # smoothed pitch track is ready (analyzing raw pitches gives garbage)
+        self._pending_analyze = False
 
         # instrument control
         self.displayed_instruments: set[int] = set() # programs to display
@@ -391,11 +395,24 @@ class Attune(QMainWindow):
         rec.detect_notes()
         self.guitar_hero.load_user(rec)
 
+    def _detection_in_flight(self) -> bool:
+        """True while the active recording's offline pitch detection+smoothing
+        thread is still running (so its pitch_data isn't ready to analyze)."""
+        rec = self.active_recording
+        if rec is None:
+            return False
+        thread = getattr(rec.pitch_detector, "offline_thread", None)
+        return bool(thread and thread.is_alive())
+
     def _on_detection_finished(self):
         """Offline pitch detection finished (queued onto the main thread): clear
-        the status message and load the now-ready pitch data into the view."""
+        the status message and load the now-ready pitch data into the view. If an
+        Analyze press was deferred while detection ran, run it now."""
         self.status_bar.update_status("")
         self.guitar_hero.load_user(self.active_recording)
+        if self._pending_analyze:
+            self._pending_analyze = False
+            self.analyze()
 
     # --- PLAYBACK / RECORDING TOGGLES ---
     def toggle_playback(self):
@@ -522,6 +539,14 @@ class Attune(QMainWindow):
         rec = self._require_recording()
         if rec is None:
             return
+        # don't analyze raw/partial pitches: if offline detection+smoothing is
+        # still running in the background, defer until it finishes (the smoothed
+        # track has the octave errors / noise cleaned up). _on_detection_finished
+        # will re-call analyze() once the pitch_data is ready.
+        if self._detection_in_flight():
+            self._pending_analyze = True
+            self.status_bar.update_status("Detecting pitches… will analyze when ready")
+            return
         print("analyzing... ")
         self.cleanup() # clear stale notes/alignment/mistakes before recomputing
 
@@ -533,6 +558,11 @@ class Attune(QMainWindow):
         rec.resize(new_length=length)
         rec.detect_mistakes()
         self.mistake_correction_loop()
+
+        # color the user pitches by the final alignment (insertions red, others by
+        # distance to their *aligned* score note) instead of the live per-frame
+        # distance. Runs after the correction loop so it reflects the final pairs.
+        rec.update_alignment_distances()
 
         # reload every view with the fresh analysis (note/alignment may have been
         # overwritten by the correction loop)

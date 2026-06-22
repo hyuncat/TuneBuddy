@@ -88,7 +88,7 @@ class MistakeChecker:
         if self.verbose:
             print(f"      [split] host@{host.start_time:.2f} -> "
                   f"halves=[{split[0].midi_num[0]:.1f}, {split[1].midi_num[0]:.1f}] "
-                  f"targets=({targets[0]:.1f}, {targets[1]:.1f}) resembles={ok} (tol={self.config.tolerance})")
+                  f"targets=({targets[0]:.1f}, {targets[1]:.1f}) resembles={ok} (tol={self.config.pitch_thresh})")
         if not ok:
             return None
         return [host], split
@@ -164,9 +164,9 @@ class MistakeChecker:
             aligned = self._is_well_aligned(neighbor)
             if self.verbose:
                 print(f"      [merge?] inserted={pitch:.1f} | {label}({neighbor.midi_num[0]:.1f}"
-                      f"@{neighbor.start_time:.2f}) dist={dist:.2f} (<={self.config.tolerance}?)"
+                      f"@{neighbor.start_time:.2f}) dist={dist:.2f} (<={self.config.pitch_thresh}?)"
                       f" well_aligned={aligned}")
-            if dist <= self.config.tolerance and aligned:
+            if dist <= self.config.pitch_thresh and aligned:
                 candidates.append((dist, neighbor))
 
         if not candidates:
@@ -182,7 +182,7 @@ class MistakeChecker:
         score_note = self.recording.alignment.get_match(user_note=user_note)
         if score_note is None:
             return False
-        return abs(user_note.midi_num[0] - score_note.midi_num[0]) <= self.config.tolerance
+        return abs(user_note.midi_num[0] - score_note.midi_num[0]) <= self.config.pitch_thresh
 
     def _count_close(self, note: Note, intended: Note) -> int:
         """How many of `note`'s voiced pitch frames sit within tolerance of the
@@ -191,7 +191,7 @@ class MistakeChecker:
         pitches = self.pd.read(start_time=note.start_time, end_time=note.end_time, clean=True)
         target = intended.midi_num[0]
         return sum(1 for p in pitches
-                   if p.candidates and abs(p.candidates[0][0] - target) <= self.config.tolerance)
+                   if p.candidates and abs(p.candidates[0][0] - target) <= self.config.pitch_thresh)
 
     def _split_resembles_score(self, split: list, targets: tuple) -> bool:
         """Accept a split only if each half resembles the score note it would
@@ -199,7 +199,7 @@ class MistakeChecker:
         in the same order as the split halves, so each half must land within
         tolerance of its target. (`< tol` matches StringEditor's "same note"
         convention.)"""
-        tol = self.config.tolerance
+        tol = self.config.pitch_thresh
         return all(abs(note.midi_num[0] - target) <= tol
                    for note, target in zip(split, targets))
 

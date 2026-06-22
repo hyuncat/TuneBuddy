@@ -227,10 +227,20 @@ class GuitarHero(QWidget):
                 alpha = (d - 0.5) / (self.max_dist - 0.5)
                 alpha = max(0.0, min(alpha, 1.0))
                 hue = int(120 * (1.0 - alpha))
-        
+
             color = QColor()
             color.setHsv(hue, 255, 255)
             self.distance_brushes.append(pg.mkBrush(color))
+
+        # --- POST-ANALYSIS (alignment-based) palette ---
+        # Used after analyze() for pitches that carry an `align_distance`. Both
+        # bounds scale with the recording's string-edit tolerance: green within
+        # `tolerance` semitones of the aligned score note, then ramps green->red
+        # out to ALIGN_MAX_MULT * tolerance (insertions, stored as inf, clamp to
+        # the max bucket => solid red). Rebuilt per-recording in load_user().
+        self.ALIGN_MAX_MULT = 4.0
+        self.align_distance_brushes = []
+        self._build_align_brushes(tolerance=0.3)  # default; rebuilt per-recording
 
     def init_objects(self):
         """Initialize all foreground plot items, including:
@@ -380,6 +390,8 @@ class GuitarHero(QWidget):
         self.recording = recording
         self.score_data = recording.score_data
         self.alignment = recording.alignment
+        # green band + red ramp track this recording's string-edit tolerance
+        self._build_align_brushes(tolerance=recording.config.tolerance)
         self.clear_highlight()
         self.update_view_items()
 
@@ -432,7 +444,14 @@ class GuitarHero(QWidget):
             for c in p.candidates:
                 xs.append(p.time)
                 ys.append(c[0]) # pitch value
-                brushes.append(self.get_distance_brush(getattr(p, "distance", None)))
+                # after analyze() pitches carry an alignment-based distance; color
+                # by that. while recording (or pre-analysis) it's None, so fall
+                # back to the live per-frame distance coloring.
+                ad = getattr(p, "align_distance", None)
+                if ad is not None:
+                    brushes.append(self.get_align_distance_brush(ad))
+                else:
+                    brushes.append(self.get_distance_brush(getattr(p, "distance", None)))
                 break
                     
         # get_alpha = lambda p: int(50 + 205*(1 - p.candidates[0][1]))
@@ -652,6 +671,40 @@ class GuitarHero(QWidget):
         idx = int(d / self.distance_step)
         idx = min(idx, len(self.distance_brushes) - 1)
         return self.distance_brushes[idx]
+
+    def _build_align_brushes(self, tolerance: float):
+        """(Re)build the post-analysis palette from the string-edit `tolerance`:
+        green within `tolerance` semitones of the aligned note, ramping green->red
+        out to ALIGN_MAX_MULT * tolerance. Both bounds scale with tolerance so a
+        looser tolerance widens the whole green->red span."""
+        green_thresh = max(float(tolerance), 0.0)
+        # keep at least one bucket of ramp even if tolerance is ~0
+        max_dist = max(self.ALIGN_MAX_MULT * green_thresh, green_thresh + self.distance_step)
+        self.align_green_thresh = green_thresh
+        self.align_max_dist = max_dist
+
+        self.align_distance_brushes = []
+        num_buckets = int(max_dist / self.distance_step) + 1
+        for i in range(num_buckets):
+            d = i * self.distance_step
+            if d <= green_thresh:
+                hue = 120
+            else:
+                frac = (d - green_thresh) / (max_dist - green_thresh)
+                frac = max(0.0, min(frac, 1.0))
+                hue = int(120 * (1.0 - frac))
+
+            color = QColor()
+            color.setHsv(hue, 255, 255)
+            self.align_distance_brushes.append(pg.mkBrush(color))
+
+    def get_align_distance_brush(self, d: float):
+        """Brush for an alignment-based distance. inf (insertions) clamps to the
+        max bucket => solid red."""
+        d = min(abs(float(d)), self.align_max_dist)
+        idx = int(d / self.distance_step)
+        idx = min(idx, len(self.align_distance_brushes) - 1)
+        return self.align_distance_brushes[idx]
 
 
 
