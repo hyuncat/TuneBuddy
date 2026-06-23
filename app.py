@@ -742,7 +742,7 @@ class Attune(QMainWindow):
         """Called when user toggles the user audio playback option in the toolbar."""
         self.user_playback_enabled = checked
         if not checked:
-            self.audio_player.pause()
+            self.audio_player.stop()
 
     def on_tempo_changed(self, new_bpm: int):
         """Called when user changes the tempo in the toolbar. Update the score data and 

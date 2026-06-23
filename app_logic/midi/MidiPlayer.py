@@ -94,10 +94,15 @@ class MidiPlayer(QObject):
             messages = midi_data.messages[current_time]
 
             for msg in messages:
-                # only handle messages in active_channels
-                if hasattr(msg, "channel") and msg.channel in self.score_data.playing_instruments:
+                if msg.is_meta:
                     self.midi_synth.handle_midi(msg)
-                elif msg.is_meta:
+                    continue
+                channel = getattr(msg, "channel", None)
+                enabled = channel in self.score_data.playing_instruments
+                # only sound enabled channels, but ALWAYS let note_off through so
+                # toggling a channel (e.g. the metronome) off mid-playback never
+                # leaves a hanging note. A note_off on a silent note is a no-op.
+                if enabled or msg.type == "note_off":
                     self.midi_synth.handle_midi(msg)
                 
             # compute time to sleep until next msg

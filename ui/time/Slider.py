@@ -50,7 +50,14 @@ class Slider(QWidget):
 
     # --- RANGE HANDLING ---
     def update_range(self, score_data=None, recording=None):
-        """Update the slider range based on max(MIDI.length, audio.length)"""
+        """Update the slider range based on max(MIDI.length, audio.length).
+
+        The left edge sits one slider click (1 / hz) before the earlier of the
+        score's first note (S) and the user's first played note (U), so neither
+        gets clipped at the very edge of the comparison. This slider is the master
+        timeline driving the ScoreViewer cursor and GuitarHero, so the lead-in
+        lands there rather than in the score translation (resize keeps S aligned
+        as closely as possible to U)."""
         m0, m1, u1 = 0, 0, 0
         if score_data:
             note_data = score_data.note_datas.get(score_data.active_instrument, None)
@@ -59,9 +66,27 @@ class Slider(QWidget):
         if recording and recording.audio_data:
             u1 = recording.audio_data.get_length()
 
-        x0 = m0
+        # one slider click before min(S, U), clamped to 0 (can't seek negative)
+        one_click = 1.0 / self.TICKS_PER_SEC
+        first_notes = [m0]
+        u0 = self._user_first_note_start(recording)
+        if u0 is not None:
+            first_notes.append(u0)
+        x0 = max(0.0, min(first_notes) - one_click)
+
         x1 = max(m1, u1+m0)
         self._update_range(x0, x1)
+
+    @staticmethod
+    def _user_first_note_start(recording) -> float | None:
+        """Start time of the recording's first voiced note (the same note resize()
+        aligns the score to), or None if there isn't one yet (no recording / no
+        notes detected). `Recording._get_first_note` returns 0 (an int, not a
+        Note) when nothing is voiced — guard on that."""
+        if recording is None:
+            return None
+        note = recording._get_first_note(voiced=True)
+        return note.start_time if hasattr(note, "start_time") else None
 
     def _update_range(self, start_time: float, end_time: float):
         """update the slider range to have [sec] amount of space"""

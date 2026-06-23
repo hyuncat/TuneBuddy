@@ -33,6 +33,15 @@ class ScoreData:
         # clipping
         self.bounds: tuple[float, float] = (0.0, 0.0) # (start_time, end_time)
 
+        # metronome beat grid: (time_sec, is_downbeat) tuples, also drives the
+        # GuitarHero vertical gridlines. `beats_og` is the baseline at the
+        # original tempo with no resize offset; `beats` is the live grid, rebuilt
+        # from it whenever the timing changes (change_tempo / resize) so the
+        # gridlines track the score. `_beat_offset` mirrors transpose_notes' shift.
+        self.beats: list[tuple[float, bool]] = []
+        self.beats_og: list[tuple[float, bool]] = []
+        self._beat_offset: float = 0.0
+
         # note reading
         self.i = 0 # index of current note
 
@@ -96,8 +105,12 @@ class ScoreData:
         self.bpm_og = self.bpm
         self.bounds = (0.0, self.length)
 
-        # initialize metronome beats from the score
+        # initialize metronome beats from the score; keep an untransformed
+        # baseline so tempo/resize changes can rebuild the live grid (and the
+        # GuitarHero gridlines) without drift.
         self.beats = self.init_beats()
+        self.beats_og = list(self.beats)
+        self._beat_offset = 0.0
         self.midi_data.init_metronome(self.beats)
 
         # init stuff from midi
@@ -241,27 +254,43 @@ class ScoreData:
         if new_bpm == self.bpm or self.score is None:
             return # no change needed
         
-        # 1. change tempo in midi data
+        # 1. change tempo in midi data (rebuilds messages from the original score)
         self.midi_data.change_tempo(factor)
         # 2. change tempo in music21 score
         for mark in self.score.recurse().getElementsByClass(tempo.MetronomeMark):
             mark.number = round(mark.number * factor)
-        # 3. remake notedatas
-        self.note_datas = self.midi_data.make_notedatas()
-        # new_notedatas = {}
-        # for channel, notedata in self.note_datas.items():
-        #     new_notedata = NoteData()
-        #     new_notedata.times = [t * factor for t in notedata.times]
-        #     new_notedata.data = {t * factor: n for t, n in notedata.data.items()}
-        #     for n in new_notedata.data.values():
-        #         n.start_time = n.start_time * factor
-        #         n.end_time = n.end_time * factor
-        #     new_notedatas[channel] = new_notedata
-        # self.note_datas = new_notedatas
-        # 4. update metadata
+        # 3. update metadata
         self.bpm = new_bpm
         self.length = self.midi_data.length_og * factor
+        # 4. rebuild the beat grid + re-overlay the metronome clicks at the new
+        # tempo BEFORE remaking notedatas, so the metronome map / GuitarHero
+        # gridlines follow the new tempo (the notes were just rescaled too).
+        self._rebuild_beats()
+        # 5. remake notedatas (now reflects the refreshed metronome track)
+        self.note_datas = self.midi_data.make_notedatas()
         print(f"Tempo changed to {new_bpm} BPM (factor: {factor:.2f}). Score length is now {self.length:.2f} sec.")
+
+    def _rebuild_beats(self):
+        """Recompute the live beat grid (`beats`) from the original baseline
+        (`beats_og`) for the current tempo and resize offset, so the GuitarHero
+        vertical gridlines track score-timing changes.
+
+        Scales the baseline beats by the tempo factor (bpm_og / bpm) — matching
+        how the notes are rescaled — then shifts by the resize offset that
+        transpose_notes applies to the notes, keeping downbeats lined up with
+        the (rescaled, transposed) barlines. Both transforms are absolute
+        (computed from the baseline), so repeated tempo changes / resizes don't
+        accumulate drift."""
+        if not self.beats_og:
+            return
+        factor = (self.bpm_og / self.bpm) if self.bpm else 1.0
+        self.beats = [
+            (round(t * factor + self._beat_offset, 9), is_downbeat)
+            for t, is_downbeat in self.beats_og
+        ]
+        # keep the audible metronome click track in lockstep with the grid
+        if self.midi_data is not None:
+            self.midi_data.set_metronome(self.beats)
 
     def resize(self, new_length: float):
         """Resize the score to a new length in seconds. Calls change_tempo
@@ -380,3 +409,8 @@ class ScoreData:
                 new_data[note.start_time] = note
             notedata.data = new_data
             notedata.times = sorted(new_data.keys())
+
+        # shift the beat grid by the same offset so the GuitarHero gridlines stay
+        # aligned with the transposed notes (idempotent: rebuilt from baseline).
+        self._beat_offset = offset_sec
+        self._rebuild_beats()
