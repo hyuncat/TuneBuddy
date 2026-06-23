@@ -15,15 +15,12 @@ from pathlib import Path
 import sys
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QStatusBar, QPushButton, QLabel, QTreeWidget, QTreeWidgetItem, QSplitter,
-    QInputDialog, QMenu, QMessageBox, QStackedLayout, QTabWidget
+    QPushButton, QLabel, QSplitter, QMessageBox, QTabWidget
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QPoint, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QIcon
 import qdarktheme
 
-from ui.ScoreViewer import ScoreViewer
-from ui.GuitarHero import GuitarHero
 from ui.time.Slider import Slider
 from ui.time.WallClock import WallClock
 from ui.time.Clipper import ClipperDialog
@@ -39,59 +36,42 @@ from ui.info.Settings import SettingsDialog
 
 # app logic imports
 from app_logic.user.ds.Recording import Recording
-# from app_logic.user.ds.PitchData import PitchConfig
-from app_logic.user.AudioPlayer import AudioPlayer
-from app_logic.user.AudioRecorder import AudioRecorder
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.midi.MidiSynth import MidiSynth
-from app_logic.midi.MidiPlayer import MidiPlayer
-from app_logic.Alignment import Alignment
-from app_logic.NoteData import NoteData
 
-# from algorithms.Config import Config
+# the two center "mode" tabs, each in its own file
+from perform import PerformPanel
 from practice import PracticePanel
 
+
 class Attune(QMainWindow):
-    """each attune instance is associated with a single score (midi/musicxml)
-    and allows you to create multiple recordings associated to that score
-    each with its own analysis and settings"""
+    """Each Attune instance is associated with a single score (midi/musicxml) and
+    allows you to create multiple recordings associated to that score, each with
+    its own analysis and settings.
+
+    The window is glue: it owns the score, the recordings model, the side panels
+    (recording tree / instrument / tolerance / mistakes), and the bottom transport
+    (play / record / slider / status bar). The center is a tabbed area with two
+    self-contained "mode" panels — **Perform** (`perform.py`) and **Practice**
+    (`practice.py`) — that SHARE this transport. The host routes the transport's
+    button clicks and the shared clock/slider ticks to whichever tab is active,
+    and pushes side-panel changes into both panels via their public setters.
+    """
     def __init__(self):
         super().__init__()
         self.score_data = ScoreData()
         self.recordings: dict[str, Recording] = {}  # name -> Recording
         self.active_recording: Recording | None = None
-        # pitch_detectors we've already wired signals for (one per recording),
-        # so init_pitch_detector_signals never double-connects the same detector
-        self._wired_detectors: set = set()
-        # rk: each recording comes with their own algorithms
 
-        # PLAYBACK stuff
+        # shared transport engines. The synth + wall clock are shared by both
+        # tabs; each tab builds its OWN MidiPlayer on them (in attach_transport)
+        # so it plays its own independent score.
         self.wall_clock = WallClock(hz=10)
-        self.metronome = None # TODO later
-
         self.SOUNDFONT = "resources/MuseScore_General.sf3"
         self.midi_synth = MidiSynth(self.SOUNDFONT)
-        self.midi_player = MidiPlayer(self.midi_synth, self.wall_clock)
-        self.audio_player = AudioPlayer(None)
-        self.audio_recorder = AudioRecorder(self.active_recording)
-        # --> playback state variables
-        self.is_playing = False
-        self.is_recording = False
+        # the metronome count-in is shared by both tabs
         self.is_counting_in = False
-        self.user_playback_enabled = True
-        # set when Analyze is pressed while offline pitch detection is still
-        # running; _on_detection_finished runs the deferred analyze once the
-        # smoothed pitch track is ready (analyzing raw pitches gives garbage)
-        self._pending_analyze = False
 
-        # instrument control
-        self.displayed_instruments: set[int] = set() # programs to display
-        self.playing_instruments: set[int] = set() # channels to play
-        # score viewer: render only the active instrument's part (default) or
-        # the full score (toggled via the instrument panel).
-        self.viewer_show_full = False
-
-        # initialize other important stuff
         self.init_ui()
         self.init_signals()
 
@@ -100,21 +80,11 @@ class Attune(QMainWindow):
         Initialize all UI components for the window.
             - main window (title + geom)
             - splitter
-                - recordings file tree
-                - center column (vertical splitter)
-                    - score viewer (top)
-                    - guitar hero (bottom)
-                - right column (vertical splitter)
-                    - mistake widget (top)
-                    - tolerance panel (bottom)
-            - slider layout
-                - play/pause button
-                - record button
-                - time label
-                - slider
-                - analyze button
-            - status bar
-                - countdown timer
+                - recordings file tree + instrument panel (left)
+                - center tabs: Perform | Practice
+                - mistake widget + tolerance panel (right)
+            - transport row (play / record / time / slider / analyze)
+            - status bar (+ countdown timer)
             - toolbar
             - dialogs (settings, clipper)
         """
@@ -126,15 +96,13 @@ class Attune(QMainWindow):
         self.setCentralWidget(self.central_widget)
         self._layout = QVBoxLayout(self.central_widget)
 
-        # --- (splitter stuff) RECORDINGS TREE | [SCORE VIEWER / GUITAR HERO] | MISTAKES ---
-        self.splitter = QSplitter(Qt.Orientation.Horizontal) # allows horizontal resizing
+        # --- (splitter) RECORDINGS TREE | [PERFORM / PRACTICE] | MISTAKES ---
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.recordings_tree = RecordingTree(self.recordings)
         self.instrument_panel = InstrumentPanel()
-        ABSOLUTE_PROJECT_ROOT = Path(__file__).resolve().parent
 
-        # left column: recordings tree (top) and the instrument/range panel
-        # below it, in a vertical splitter so each section's height is
-        # user-adjustable. (Playback controls live on the Toolbar.)
+        # left column: recordings tree (top) and the instrument/range panel below
+        # it, in a vertical splitter so each section's height is user-adjustable.
         self.left_column = QSplitter(Qt.Orientation.Vertical)
         self.left_column.addWidget(self.recordings_tree)
         self.left_column.addWidget(self.instrument_panel)
@@ -142,44 +110,19 @@ class Attune(QMainWindow):
         self.left_column.setStretchFactor(1, 0)  # instrument panel fixed-ish
         self.left_column.setMinimumWidth(180)
         self.left_column.setMaximumWidth(320)
-        
-        # score viewer requires a loading screen
-        self.score_viewer_container = QWidget()
-        stack = QStackedLayout(self.score_viewer_container)
-        self.score_viewer = ScoreViewer(project_root=ABSOLUTE_PROJECT_ROOT)
-        loading = QLabel("Loading...")
-        loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        stack.addWidget(loading)
-        stack.addWidget(self.score_viewer)
-        stack.setCurrentWidget(loading) # show loading screen until viewer is ready
-        self.score_viewer.load_finished.connect(lambda ok: stack.setCurrentIndex(1) if ok else 0)
 
-        self.guitar_hero = GuitarHero(self.active_recording)
+        # right column widgets
         self.mistake_widget = MistakeWidget()
         self.tolerance_panel = TolerancePanel()
 
-        # center column: score viewer stacked ON TOP of the guitar hero, with a
-        # vertical splitter between them so both are adjustable in height. This is
-        # the "Perform" tab's content.
-        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.center_splitter.addWidget(self.score_viewer_container)
-        self.center_splitter.addWidget(self.guitar_hero)
-        self.center_splitter.setStretchFactor(0, 1)  # score viewer grows
-        self.center_splitter.setStretchFactor(1, 1)  # guitar hero grows
-        # start the score viewer compact so its single white page roughly fills
-        # the box (still user-resizable via the handle below it).
-        self.center_splitter.setSizes([180, 520])    # initial heights (resizable)
-
-        # the center is a tabbed area: "Perform" (the analysis view above) and
-        # "Practice" (real-time note-by-note feedback). The practice tab lives in
-        # its own file (practice.py) with its own Recording, but SHARES the bottom
-        # transport (play / record / slider / status bar) and this score_data. The
-        # shared transport is attached below (once it's built) via
-        # attach_transport; side-panel changes reach it through the setters called
-        # from on_*_applied / load_score / on_tempo_changed.
-        self.practice_panel = PracticePanel(self.score_data)
+        # --- CENTER: tabbed "mode" area ---
+        # Perform = record-and-analyze view; Practice = real-time note feedback.
+        # Each panel lives in its own file with its own views + Recording, but
+        # they SHARE this window's transport (attached below, once it exists).
+        self.perform_panel = PerformPanel(self.score_data)
+        self.practice_panel = PracticePanel()  # owns its own independent score
         self.center_tabs = QTabWidget()
-        self.center_tabs.addTab(self.center_splitter, "Perform")
+        self.center_tabs.addTab(self.perform_panel, "Perform")
         self.center_tabs.addTab(self.practice_panel, "Practice")
 
         # right column: the mistake list (top) and a tolerance tuner (bottom),
@@ -203,52 +146,52 @@ class Attune(QMainWindow):
         self.splitter.setStretchFactor(0, 0)  # recordings tree is fixed-ish
         self.splitter.setStretchFactor(1, 1)  # center column grows
         self.splitter.setStretchFactor(2, 0)  # mistake widget is fixed-ish
-        # default split: the side panels start compact (still user-resizable) so
-        # the center column fills the full width between them.
+        # default split: side panels start compact (still user-resizable).
         self.splitter.setSizes([240, 764, 296])
 
         self._layout.addWidget(self.splitter)
 
-        # --- INIT SLIDER LAYOUT ---
+        # --- INIT TRANSPORT ROW ---
         self.init_slider_layout()
 
-        # --- UTILITIES --- 
-        self.status_bar = StatusBar(name="untitled_recording") # with default recording name
+        # --- UTILITIES ---
+        self.status_bar = StatusBar(name="untitled_recording")
         self.setStatusBar(self.status_bar)
         self.countdown_timer = CountdownTimer(self.status_bar, midi_synth=self.midi_synth)
         self.toolbar = Toolbar(score_data=self.score_data)
         self.addToolBar(self.toolbar)
 
-        # hand the Practice tab the shared transport now that it all exists, so
-        # its playback/recording drives the same slider/clock/status bar/MIDI.
+        # hand both tabs the shared transport now that it all exists. The Perform
+        # tab also drives the (Perform-only) MistakeWidget.
+        self.perform_panel.attach_transport(
+            wall_clock=self.wall_clock,
+            slider=self.slider,
+            status_bar=self.status_bar,
+            midi_synth=self.midi_synth,
+            mistake_widget=self.mistake_widget,
+        )
         self.practice_panel.attach_transport(
             wall_clock=self.wall_clock,
             slider=self.slider,
             status_bar=self.status_bar,
-            midi_player=self.midi_player,
+            midi_synth=self.midi_synth,
         )
-        
+
         # --- DIALOGS ---
         self.settings_dialog = SettingsDialog()
         self.clipper_dialog = ClipperDialog()
 
-        self.show() # run the show :)
-        
+        self.show()  # run the show :)
+
     def init_slider_layout(self):
-        """
-        Initialize the layout containing the play/pause, 
-        record button and the slider.
-        """
-        # the transport row (play / record / time / slider / analyze) is shared
-        # between the Perform and Practice tabs; the host routes its actions to
-        # whichever tab is active. Only the Analyze button is Perform-specific
-        # (hidden on the Practice tab — see on_center_tab_changed).
+        """Initialize the shared transport row: play/pause, record, time label,
+        slider, and the (Perform-only) Analyze button."""
         self.transport_widget = QWidget()
         self.slider_layout = QHBoxLayout(self.transport_widget)
         self.slider_layout.setContentsMargins(0, 0, 0, 0)
 
         # get the play/pause button icons
-        app_directory = os.path.dirname(__file__) 
+        app_directory = os.path.dirname(__file__)
         play_filepath = os.path.join(app_directory, 'resources', 'icons', 'play.png')
         pause_filepath = os.path.join(app_directory, 'resources', 'icons', 'pause.png')
         record_filepath = os.path.join(app_directory, 'resources', 'icons', 'record.png')
@@ -280,15 +223,15 @@ class Attune(QMainWindow):
         self.slider = Slider(self.wall_clock)
         self.slider_layout.addWidget(self.slider)
 
-        # analyze button
+        # analyze button (Perform-only; hidden on the Practice tab)
         self.analyze_button = QPushButton("Analyze")
-        self.analyze_button.clicked.connect(self.analyze)
+        self.analyze_button.clicked.connect(self.perform_panel.analyze)
         self.slider_layout.addWidget(self.analyze_button)
 
         self._layout.addWidget(self.transport_widget)
 
     def init_signals(self):
-        """Connect all signals and slots for UI / app logic"""
+        """Connect all signals and slots for UI / app logic."""
         # toolbar signals
         self.toolbar.score_uploaded.connect(self.load_score)
         self.toolbar.audio_uploaded.connect(self.load_audio)
@@ -299,101 +242,47 @@ class Attune(QMainWindow):
         self.toolbar.tempo_changed.connect(self.on_tempo_changed)
         self.center_tabs.currentChanged.connect(self.on_center_tab_changed)
 
-        # timekeeping signals
+        # shared timekeeping signals
         self.wall_clock.time_changed.connect(self.time_changed)
         self.slider.slider_changed.connect(self.slider_changed)
         self.slider.slider_end.connect(self.slider_end)
         self.countdown_timer.finished.connect(self._on_countdown_finished)
 
+        # side panels
         self.recordings_tree.selected.connect(self.on_recording_selected)
         self.recordings_tree.score_renamed.connect(self.on_score_renamed)
         self.instrument_panel.instrument_applied.connect(self.on_instrument_applied)
         self.instrument_panel.range_applied.connect(self.on_range_applied)
         self.instrument_panel.tuning_applied.connect(self.on_tuning_applied)
         self.instrument_panel.full_score_toggled.connect(self.on_full_score_toggled)
-        self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
-        self.mistake_widget.selected.connect(self.on_mistake_selected)
-        self.mistake_widget.cleared.connect(self.guitar_hero.clear_highlight)
-        self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
         self.tolerance_panel.tolerance_applied.connect(self.on_tolerance_applied)
-        self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
 
-        self.init_pitch_detector_signals()
+        # the Perform tab's score viewer is what triggers the initial demo load
+        self.perform_panel.viewer_ready.connect(self.on_score_viewer_loaded)
+        # after Analyze resizes the Perform score, reflect its new BPM/length
+        self.perform_panel.analyzed.connect(self._on_analyzed)
 
-        # settings dialog signals
-    
-    def init_pitch_detector_signals(self):
-        """Wire the active recording's pitch detector signals. Each recording
-        owns its own detector, so we connect each only once (tracked in
-        `_wired_detectors`) to avoid duplicate slot invocations."""
-        rec = self.active_recording
-        if rec is None or rec.pitch_detector in self._wired_detectors:
-            return
-        rec.pitch_detector.status_changed.connect(self.status_bar.update_status)
-        rec.pitch_detector.detection_finished.connect(self._on_detection_finished)
-        self._wired_detectors.add(rec.pitch_detector)
+    # --- ACTIVE-TAB HELPERS ---
+    def _practice_active(self) -> bool:
+        """True when the Practice tab is the one currently shown."""
+        return self.center_tabs.currentWidget() is self.practice_panel
 
-    # --- SHARED HELPERS / CLEANUP ---
+    def _active_panel(self):
+        """The mode panel that the shared transport should drive right now."""
+        return self.practice_panel if self._practice_active() else self.perform_panel
+
     def _has_recording(self, warn=False) -> bool:
-        """Return True if there's an active recording, or warn (with `message`)
-        and return False when there isn't. Centralizes the repeated no-recording
-        guard."""
-        MESSAGE = "Please select a recording first."
+        """True if there's an active recording, else optionally warn. Used by the
+        side-panel handlers (instrument / range / tuning / tolerance)."""
         if self.active_recording is None:
             if warn:
-                QMessageBox.warning(self, "No recording selected", MESSAGE)
+                QMessageBox.warning(self, "No recording selected", "Please select a recording first.")
             return False
         return True
-    
-    def _recording_is_empty(self, warn=False) -> bool:
-        """Return True if the active recording has no audio, or warn (with
-        `message`) and return False when it does. Centralizes the repeated
-        no-audio guard."""
-        if not self._has_recording(warn=False):
-            return False
-        
-        MESSAGE = "Please record or upload audio first."
-        rec = self.active_recording
-        if rec.audio_data.end_index <= 0:
-            if warn:
-                QMessageBox.warning(self, "No audio available", MESSAGE)
-            return True
-        
-        return False
-
-    def _has_analysis(self, warn=False) -> bool:
-        """Return True if the active recording has been analyzed (notes detected =>
-        alignment filled in), or warn (with `message`) and return False when it
-        hasn't. Centralizes the repeated no-analysis guard."""
-        MESSAGE = "Please analyze the recording first."
-        if not self._has_recording():
-            return False
-        if not self.active_recording.has_analysis():
-            if warn:
-                QMessageBox.warning(self, "No analysis available", MESSAGE)
-            return False
-        return True
-
-    def cleanup(self):
-        """Reset all analysis-derived state so no stale artifacts survive an
-        input change (new score/audio, re-run detection, re-analyze). Clears the
-        active recording's notes/alignment/overrides, the mistake list, and the
-        GuitarHero overlays (user notes, alignment, highlight)."""
-        rec = self.active_recording
-        if rec is not None:
-            rec.note_data = NoteData()
-            rec.alignment = Alignment(config=rec.config)
-            rec.overridden_mistake_indices = set()
-            # reloading the now-empty recording wipes the user-note + alignment
-            # overlays and the highlight bar from the GuitarHero
-            self.guitar_hero.load_user(rec)
-        self.mistake_widget.clear()
 
     # --- LOAD SCORE / AUDIO ---
     def load_score(self, filepath: str):
-        """Load the score into the app."""
-        # reload same score_data so all modules which reference it 
-        # get updated data without needing a manual refresh
+        """Load the score into the app and push it into every view/engine."""
         filepath = Path(filepath)
         self.score_data.load(filepath)
 
@@ -405,21 +294,22 @@ class Attune(QMainWindow):
         )
         self.score_data.active_instrument = first_ch
 
-        # load into important ui components
+        # load into side UI
         self.toolbar.populate_instrument_menu()
+        self.toolbar.set_tempo(self.score_data.bpm)  # reflect the score's tempo
         self.instrument_panel.load_score(self.score_data)
         self.slider.update_range(score_data=self.score_data)
         self.recordings_tree.init_score(filepath=filepath, score_data=self.score_data)
-        self.recordings_tree._add_recording(name="untitled_recording") # dummy init
-        # fresh score => wipe any analysis/artifacts left over from the previous one
-        self.cleanup()
-        self.guitar_hero.load_score(self.score_data)
-        self.practice_panel.load_score(self.score_data)
-        # render the score viewer (active instrument only, unless "full" is on)
-        self.refresh_score_viewer()
+        # adding (and selecting) a recording fires on_recording_selected, which
+        # sets active_recording and hands it to the Perform tab.
+        self.recordings_tree._add_recording(name="untitled_recording")
 
-        # load into playback engines
-        self.midi_player.load_score(self.score_data)
+        # fresh score => wipe any analysis/artifacts left over from the previous one
+        self.perform_panel.cleanup()
+        self.perform_panel.load_score(self.score_data)
+        # the Practice tab parses its OWN independent copy from the same file, so
+        # Perform's later resize/tempo edits never mutate the score shown there.
+        self.practice_panel.load_score(filepath)
 
     def load_audio(self, filepath: str):
         if not self._has_recording():
@@ -428,99 +318,22 @@ class Attune(QMainWindow):
         rec.load_audio(filepath)  # loads the raw waveform only
         # default the recording's name to the uploaded audio file's name
         self.recordings_tree.set_recording_name(Path(filepath).stem)
-        # UI that only needs the raw audio can refresh right away
-        self.slider.update_range(score_data=self.score_data, recording=rec)
-        self.audio_player.load_audio(rec.audio_data)
-        # clear stale analysis, then detect pitches on the new audio in the
-        # background (phase text appears in the status bar, cleared in
-        # _on_detection_finished, which loads the fresh pitch data)
-        self.detect_pitches()
+        self._sync_slider_range()
+        # make it playable + (re-)detect pitches in the background (the Perform
+        # tab owns the audio player + detection pipeline)
+        self.perform_panel.refresh_audio()
 
-    def detect_pitches(self):
-        """Clear stale analysis, then (re-)run offline pitch detection on the
-        active recording's audio in the background. Used whenever the pitch track
-        must be recomputed (new audio, range/tuning change). When detection
-        finishes, _on_detection_finished loads the fresh pitch data into view."""
-        rec = self.active_recording
-        if rec is None or rec.audio_data.end_index <= 0:
-            return
-        self.cleanup()
-        self.init_pitch_detector_signals() # just in case
-        rec.pitch_detector.detect_pitches_async()
-
-    def detect_notes(self):
-        """Run note detection on the active recording's current pitch data, then
-        refresh the user-note view."""
-        rec = self.active_recording
-        if rec is None:
-            return
-        rec.detect_notes()
-        self.guitar_hero.load_user(rec)
-
-    def _detection_in_flight(self) -> bool:
-        """True while the active recording's offline pitch detection+smoothing
-        thread is still running (so its pitch_data isn't ready to analyze)."""
-        rec = self.active_recording
-        if rec is None:
-            return False
-        thread = getattr(rec.pitch_detector, "offline_thread", None)
-        return bool(thread and thread.is_alive())
-
-    def _on_detection_finished(self):
-        """Offline pitch detection finished (queued onto the main thread): clear
-        the status message and load the now-ready pitch data into the view. If an
-        Analyze press was deferred while detection ran, run it now."""
-        self.status_bar.update_status("")
-        self.guitar_hero.load_user(self.active_recording)
-        if self._pending_analyze:
-            self._pending_analyze = False
-            self.analyze()
-
-    # --- PLAYBACK / RECORDING TOGGLES ---
-    def _practice_active(self) -> bool:
-        """True when the Practice tab is the one currently shown (so the shared
-        transport should drive the practice panel rather than the Perform view)."""
-        return self.center_tabs.currentWidget() is self.practice_panel
-
-    def _is_recording_active(self) -> bool:
-        """Whether the *active* tab is currently recording."""
-        if self._practice_active():
-            return self.practice_panel.is_recording
-        return self.is_recording
-
+    # --- SHARED TRANSPORT DISPATCH ---
     def toggle_playback(self):
-        # Practice tab: hand off to the panel (it uses the shared clock + MIDI),
-        # then reflect the result on the shared play button / status bar.
-        if self._practice_active():
-            playing = self.practice_panel.toggle_playback()
-            self.play_button.setIcon(self.pause_icon if playing else self.play_icon)
-            self.status_bar.update_status("Practicing..." if playing else "")
-            return
-
-        t = self.slider.get_time()
-        if not self.is_playing:
-            self.is_playing = True
-            self.wall_clock.start(t)
-            self.midi_player.play(start_time=t)
-            if self.user_playback_enabled:
-                self.audio_player.play(start_time=t)
-            # update UI
-            self.play_button.setIcon(self.pause_icon)
-            self.status_bar.update_status("Playing...")
-
-        elif self.is_playing:
-            self.is_playing = False
-            self.wall_clock.pause()
-            self.midi_player.stop()
-            self.audio_player.stop()
-            # update UI
-            self.play_button.setIcon(self.play_icon)
-            self.status_bar.update_status("")
+        """Play/pause the active tab via the shared play button."""
+        playing = self._active_panel().toggle_playback()
+        self.play_button.setIcon(self.pause_icon if playing else self.play_icon)
 
     def toggle_recording(self):
-        # Perform requires an active recording to capture into; Practice always
-        # has its own, so only guard on the Perform tab.
-        if not self._practice_active() and not self._has_recording(warn=True):
+        panel = self._active_panel()
+        # Perform needs an active recording to capture into; Practice always has
+        # its own, so only guard on the Perform tab.
+        if panel is self.perform_panel and not self._has_recording(warn=True):
             return
         if self.is_counting_in:
             # clicking again during the count-in cancels it (un-arm recording)
@@ -528,217 +341,50 @@ class Attune(QMainWindow):
             self.is_counting_in = False
             self.record_button.setIcon(self.record_icon)
             return
-        if not self._is_recording_active():
-            # play a one-measure metronome count-in; _on_countdown_finished
-            # starts the (Perform- or Practice-) recording on finish
+        if not panel.is_recording:
+            # play a one-measure metronome count-in; _on_countdown_finished starts
+            # the active tab's recording on finish. Use the active tab's score so
+            # the count-in beats land at that tab's (possibly different) tempo.
+            sd = self._active_score_data()
             self.is_counting_in = True
             self.record_button.setIcon(self.pause_icon)
             self.countdown_timer.start(
-                beats=self.score_data.count_in_beats(),
-                channel=self.score_data.metronome_channel,
+                beats=sd.count_in_beats(),
+                channel=sd.metronome_channel,
             )
-        elif self._practice_active():
-            self.practice_panel.stop_recording()
+        else:
+            panel.stop_recording()
             self.record_button.setIcon(self.record_icon)
             self.status_bar.update_status("")
-        else:
-            self._stop_recording()
 
     def _on_countdown_finished(self):
         """Shared count-in finished: start recording in whichever tab is active."""
-        if self._practice_active():
-            self.is_counting_in = False
-            self.record_button.setIcon(self.pause_icon)
-            self.practice_panel.start_recording()
-        else:
-            self._start_recording()
-
-    def _start_recording(self):
-        """Called when the countdown timer finishes, to start the Perform-tab
-        recording and playback."""
-        # update UI
-        self.record_button.setIcon(self.pause_icon)
-        # stuff
         self.is_counting_in = False
-        t = self.slider.get_time()
-        self.is_recording = True
-        self.audio_player.stop()
-        self.wall_clock.start(t)
-        self.audio_recorder.run(start_time=t)
-        self.active_recording.pitch_detector.run(start_time=t)
-        self.midi_player.play(start_time=t) # play whatever audio the user has enabled
-
-    def _stop_recording(self):
-        """Called when user clicks the record button while already recording, 
-        to stop the recording and playback."""
-        # update UI
-        self.record_button.setIcon(self.record_icon)
-        # stuff
-        self.is_recording = False
-        self.wall_clock.pause()
-        self.audio_recorder.stop()
-        self.midi_player.stop()
-        self.active_recording.pitch_detector.stop()
-        self.status_bar.update_status("")
-
-    def _find_best_w2(self):
-        """refactor later but essentially
-        finds the best note detection frame size by minimizing mistakes
-        then sets the config to that
-        """
-        # parameter sweep for ND
-        W2_SIZES = [33, 31, 29, 27, 25, 23, 21, 19, 17]
-
-        min_mistake, best_w2 = float('inf'), None
-        for w2 in W2_SIZES:
-            self.active_recording.config.w2 = w2
-            self.active_recording.config.h2 = w2 - 2
-            self.active_recording.update_config(self.active_recording.config)
-            # rec.detect_pitches()
-            self.active_recording.detect_notes()
-            self.active_recording.detect_mistakes()
-            # print(self.active_recording.alignment)
-
-            if len(self.active_recording.alignment.mistakes) < min_mistake:
-                min_mistake = len(self.active_recording.alignment.mistakes)
-                best_w2 = w2
-        
-        print(f"best ND frame-size: {best_w2}, min mistakes: {min_mistake}")
-
-        self.active_recording.config.w2 = best_w2
-        self.active_recording.config.h2 = best_w2 - 2
-        self.active_recording.update_config(self.active_recording.config)
-
-    def mistake_correction_loop(self):
-        """run mistake correction until it stops improving"""
-        if not self.active_recording or not self.active_recording.alignment:
-            print("No active recording or alignment to correct mistakes on.")
-            return
-        n_mistakes = len(self.active_recording.alignment.mistakes)
-        print(f"initial mistakes: {n_mistakes}")
-        while True:
-            # keep the current (best-so-far) state in case this pass regresses
-            prev_nd = self.active_recording.note_data
-            prev_alignment = self.active_recording.alignment
-
-            self.active_recording.correct_mistakes()
-            new_n_mistakes = len(self.active_recording.alignment.mistakes)
-            print(f" > mistakes after correction: {new_n_mistakes}")
-
-            if new_n_mistakes >= n_mistakes:
-                # correction stopped helping (plateaued or got worse) -> revert
-                # to the better previous result and stop
-                self.active_recording.note_data = prev_nd
-                self.active_recording.alignment = prev_alignment
-                print("no improvement after correction, breaking loop")
-                break
-            n_mistakes = new_n_mistakes  # made progress -> raise the baseline
-
-    def analyze(self):
-        if not self._has_recording(warn=True) or self._recording_is_empty(warn=True):
-            return
-
-        rec = self.active_recording
-        # don't analyze raw/partial pitches: if offline detection+smoothing is
-        # still running in the background, defer until it finishes (the smoothed
-        # track has the octave errors / noise cleaned up). _on_detection_finished
-        # will re-call analyze() once the pitch_data is ready.
-        if self._detection_in_flight():
-            self._pending_analyze = True
-            self.status_bar.update_status("Detecting pitches… will analyze when ready")
-            return
-        print("analyzing... ")
-        self.cleanup() # clear stale notes/alignment/mistakes before recomputing
-
-        # detect notes (at the best ND frame size), stretch the score to match
-        # the take's length (also rescales p.distances), then string-edit align
-        self._find_best_w2()
-        self.detect_notes()
-        # flag high-slope transition frames now (after onset refinement pulls them
-        # back into note spans) so update_alignment_distances leaves them grey
-        # instead of letting slides bias a note's coloring / flag false mistakes.
-        rec.detect_transitions()
-        # re-median note pitches over non-transition frames so onset-refinement
-        # slide frames don't bias a note sharp/flat (kills false "too sharp"
-        # substitutions). Must run before detect_mistakes() / the alignment.
-        rec.recompute_note_pitches()
-        # drop phantom notes that are almost entirely slide (the wide ND window can
-        # detect a "note" inside a long transition). Also before detect_mistakes().
-        rec.prune_transition_notes()
-        length = rec.get_length(raw=True)
-        rec.resize(new_length=length)
-        rec.detect_mistakes()
-        self.mistake_correction_loop()
-
-        # color the user pitches by the final alignment (insertions red, others by
-        # distance to their *aligned* score note) instead of the live per-frame
-        # distance. Runs after the correction loop so it reflects the final pairs.
-        rec.update_alignment_distances()
-
-        # reload every view with the fresh analysis (note/alignment may have been
-        # overwritten by the correction loop)
-        self.guitar_hero.load_alignment(rec.alignment)
-        self.guitar_hero.load_user(rec)
-        self.guitar_hero.update_view_items()
-        self.slider.update_range(score_data=self.score_data, recording=rec)
-        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
-        
-    # --- SIGNAL-RELATED ACTIONS ---
-    def _score_viewer_time(self, t: float) -> float:
-        """Map a wall-clock time `t` (in the *current* tempo's timeframe) back
-        into the *original* score tempo's timeframe.
-
-        The Verovio render is never reloaded on a tempo change, so its internal
-        timemap (used by getElementsAtTime) stays in the original tempo. Playing
-        at a different tempo stretches/squeezes wall-clock time by
-        bpm_og / bpm, so we undo that here before driving the score cursor.
-        """
-        bpm_og = self.score_data.bpm_og or self.score_data.bpm
-        if not bpm_og:
-            return t
-        return t * self.score_data.bpm / bpm_og
+        self.record_button.setIcon(self.pause_icon)
+        self._active_panel().start_recording()
 
     def update_time_label(self, t: float):
-        """Update the time label based on current time t."""
+        """Update the shared time label (current/total) from time `t`."""
         def format_time(seconds: float) -> str:
             mins = int(seconds // 60)
             secs = seconds % 60
             return f"{mins:02}:{secs:04.1f}"
 
         current_time_str = format_time(t)
-        total_length = self.slider.get_total_time()
-        total_time_str = format_time(total_length)
+        total_time_str = format_time(self.slider.get_total_time())
         self.time_label.setText(f"{current_time_str} / {total_time_str}")
 
     def time_changed(self, t: float):
-        """Called when the (shared) wall clock time changes. Always refresh the
-        shared time label, then move the ACTIVE tab's score/guitar-hero plots if
-        it's playing. The Practice tab is dispatched its own clock tick."""
+        """Shared wall-clock tick: refresh the time label, then drive the active
+        tab's plots (each panel guards on its own playing state)."""
         self.update_time_label(t)
-        if self._practice_active():
-            self.practice_panel.on_clock_tick(t)
-            return
-        if not self.is_playing:
-            return
-        # else, move the score and guitar hero plots
-        self.score_data.update_time(t)
-        self.score_viewer.set_playback_time(self._score_viewer_time(t))
-        self.guitar_hero.move_plot(t)
+        self._active_panel().on_clock_tick(t)
 
     def slider_changed(self, t: float):
-        """Called when the (shared) slider moves. Always refresh the time label,
-        then drive the ACTIVE tab's plots (so scrubbing works on either tab; each
-        side guards against moving while it's the one playing/recording)."""
+        """Shared slider moved: refresh the time label, then drive the active
+        tab's plots (each panel guards against moving while it's playing)."""
         self.update_time_label(t)
-        if self._practice_active():
-            self.practice_panel.on_slider_changed(t)
-            return
-        if self.is_playing:
-            return
-        # else, move the score and guitar hero plots
-        self.score_data.update_time(t)
-        self.score_viewer.set_playback_time(self._score_viewer_time(t))
-        self.guitar_hero.move_plot(t)
+        self._active_panel().on_slider_changed(t)
 
     def slider_end(self, t: float):
         """Shared slider hit its end. On the Practice tab, stop the take and reset
@@ -749,207 +395,159 @@ class Attune(QMainWindow):
             self.record_button.setIcon(self.record_icon)
             self.status_bar.update_status("")
 
+    # --- SIDE-PANEL HANDLERS ---
     def on_recording_selected(self, recording_name: str):
-        """When a recording is selected from the recordings tree, update the active 
-        recording and refresh the score viewer and other relevant UI components."""
+        """A recording was selected in the tree: make it active and reflect it in
+        the side panels + the Perform tab."""
         if recording_name not in self.recordings.keys():
             print(f"No recording named '{recording_name}' was found.")
             return
         self.active_recording = self.recordings[recording_name]
-        self.init_pitch_detector_signals()
-        # print(f"Setting active recording to '{recording_name}'")
-        self.instrument_panel.set_active_instrument(self.active_recording.active_instrument)
+        rec = self.active_recording
         # reflect this recording's Config in the tunable inputs
-        self.instrument_panel.set_tuning(self.active_recording.config.tuning)
-        self.tolerance_panel.set_tolerance(self.active_recording.config.tolerance)
+        self.instrument_panel.set_active_instrument(rec.active_instrument)
+        self.instrument_panel.set_tuning(rec.config.tuning)
+        self.tolerance_panel.set_tolerance(rec.config.tolerance)
         self.status_bar.update_name(recording_name)
-        # show this recording's own analysis (load_user draws its GuitarHero
-        # overlays; keep the mistake list in sync rather than blanking it)
-        self.mistake_widget.load_mistakes(self.active_recording.alignment.mistakes)
-        self.guitar_hero.load_user(self.active_recording)
-        self.audio_player.load_audio(self.active_recording.audio_data)
-        self.audio_recorder.load_recording(self.active_recording)
-        self.slider.update_range(score_data=self.score_data, recording=self.active_recording)
+        # hand the take to the Perform tab (loads its views/audio/mistakes)
+        self.perform_panel.set_active_recording(rec)
+        self._sync_slider_range()
 
     def on_instrument_applied(self, channel: int):
-        """Make `channel` the active instrument for the active recording. Resets
-        all analysis-derived data (notes, alignment, mistakes/overrides), re-inits
-        the algorithms from the current Config, and refreshes the views."""
+        """Make `channel` the active instrument for the active recording, and keep
+        both tabs (which share this score_data) in sync."""
         if not self._has_recording():
             return
-        rec = self.active_recording
-
-        # the active instrument drives both display (score_data) and analysis
-        # (rec.active_instrument is what detect_mistakes / pitch distances key on)
-        self.score_data.active_instrument = channel
-        rec.active_instrument = channel
-
-        # wipe the analysis-derived data + views, then re-init the algorithm
-        # stages from the (unchanged) Config
-        self.cleanup()
-        rec.update_config(rec.config)
-
-        # re-render the score viewer for the new instrument (no-op extra cost
-        # during playback: this only runs here, on the instrument change)
-        self.refresh_score_viewer()
-
+        self.perform_panel.set_active_instrument(channel)
         # the range defaults follow the newly selected instrument's note range
         self.instrument_panel.populate_range_from_score(self.score_data, channel)
-
-        # keep the Practice tab on the same instrument (shares this score_data)
         self.practice_panel.set_active_instrument(channel)
 
     def on_full_score_toggled(self, show_full: bool):
-        """Toggle the score viewer between the full score and the active
-        instrument's part. Re-render lag here is acceptable."""
-        self.viewer_show_full = show_full
-        self.refresh_score_viewer()
-
-    def refresh_score_viewer(self):
-        """(Re)render the score viewer to match the current instrument/full-score
-        state. The single expensive Verovio layout step — never called per tick."""
-        if self.score_data.score is None:
-            return
-        channel = None if self.viewer_show_full else self.score_data.active_instrument
-        self.score_viewer.load_score(self.score_data, channel=channel)
+        """Toggle the Perform score viewer between full score and active part."""
+        self.perform_panel.on_full_score_toggled(show_full)
 
     def on_range_applied(self, low_midi: int, high_midi: int):
-        """Set the active recording's Config frequency range from the chosen
-        lowest/highest notes, then re-compute pitches with the new Config."""
+        """Set the active recording's Config frequency range, then re-detect."""
         if not self._has_recording():
             return
         rec = self.active_recording
         config = rec.config
-
         config.fmin = config.midi_to_freq(low_midi)
         config.fmax = config.midi_to_freq(high_midi)
         rec.update_config(config)
-
-        # mirror the new range into the Practice tab's recording config
+        # mirror into the Practice tab's recording config
         self.practice_panel.set_range(low_midi, high_midi)
-
         # re-run pitch detection on the existing audio (if any) with the new range
-        self.detect_pitches()
+        self.perform_panel.detect_pitches()
 
     def on_tuning_applied(self, tuning: float):
-        """Set the active recording's Config tuning (A4 reference, Hz), then
-        re-compute pitches with it (tuning drives the freq<->MIDI conversion)."""
+        """Set the active recording's Config tuning (A4 Hz), then re-detect."""
         if not self._has_recording():
             return
         rec = self.active_recording
         rec.config.tuning = tuning
         rec.update_config(rec.config)
-
-        # mirror the new tuning into the Practice tab's recording config
+        # mirror into the Practice tab's recording config
         self.practice_panel.set_tuning(tuning)
-
-        # re-run pitch detection on the existing audio (if any) with the new tuning
-        self.detect_pitches()
+        self.perform_panel.detect_pitches()
 
     def on_tolerance_applied(self, tolerance: float):
-        """Set the active recording's Config tolerance (semitone slack for a note
-        to count as correct), then re-run just the mistake-detection (string-edit)
-        step and refresh the mistake list + GuitarHero overlays."""
+        """Set the active recording's Config tolerance, mirror it into Practice,
+        then re-run just the mistake step (if the take is already analyzed)."""
         if not self._has_recording():
             return
         rec = self.active_recording
         rec.config.tolerance = tolerance
         rec.update_config(rec.config)
-
-        # mirror the new tolerance into the Practice tab (drives its pitch match)
+        # mirror into the Practice tab (drives its live pitch match)
         self.practice_panel.set_tolerance(tolerance)
-
-        if self._has_analysis(warn=False):
-            self.analyze()
+        self.perform_panel.reanalyze_if_analyzed()
 
     def on_score_renamed(self, title: str):
         """The Score Title was edited in the RecordingTree (the source of truth).
-        Push it to the score and re-render so Verovio shows the new title."""
+        Push it to BOTH tabs' (independent) scores and re-render their viewers."""
         self.score_data.set_title(title)
-        self.refresh_score_viewer()
+        self.practice_panel.score_data.set_title(title)
+        self.perform_panel.refresh_score_viewer()
+        self.practice_panel.refresh_score_viewer()
 
     def on_score_viewer_loaded(self):
-        """Called after score viewer is done loading JS and ready to receive data."""
+        """Perform tab's score viewer is ready: load the demo score once."""
         DEMO_SCORE_PATH = Path(__file__).resolve().parent / "resources" / "scores" / "c_major_scale.mxl"
         self.load_score(str(DEMO_SCORE_PATH))
 
     def on_user_audio_toggled(self, checked: bool):
-        """Called when user toggles the user audio playback option in the toolbar."""
-        self.user_playback_enabled = checked
-        if not checked:
-            self.audio_player.stop()
+        """The toolbar 'User' checkbox (Perform-tab playback of the user audio)."""
+        self.perform_panel.set_user_audio_enabled(checked)
 
     def on_tempo_changed(self, new_bpm: int):
-        """Called when user changes the tempo in the toolbar. Update the score data and
-        midi player accordingly."""
-        if self.is_playing or self.practice_panel.is_playing or self._is_recording_active():
-            self.toolbar.tempo_spinbox.setValue(self.score_data.bpm)  # revert UI
+        """Change the tempo of the ACTIVE tab's score only (the two tabs keep
+        independent scores, so changing one never affects the other). Ignored
+        (reverted) while anything is playing/recording, to avoid mid-stream drift."""
+        sd = self._active_score_data()
+        if self._any_transport_active():
+            self.toolbar.set_tempo(sd.bpm)  # revert UI
             return
-        self.score_data.change_tempo(new_bpm)
-        self.guitar_hero.update_view_items()
-        # keep the Practice tab's views on the same tempo (shares score_data)
-        self.practice_panel.on_tempo_changed()
-        # don't reload the score viewer: Verovio keeps its original-tempo render
-        # and _score_viewer_time() maps the new wall-clock time back into it.
-        # re-range the shared slider for whichever tab is currently showing.
+        sd.change_tempo(new_bpm)
+        # refresh just the active tab's views (Verovio keeps its original-tempo
+        # render, remapped via the panel's _score_viewer_time).
+        self._active_panel().on_tempo_changed()
+        # re-range the shared slider for the active tab
         self._sync_slider_range()
 
-    def on_mistake_override_toggled(self, idx: int):
-        if self.active_recording is None:
-            return
-        self.active_recording.toggle_mistake_override(idx)
-        mistake = self.active_recording.alignment.mistakes[idx]
-        self.mistake_widget.refresh_override(idx)
-        self.guitar_hero.update_highlight_override(mistake.is_overridden())
-        self.guitar_hero.update_view_items()
+    def _active_score_data(self) -> ScoreData:
+        """The score the active tab is showing — Perform's is the app's; Practice
+        keeps its own independent copy."""
+        return self.practice_panel.score_data if self._practice_active() else self.score_data
 
-    def on_mistake_selected(self, idx: int):
-        """When mistake selected, highlight corresponding note in guitar hero plot"""
-        if self.active_recording is None:
-            return
-        mistakes = self.active_recording.alignment.mistakes
-        if 0 <= idx < len(mistakes):
-            self.guitar_hero.highlight_mistake(mistakes[idx])
+    def _on_analyzed(self):
+        """Analyze resized the Perform score: show its new BPM in the toolbar (it
+        only runs on the Perform tab, whose score is self.score_data)."""
+        self.toolbar.set_tempo(self.score_data.bpm)
 
     def on_practice_toggled(self):
-        """Toolbar 'Practice' button: jump to the Practice tab (it's an in-window
-        tab now, not a separate window)."""
+        """Toolbar 'Practice' button: jump to the Practice tab."""
         self.center_tabs.setCurrentWidget(self.practice_panel)
 
+    # --- TAB SWITCHING / SLIDER SYNC ---
     def _active_slider_recording(self):
         """The recording whose length should size the shared slider, picked by the
-        currently active tab (Practice keeps its own take separate from Perform's)."""
+        active tab (Practice keeps its own take separate from Perform's)."""
         if self._practice_active():
             return self.practice_panel.recording
         return self.active_recording
 
     def _sync_slider_range(self):
         """Re-range the shared slider to the active tab's score/recording length."""
-        self.slider.update_range(score_data=self.score_data, recording=self._active_slider_recording())
+        self.slider.update_range(
+            score_data=self._active_score_data(), recording=self._active_slider_recording()
+        )
+
+    def _any_transport_active(self) -> bool:
+        """True if either tab is playing/recording, or a count-in is running."""
+        return (self.perform_panel.is_playing or self.perform_panel.is_recording
+                or self.practice_panel.is_playing or self.practice_panel.is_recording
+                or self.is_counting_in)
 
     def _halt_transport(self):
-        """Stop any playback/recording/count-in on BOTH tabs, so only the tab
-        being switched to will drive the shared transport."""
-        if self.is_playing:
-            self.is_playing = False
-            self.wall_clock.pause()
-            self.midi_player.stop()
-            self.audio_player.stop()
-        if self.is_recording:
-            self._stop_recording()
+        """Stop playback/recording/count-in on BOTH tabs, so only the tab being
+        switched to drives the shared transport (and the audio device isn't
+        grabbed twice)."""
+        self.perform_panel.stop_playback()
+        self.perform_panel.stop_recording()
+        self.practice_panel.stop_playback()
+        self.practice_panel.stop_recording()
         if self.is_counting_in:
             self.countdown_timer.cancel()
             self.is_counting_in = False
-        self.practice_panel.stop_playback()
-        self.practice_panel.stop_recording()
 
     def on_center_tab_changed(self, index: int):
-        """The shared transport (play / record / slider / status bar) now drives
-        whichever tab is active. On switch: halt the old tab, hide the Perform-only
-        Analyze button on Practice, reset the transport buttons, then re-range the
-        shared slider to the new tab and line its views up with the current time
-        (the two tabs can have different total lengths, so the slider position is
-        clamped/re-rendered to stay consistent)."""
+        """The shared transport drives whichever tab is active. On switch: halt the
+        old tab, hide the Perform-only Analyze button on Practice, reset the
+        transport buttons, then re-range the shared slider to the new tab and line
+        its views up with the current time (the two tabs can have different total
+        lengths, so the slider position is clamped/re-rendered to stay consistent)."""
         practice = self.center_tabs.widget(index) is self.practice_panel
         self._halt_transport()
 
@@ -959,18 +557,15 @@ class Attune(QMainWindow):
         self.play_button.setIcon(self.play_icon)
         self.record_button.setIcon(self.record_icon)
         self.status_bar.update_status("")
+        # the tempo display reflects the active tab's (independent) score tempo
+        self.toolbar.set_tempo(self._active_score_data().bpm)
 
         # preserve the current time, re-range for the new tab, clamp, and render.
         t = self.slider.get_time()
         self._sync_slider_range()
         t = min(t, self.slider.get_total_time())
         self.slider.handle_timer_update(t)   # move the shared handle to clamped t
-        if practice:
-            self.practice_panel.render_at(t)
-        else:
-            self.score_data.update_time(t)
-            self.score_viewer.set_playback_time(self._score_viewer_time(t))
-            self.guitar_hero.move_plot(t)
+        self._active_panel().render_at(t)
 
 
 if __name__ == "__main__":

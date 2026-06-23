@@ -101,6 +101,13 @@ class Toolbar(QToolBar):
         self.tempo_spinbox.valueChanged.connect(self.tempo_changed.emit)
         self.addWidget(self.tempo_spinbox)
 
+    def set_tempo(self, bpm: float):
+        """Reflect `bpm` in the spinbox WITHOUT emitting tempo_changed (used to
+        display the active tab's score tempo, e.g. the new length after Analyze)."""
+        self.tempo_spinbox.blockSignals(True)
+        self.tempo_spinbox.setValue(int(round(bpm)))
+        self.tempo_spinbox.blockSignals(False)
+
 
     def init_ui(self):
         # --- UPLOAD BUTTON + MENU ---

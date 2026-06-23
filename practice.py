@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from app_logic.midi.ScoreData import ScoreData
+from app_logic.midi.MidiPlayer import MidiPlayer
 from app_logic.user.ds.Recording import Recording
 from app_logic.user.AudioRecorder import AudioRecorder
 
@@ -37,9 +38,13 @@ class PracticePanel(QWidget):
     ``set_tolerance`` / ``on_tempo_changed``) and a fresh score via ``load_score``.
     """
 
-    def __init__(self, score_data: ScoreData, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.score_data = score_data
+        # Practice keeps its OWN independent score (loaded in load_score) so that
+        # Perform's analyze / resize / tempo changes never mutate the MIDI shown
+        # here. The app keeps the two in sync only for shared edits it pushes in
+        # explicitly (instrument selection, score upload).
+        self.score_data = ScoreData()
         self.recording = Recording(score_data=self.score_data)
 
         self.is_playing = False
@@ -105,14 +110,17 @@ class PracticePanel(QWidget):
         self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
         self.recording.pitch_detector.pitch_detected.connect(self.pitch_detected)
 
-    def attach_transport(self, wall_clock, slider, status_bar, midi_player):
+    def attach_transport(self, wall_clock, slider, status_bar, midi_synth):
         """Inject the shared transport components (owned by the host app). The
         panel drives these directly during practice playback/recording; the host
-        routes the matching button clicks / clock+slider ticks back to us."""
+        routes the matching button clicks / clock+slider ticks back to us.
+
+        The MIDI player is the panel's OWN (sharing only the synth + clock) so it
+        plays *this tab's* independent score — Perform's resize never leaks in."""
         self.wall_clock = wall_clock
         self.slider = slider
         self.status_bar = status_bar
-        self.midi_player = midi_player
+        self.midi_player = MidiPlayer(midi_synth, wall_clock)
         # the plot is the master view while recording (driven by emitted pitch
         # times, not the clock): keep the shared slider following it.
         self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
@@ -173,6 +181,7 @@ class PracticePanel(QWidget):
         self.is_playing = True
         self.wall_clock.start(t)
         self.midi_player.play(start_time=t)
+        self.status_bar.update_status("Practicing...")
 
     def stop_playback(self):
         if not self.is_playing:
@@ -180,6 +189,7 @@ class PracticePanel(QWidget):
         self.is_playing = False
         self.wall_clock.pause()
         self.midi_player.stop()
+        self.status_bar.update_status("")
 
     def start_recording(self):
         """Begin a pitch-driven take. The host calls this after the shared
@@ -335,12 +345,23 @@ class PracticePanel(QWidget):
         score is currently loaded (no-op if none yet)."""
         self.refresh_score_viewer()
 
-    def load_score(self, score_data: ScoreData):
-        """Load a score into practice mode: re-init the recording and views with
-        the new score. The shared midi_player/slider are (re)loaded/re-ranged by
-        the host (Attune.load_score), so we don't touch them here."""
-        self.score_data = score_data
+    def load_score(self, filepath):
+        """Load a score from `filepath` into practice mode. Practice parses its
+        OWN ScoreData copy (rather than sharing the app's) so Perform's resize /
+        tempo edits never mutate the MIDI shown here; the app keeps the active
+        instrument in sync via set_active_instrument. The slider range is re-synced
+        by the host."""
+        self.score_data = ScoreData()
+        self.score_data.load(filepath)
+        # match the app's default: first real (non-metronome) instrument channel
+        self.score_data.active_instrument = next(
+            (ch for ch in self.score_data.instruments
+             if ch != self.score_data.metronome_channel),
+            0,
+        )
         self.recording = Recording(score_data=self.score_data)
+        if self.midi_player is not None:
+            self.midi_player.load_score(self.score_data)
         self.guitar_hero.load_score(self.score_data)
         self.guitar_hero.load_user(self.recording)
         self.audio_recorder.load_recording(self.recording)

@@ -116,7 +116,7 @@ class NoteDetector(QObject):
         slope, _ = self.get_slope(pitches) 
 
         # key results
-        is_flat = slope < self.SLOPE_THRESH
+        is_flat = abs(slope) < self.SLOPE_THRESH
         is_unv = self.is_unvoiced(unvoiced_probs)
         med_pitches = self.get_median_pitches(pitches)
         
