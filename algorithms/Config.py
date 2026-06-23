@@ -22,7 +22,7 @@ class Config:
     ins_cost: float = 5
     del_cost: float = 5
     sub_cost: float = 1
-    tolerance: float = 0.3
+    tolerance: float = 0.5
 
     # tiger-mom parameter
     tiger_level: int = 1

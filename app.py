@@ -304,13 +304,45 @@ class Attune(QMainWindow):
         self._wired_detectors.add(rec.pitch_detector)
 
     # --- SHARED HELPERS / CLEANUP ---
-    def _require_recording(self, message: str = "Please select a recording first.") -> "Recording | None":
-        """Return the active recording, or warn (with `message`) and return None
-        when there isn't one. Centralizes the repeated no-recording guard."""
+    def _has_recording(self, warn=False) -> bool:
+        """Return True if there's an active recording, or warn (with `message`)
+        and return False when there isn't. Centralizes the repeated no-recording
+        guard."""
+        MESSAGE = "Please select a recording first."
         if self.active_recording is None:
-            QMessageBox.warning(self, "No recording selected", message)
-            return None
-        return self.active_recording
+            if warn:
+                QMessageBox.warning(self, "No recording selected", MESSAGE)
+            return False
+        return True
+    
+    def _recording_is_empty(self, warn=False) -> bool:
+        """Return True if the active recording has no audio, or warn (with
+        `message`) and return False when it does. Centralizes the repeated
+        no-audio guard."""
+        if not self._has_recording(warn=False):
+            return False
+        
+        MESSAGE = "Please record or upload audio first."
+        rec = self.active_recording
+        if rec.audio_data.end_index <= 0:
+            if warn:
+                QMessageBox.warning(self, "No audio available", MESSAGE)
+            return True
+        
+        return False
+
+    def _has_analysis(self, warn=False) -> bool:
+        """Return True if the active recording has been analyzed (notes detected =>
+        alignment filled in), or warn (with `message`) and return False when it
+        hasn't. Centralizes the repeated no-analysis guard."""
+        MESSAGE = "Please analyze the recording first."
+        if not self._has_recording():
+            return False
+        if not self.active_recording.has_analysis():
+            if warn:
+                QMessageBox.warning(self, "No analysis available", MESSAGE)
+            return False
+        return True
 
     def cleanup(self):
         """Reset all analysis-derived state so no stale artifacts survive an
@@ -360,9 +392,9 @@ class Attune(QMainWindow):
         self.midi_player.load_score(self.score_data)
 
     def load_audio(self, filepath: str):
-        rec = self._require_recording("Please select a recording to load the audio into.")
-        if rec is None:
+        if not self._has_recording():
             return
+        rec = self.active_recording
         rec.load_audio(filepath)  # loads the raw waveform only
         # default the recording's name to the uploaded audio file's name
         self.recordings_tree.set_recording_name(Path(filepath).stem)
@@ -436,7 +468,7 @@ class Attune(QMainWindow):
             self.play_button.setIcon(self.play_icon)
 
     def toggle_recording(self):
-        if self._require_recording("Please select a recording to record into.") is None:
+        if not self._has_recording(warn=True):
             return
         if self.is_counting_in:
             # clicking again during the count-in cancels it (un-arm recording)
@@ -536,9 +568,10 @@ class Attune(QMainWindow):
             n_mistakes = new_n_mistakes  # made progress -> raise the baseline
 
     def analyze(self):
-        rec = self._require_recording()
-        if rec is None:
+        if not self._has_recording(warn=True) or self._recording_is_empty(warn=True):
             return
+
+        rec = self.active_recording
         # don't analyze raw/partial pitches: if offline detection+smoothing is
         # still running in the background, defer until it finishes (the smoothed
         # track has the octave errors / noise cleaned up). _on_detection_finished
@@ -650,9 +683,9 @@ class Attune(QMainWindow):
         """Make `channel` the active instrument for the active recording. Resets
         all analysis-derived data (notes, alignment, mistakes/overrides), re-inits
         the algorithms from the current Config, and refreshes the views."""
-        rec = self._require_recording()
-        if rec is None:
+        if not self._has_recording():
             return
+        rec = self.active_recording
 
         # the active instrument drives both display (score_data) and analysis
         # (rec.active_instrument is what detect_mistakes / pitch distances key on)
@@ -688,16 +721,13 @@ class Attune(QMainWindow):
     def on_range_applied(self, low_midi: int, high_midi: int):
         """Set the active recording's Config frequency range from the chosen
         lowest/highest notes, then re-compute pitches with the new Config."""
-        rec = self._require_recording()
-        if rec is None:
+        if not self._has_recording():
             return
+        rec = self.active_recording
         config = rec.config
 
-        # half-semitone padding so the boundary notes sit comfortably inside the
-        # detectable range. fmin/fmax drive the detector's tau_max/tau_min.
-        MARGIN = 0.5
-        config.fmin = config.midi_to_freq(low_midi - MARGIN)
-        config.fmax = config.midi_to_freq(high_midi + MARGIN)
+        config.fmin = config.midi_to_freq(low_midi)
+        config.fmax = config.midi_to_freq(high_midi)
         rec.update_config(config)
 
         # re-run pitch detection on the existing audio (if any) with the new range
@@ -706,9 +736,9 @@ class Attune(QMainWindow):
     def on_tuning_applied(self, tuning: float):
         """Set the active recording's Config tuning (A4 reference, Hz), then
         re-compute pitches with it (tuning drives the freq<->MIDI conversion)."""
-        rec = self._require_recording()
-        if rec is None:
+        if not self._has_recording():
             return
+        rec = self.active_recording
         rec.config.tuning = tuning
         rec.update_config(rec.config)
 
@@ -719,13 +749,14 @@ class Attune(QMainWindow):
         """Set the active recording's Config tolerance (semitone slack for a note
         to count as correct), then re-run just the mistake-detection (string-edit)
         step and refresh the mistake list + GuitarHero overlays."""
-        rec = self._require_recording()
-        if rec is None:
+        if not self._has_recording():
             return
+        rec = self.active_recording
         rec.config.tolerance = tolerance
         rec.update_config(rec.config)
 
-        self.analyze()
+        if self._has_analysis(warn=False):
+            self.analyze()
 
     def on_score_renamed(self, title: str):
         """The Score Title was edited in the RecordingTree (the source of truth).

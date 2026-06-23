@@ -31,8 +31,10 @@ class PitchDetector(QObject):
         # --- pitch config variables ---
         # ensure max lag is big enough to detect lowest f0 (largest period)
         # defaults to violin min
-        self.tau_max = int(self.config.sr / self.config.fmin) 
-        self.tau_min = int(self.config.sr / self.config.fmax)
+        padded_fmin = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmin) - 0.5)
+        padded_fmax = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmax) + 0.5)
+        self.tau_max = int(self.config.sr / padded_fmin)
+        self.tau_min = int(self.config.sr / padded_fmax)
 
         # initialize beta distribution parameters
         self.UNVOICED_PROB = 0.01
@@ -56,8 +58,10 @@ class PitchDetector(QObject):
         """re-initialize the tuning parameters"""
         self.config = config
         self.SR = config.sr
-        self.tau_max = int(self.SR / config.fmin) 
-        self.tau_min = int(self.SR / config.fmax)
+        padded_fmin = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmin) - 0.5)
+        padded_fmax = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmax) + 0.5)
+        self.tau_max = int(self.SR / padded_fmin)
+        self.tau_min = int(self.SR / padded_fmax)
 
         # rolling window variables (for detect_pitches)
         self.FRAME_SIZE = config.w1

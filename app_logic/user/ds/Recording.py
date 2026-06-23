@@ -194,7 +194,7 @@ class Recording:
             if p is not None:
                 p.align_distance = None
 
-        for user_note, midi_note in self.alignment.pairs:
+        for pair_index, (user_note, midi_note) in enumerate(self.alignment.pairs):
             if user_note is None:
                 continue  # deletion: score note with no user pitches to color
             pitches = self.pitch_data.read(
@@ -202,7 +202,12 @@ class Recording:
                 end_time=user_note.end_time,
                 clean=True,
             )
-            if midi_note is None:
+            if pair_index in self.alignment.overridden_pair_indices:
+                # overridden mistake: the user dismissed it, so force its pitches
+                # to distance 0 => green, regardless of the underlying mismatch.
+                for p in pitches:
+                    p.align_distance = 0.0
+            elif midi_note is None:
                 # insertion: a note that isn't in the score at all -> all red
                 for p in pitches:
                     p.align_distance = float('inf')
@@ -235,3 +240,11 @@ class Recording:
 
         if 0 <= mistake_index < len(self.alignment.mistakes):
             self.alignment.mistakes[mistake_index].set_override(overridden)
+
+        # recolor the affected pitches: overridden notes -> green (distance 0),
+        # un-overridden -> back to their real alignment distance.
+        self.update_alignment_distances()
+
+    def has_analysis(self):
+        """Return True if this recording has been analyzed (notes detected => alignment filled in)"""
+        return len(self.note_data.times) > 0

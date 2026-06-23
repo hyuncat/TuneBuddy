@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QRectF, QSize, pyqtSignal
-from PyQt6.QtGui import QIcon, QPainter, QPixmap
+from PyQt6.QtGui import QBrush, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
@@ -10,6 +10,10 @@ from PyQt6.QtWidgets import (
 from app_logic.Alignment import Mistake
 
 _ICON_DIR = Path(__file__).resolve().parents[2] / "resources" / "icons"
+
+# per-row flag (read off column 0) marking an overridden/dismissed mistake, so
+# the delegate can darken the whole row
+_OVERRIDE_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 def _svg_icon(filename: str, px: int = 64) -> QIcon:
@@ -40,17 +44,43 @@ class _CenteredIconDelegate(QStyledItemDelegate):
     delegate handles every row, so we avoid creating N per-row native widgets —
     which the comment on MistakeWidget warns starves the GPU process on macOS."""
 
-    def __init__(self, columns: set[int], icon_px: int = 18, parent=None):
+    def __init__(self, columns: set[int], override_brush: QBrush,
+                 override_fg: QColor, icon_px: int = 18, parent=None):
         super().__init__(parent)
         self._columns = set(columns)
         self._icon_px = icon_px
+        self._override_brush = override_brush
+        self._override_fg = override_fg
 
     def paint(self, painter, option, index):
-        if index.column() not in self._columns:
-            super().paint(painter, option, index)
+        overridden = bool(index.data(_OVERRIDE_ROLE))
+        is_icon_col = index.column() in self._columns
+
+        if not overridden:
+            # default path: text columns rendered by the base delegate, icon
+            # columns drawn with a centered (white) glyph
+            if is_icon_col:
+                self._paint_icon_cell(painter, option, index, tint=None)
+            else:
+                super().paint(painter, option, index)
             return
-        # draw the background / selection highlight, but no text or (left-
-        # aligned) decoration of its own
+
+        # --- overridden row: fully custom-drawn so the grey survives selection.
+        # The palette can't dim selected text here because qdarktheme sets the
+        # selected-text color via the `selection-color` style-sheet property,
+        # which QStyleSheetStyle uses instead of the palette. So we draw the
+        # selection chrome with no text, then paint the text/icon ourselves grey.
+        # First darken the (unselected) background; a selected row's blue fill is
+        # drawn over it by the chrome below.
+        painter.fillRect(option.rect, self._override_brush)
+        if is_icon_col:
+            self._paint_icon_cell(painter, option, index, tint=self._override_fg)
+        else:
+            self._paint_text_cell(painter, option, index, self._override_fg)
+
+    def _paint_icon_cell(self, painter, option, index, tint):
+        """Draw the cell chrome (background/selection) with a centered icon. The
+        icon is recolored to `tint` when given (overridden rows), else drawn as-is."""
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         opt.text = ""
@@ -58,14 +88,50 @@ class _CenteredIconDelegate(QStyledItemDelegate):
         widget = opt.widget
         style = widget.style() if widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
-        # draw the icon centered in the cell
         icon = index.data(Qt.ItemDataRole.DecorationRole)
         if isinstance(icon, QIcon) and not icon.isNull():
             s = self._icon_px
             r = option.rect
             x = r.x() + (r.width() - s) // 2
             y = r.y() + (r.height() - s) // 2
-            icon.paint(painter, x, y, s, s)
+            if tint is not None:
+                self._draw_tinted_icon(painter, icon, x, y, s, tint)
+            else:
+                icon.paint(painter, x, y, s, s)
+
+    def _paint_text_cell(self, painter, option, index, color: QColor):
+        """Draw the cell chrome (background/selection) then the text in `color`,
+        bypassing the style's own (selection-aware) text coloring."""
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, widget
+        )
+        elided = opt.fontMetrics.elidedText(
+            text, Qt.TextElideMode.ElideRight, text_rect.width()
+        )
+        painter.save()
+        painter.setPen(color)
+        painter.setFont(opt.font)
+        painter.drawText(text_rect, int(opt.displayAlignment), elided)
+        painter.restore()
+
+    @staticmethod
+    def _draw_tinted_icon(painter, icon: QIcon, x: int, y: int, s: int, color: QColor):
+        """Draw `icon` recolored to a flat `color`, preserving its alpha mask, so
+        the icons on overridden rows match the dimmed text."""
+        pm = icon.pixmap(s, s)
+        tp = QPainter(pm)
+        tp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        tp.fillRect(pm.rect(), color)
+        tp.end()
+        painter.drawPixmap(x, y, pm)
 
 
 #converts number of seconds to a well-formatted time to display to the user in the mistake widget
@@ -103,6 +169,13 @@ class MistakeWidget(QWidget):
     _TYPE_COL = 2
     _OVERRIDE_COL = 5
 
+    # translucent dark tint laid over an overridden (dismissed) row so it reads
+    # as "set aside" — pairs with the green highlight the same note gets in
+    # GuitarHero. A null brush clears it back to the default row background.
+    _OVERRIDE_BG = QBrush(QColor(0, 0, 0, 115))
+    # grey the row's text + icons when overridden (qdarktheme's disabled color)
+    _OVERRIDE_FG = QColor(105, 113, 119)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._layout = QVBoxLayout(self)
@@ -136,7 +209,12 @@ class MistakeWidget(QWidget):
         self.tree.setRootIsDecorated(False)
         self.tree.setIconSize(QSize(20, 20))
         self.tree.setItemDelegate(
-            _CenteredIconDelegate({self._TYPE_COL, self._OVERRIDE_COL}, parent=self.tree)
+            _CenteredIconDelegate(
+                {self._TYPE_COL, self._OVERRIDE_COL},
+                self._OVERRIDE_BG,
+                self._OVERRIDE_FG,
+                parent=self.tree,
+            )
         )
 
         self.tree.setColumnWidth(0, 24)   # "#"        — 1-2 digit index
@@ -235,6 +313,10 @@ class MistakeWidget(QWidget):
         else:
             item.setIcon(self._OVERRIDE_COL, self._icons["trash"])
             item.setToolTip(self._OVERRIDE_COL, "Override (dismiss this mistake)")
+        # flag every column so the delegate darkens the whole row, and each cell
+        # repaints when toggled live (see _CenteredIconDelegate)
+        for col in range(self.tree.columnCount()):
+            item.setData(col, _OVERRIDE_ROLE, overridden)
 
     def _on_selection_changed(self):
         item = self.tree.currentItem()

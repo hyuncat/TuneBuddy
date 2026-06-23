@@ -23,3 +23,21 @@ html, body { height: 100%; margin: 0; background: #111; }
 g.note.playing {
   fill: rgb(6, 114, 197);
 }
+
+/* Mirror qdarktheme's dark scrollbars (the rest of the app uses Qt's
+   styled scrollbars; this web view renders its own Chromium ones). */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: rgb(65, 66, 66);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(94, 94, 94);
+}
