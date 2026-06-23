@@ -25,7 +25,11 @@ class NoteDetector(QObject):
         
         self.UNVOICED_PROP = self.config.unv_ratio # if more than 50% of pitches are unvoiced
         self.UNV_THRESH = self.config.unv_thresh # unvoiced pitches have unv_prob > sens
-        
+
+        # refine_onsets: a relocated boundary must hold for this many consecutive
+        # pitch frames before we trust it (resists a lone vibrato / noise frame)
+        self.ONSET_SUSTAIN = 3
+
         # threading variables
         self.nda_thread: threading.Thread = None
         self.stop_event = threading.Event()
@@ -171,13 +175,127 @@ class NoteDetector(QObject):
         # write the last note! :,)
         n = Note(
             i=i,
-            start_time=prev_time, 
+            start_time=prev_time,
             end_time=t,
             midi_num=prev_note
         )
         nd.write_note(n)
+
+        # post-process: pull the hop-quantized boundaries onto the true onsets
+        nd = self.refine_onsets(nd, pitch_data)
         return nd
-    
+
+    # ------------------------------------------------------------------ #
+    # onset refinement (Method 1: pitch-transition + voicing fallback)
+    # ------------------------------------------------------------------ #
+    def _frame_pitch(self, p: Pitch):
+        """primary midi of a frame, or None if the frame is missing / empty."""
+        if p is None or not p.candidates:
+            return None
+        return p.candidates[0][0]
+
+    def _frame_unvoiced(self, p: Pitch) -> float:
+        """unvoiced prob of a frame; a missing frame counts as fully unvoiced."""
+        return p.unvoiced_prob if p is not None else 1.0
+
+    def _find_pitch_crossing(self, pitches: list[Pitch], lo: int, hi: int,
+                             med_a: float, med_b: float) -> int | None:
+        """voiced<->voiced: smallest frame in [lo, hi) where the per-frame pitch
+        has crossed onto note B's side of the A/B midpoint and *stays* there for
+        ONSET_SUSTAIN frames. returns the start of that run, or None."""
+        midpoint = 0.5 * (med_a + med_b)
+        going_up = med_b > med_a
+        run, run_start = 0, None
+        for k in range(lo, hi):
+            v = self._frame_pitch(pitches[k])
+            on_b = v is not None and ((v > midpoint) if going_up else (v < midpoint))
+            if on_b:
+                if run == 0:
+                    run_start = k
+                run += 1
+                if run >= self.ONSET_SUSTAIN:
+                    return run_start
+            else:
+                run, run_start = 0, None
+        return None
+
+    def _find_voicing_change(self, pitches: list[Pitch], lo: int, hi: int,
+                             to_voiced: bool) -> int | None:
+        """rest<->note: smallest frame in [lo, hi) where voicing flips to the
+        target state and holds for ONSET_SUSTAIN frames. returns its start, or
+        None."""
+        run, run_start = 0, None
+        for k in range(lo, hi):
+            unv = self._frame_unvoiced(pitches[k])
+            match = (unv < self.UNV_THRESH) if to_voiced else (unv >= self.UNV_THRESH)
+            if match:
+                if run == 0:
+                    run_start = k
+                run += 1
+                if run >= self.ONSET_SUSTAIN:
+                    return run_start
+            else:
+                run, run_start = 0, None
+        return None
+
+    def refine_onsets(self, note_data: NoteData, pitch_data: PitchData) -> NoteData:
+        """relocate the hop-quantized note boundaries onto their true onsets.
+
+        The detector reports every boundary at an h2-frame grid point (~55 ms).
+        For each *shared* boundary between consecutive notes we search +-w pitch
+        frames around it and move the split to single-frame (h1, ~3 ms) detail:
+          - voiced<->voiced : first sustained crossing of the A/B pitch midpoint
+          - rest<->note     : first sustained voicing change
+          - rest<->rest     : left untouched (no cue)
+        The original boundary is kept whenever no confident split is found, and
+        the split is clamped strictly inside the pair so notes can't collapse.
+        """
+        notes = note_data.read(i=0, j=len(note_data.times))
+        if len(notes) < 2:
+            return note_data
+
+        pitches = pitch_data.data
+        n_frames = len(pitches)
+        radius = self.w  # detection-window width; the true onset lies within it
+        frame_dt = self.config.h1 / self.config.sr
+
+        for a, b in zip(notes, notes[1:]):
+            med_a, med_b = a.midi_num[0], b.midi_num[0]
+
+            # clamp the search to this pair's own extent so we never wander into
+            # neighbouring notes (a.start_time may already have been refined)
+            bound_idx = pitch_data.time_to_index(a.end_time)
+            a_start = pitch_data.time_to_index(a.start_time)
+            b_end = pitch_data.time_to_index(b.end_time)
+            lo = max(a_start + 1, bound_idx - radius)
+            hi = min(b_end, bound_idx + radius, n_frames)
+            if lo >= hi:
+                continue
+
+            a_voiced, b_voiced = med_a != -1, med_b != -1
+            if a_voiced and b_voiced:
+                k = self._find_pitch_crossing(pitches, lo, hi, med_a, med_b)
+            elif a_voiced != b_voiced:
+                k = self._find_voicing_change(pitches, lo, hi, to_voiced=b_voiced)
+            else:
+                k = None  # rest<->rest: nothing to refine
+
+            if k is None:
+                continue
+
+            new_t = k * frame_dt
+            if a.start_time < new_t < b.end_time:
+                a.end_time = new_t
+                b.start_time = new_t
+
+        # rebuild so NoteData's dict/times index reflects the new start_times
+        refined = NoteData()
+        for idx, n in enumerate(notes):
+            n.id = idx
+            refined.write_note(n)
+        return refined
+
+
 
     def run(self, start_time: float=None):
         self.stop()
