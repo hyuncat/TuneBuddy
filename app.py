@@ -459,6 +459,7 @@ class Attune(QMainWindow):
                 self.audio_player.play(start_time=t)
             # update UI
             self.play_button.setIcon(self.pause_icon)
+            self.status_bar.update_status("Playing...")
 
         elif self.is_playing:
             self.is_playing = False
@@ -467,6 +468,7 @@ class Attune(QMainWindow):
             self.audio_player.stop()
             # update UI
             self.play_button.setIcon(self.play_icon)
+            self.status_bar.update_status("")
 
     def toggle_recording(self):
         if not self._has_recording(warn=True):
@@ -514,6 +516,7 @@ class Attune(QMainWindow):
         self.audio_recorder.stop()
         self.midi_player.stop()
         self.active_recording.pitch_detector.stop()
+        self.status_bar.update_status("")
 
     def _find_best_w2(self):
         """refactor later but essentially
