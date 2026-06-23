@@ -444,6 +444,13 @@ class GuitarHero(QWidget):
             for c in p.candidates:
                 xs.append(p.time)
                 ys.append(c[0]) # pitch value
+                # high-slope transition frames (slides between notes) are always
+                # neutral grey: their pitch is mid-slide, so we never score them by
+                # distance — even post-analyze where _update_pitch_distances has
+                # given them a (meaningless) live `distance`.
+                if getattr(p, "is_transition", False):
+                    brushes.append(self.rest_brush)
+                    break
                 # after analyze() pitches carry an alignment-based distance; color
                 # by that. while recording (or pre-analysis) it's None, so fall
                 # back to the live per-frame distance coloring.

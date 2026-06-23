@@ -82,6 +82,19 @@ class Recording:
         """run note detection on the current pitch data"""
         self.note_data = self.note_detector.detect_notes(self.pitch_data)
 
+    def detect_transitions(self):
+        """flag high-slope (pitch-transition) frames in the pitch data. Run after
+        detect_notes() / onset refinement and before update_alignment_distances()
+        so those biased frames are left uncolored (grey) instead of scored."""
+        self.note_detector.detect_transitions(self.pitch_data)
+
+    def recompute_note_pitches(self):
+        """re-median each detected note's pitch over only its non-transition
+        frames, so onset-refinement slide frames don't bias a note sharp/flat
+        (e.g. a false F5->F#5). Run after detect_transitions(), before
+        detect_mistakes()."""
+        self.note_detector.recompute_note_pitches(self.note_data, self.pitch_data)
+
     def detect_mistakes(self):
         user_notes, midi_notes = self.note_data, self.score_data.note_datas[self.active_instrument]
         notes, mistakes = self.string_editor.string_edit(user_string=user_notes, midi_string=midi_notes)
@@ -184,11 +197,14 @@ class Recording:
           - insertion (user note, no score match): all its pitches -> inf (red).
           - good / substitution: distance to the *aligned* score note's pitch.
 
-        Voiced pitches not covered by any aligned note (transitions between notes)
-        default to green (TRANSITION_DISTANCE) rather than the live per-frame
-        distance. Truly empty/unvoiced frames stay None. So in post-analysis every
-        *drawn* pitch has an align_distance and nothing falls back to live coloring;
-        while recording (pitches detected fresh) they're all None -> live coloring."""
+        High-slope transition frames (flagged by detect_transitions) are always
+        skipped — their pitch is mid-slide and unreliable, so they stay None
+        (grey) rather than dragging a note's coloring or showing as a mistake.
+        Other voiced pitches not covered by any aligned note default to green
+        (TRANSITION_DISTANCE) rather than the live per-frame distance. Truly
+        empty/unvoiced frames stay None. So in post-analysis every *drawn*,
+        non-transition pitch has an align_distance; while recording (pitches
+        detected fresh) they're all None -> live coloring."""
         # reset first so stale post-analysis colors never linger
         for p in self.pitch_data.data:
             if p is not None:
@@ -202,6 +218,8 @@ class Recording:
                 end_time=user_note.end_time,
                 clean=True,
             )
+            # transition frames are mid-slide: leave them None (grey), never score
+            pitches = [p for p in pitches if not p.is_transition]
             if pair_index in self.alignment.overridden_pair_indices:
                 # overridden mistake: the user dismissed it, so force its pitches
                 # to distance 0 => green, regardless of the underlying mismatch.
@@ -216,10 +234,12 @@ class Recording:
                 for p in pitches:
                     p.align_distance = target - p.candidates[0][0]
 
-        # transitions: any remaining voiced (drawable) pitch no note covered.
-        # color these green by default instead of leaving them to live coloring.
+        # any remaining voiced (drawable) pitch no note covered: color green by
+        # default instead of falling back to live coloring -- but skip high-slope
+        # transition frames, which stay None (grey) so slides aren't penalized.
         for p in self.pitch_data.data:
-            if p is not None and p.align_distance is None and p.candidates:
+            if (p is not None and p.align_distance is None and p.candidates
+                    and not p.is_transition):
                 p.align_distance = self.TRANSITION_DISTANCE
     
     def toggle_mistake_override(self, mistake_index: int):

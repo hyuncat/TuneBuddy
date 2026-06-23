@@ -185,8 +185,13 @@ class PitchDetector(QObject):
 
             start_time = (i*self.HOP_SIZE)/self.SR # elapsed time of the frame
             pitch = self.detect_pitch(frame, start_time)
+            # offline detection has no live playhead, so detect_pitch's per-frame
+            # distance (to the score's *current* note at a fixed cursor) is
+            # meaningless here. Leave it None so detected-but-unanalyzed pitches
+            # render neutral grey until analyze() assigns alignment distances.
+            pitch.distance = None
             pitches.append(pitch)
-             
+
         return pitches
 
 

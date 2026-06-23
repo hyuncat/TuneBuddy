@@ -39,7 +39,7 @@ class Config:
         self.unv_thresh = config.get("unv_thresh", self.unv_thresh)
 
         self.w2 = config.get("w2", self.w2)
-        self.h2 = config.get("h2", self.h2)
+        self.h2 = self.w2 - 2
         self.pitch_thresh = config.get("pitch_thresh", self.pitch_thresh)
         self.slope_thresh = 0.75 / self.w2 # rk: 0.75 is not set in stone
         # self.slope_thresh = config.get("slope_thresh", self.slope_thresh)

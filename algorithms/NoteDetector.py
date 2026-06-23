@@ -295,6 +295,70 @@ class NoteDetector(QObject):
             refined.write_note(n)
         return refined
 
+    # ------------------------------------------------------------------ #
+    # transition flagging (post-pass, run after onset refinement)
+    # ------------------------------------------------------------------ #
+    def detect_transitions(self, pitch_data: PitchData) -> None:
+        """Mark every high-slope (pitch-transition) frame in `pitch_data`.
+
+        Note detection deliberately skips windows whose pitch slope exceeds
+        SLOPE_THRESH (slides between notes), but onset refinement then pulls those
+        boundaries back so the transition frames end up *inside* a note's span.
+        Left in, they drag a note's median pitch toward the neighbour it's sliding
+        from/to (e.g. a slide up reads "too sharp").
+
+        This pass slides the same detection window over the whole pitch track and
+        sets `Pitch.is_transition = True` for any frame inside a window whose
+        |slope| >= SLOPE_THRESH, else False. Downstream, update_alignment_distances
+        leaves these frames' distances unset (grey) so they aren't scored.
+        Call after detect_notes() (i.e. after refine_onsets) and before
+        Recording.update_alignment_distances()."""
+        pitches = pitch_data.data
+
+        # default every present frame to non-transition first (idempotent re-runs)
+        for p in pitches:
+            if p is not None:
+                p.is_transition = False
+
+        # slide the detection window; flag all frames inside a high-slope window.
+        # uses a dedicated small window (transitions are short-timescale events),
+        # independent of the note-segmentation window self.w.
+        w = 9
+        h = 7
+        slope_thresh = 0.75 / w
+        for i in range(0, len(pitches) - w, h):
+            window = pitches[i:i + w]
+            if window[0] is None:
+                continue
+            slope, _ = self.get_slope(window)
+            if abs(slope) >= slope_thresh:
+                for p in window:
+                    if p is not None:
+                        p.is_transition = True
+
+    def recompute_note_pitches(self, note_data: NoteData, pitch_data: PitchData) -> None:
+        """Re-median each note's pitch over only its non-transition frames.
+
+        A note's midi_num is the median of its frames, but onset refinement pulls
+        high-slope slide frames into the note's span; for a descending slide those
+        frames sit above the settled pitch and drag the median sharp (e.g. an F5
+        reads F#5 -> a false 'too sharp' substitution). Excluding transition frames
+        (flagged by detect_transitions) restores the settled pitch. A note with no
+        non-transition voiced frames (rests, all-slide blips) keeps its original
+        midi_num.
+
+        Run after detect_transitions() and before detect_mistakes()."""
+        for note in note_data.data.values():
+            if note is None or note.midi_num[0] == -1:
+                continue  # leave rests alone
+            frames = pitch_data.read(
+                start_time=note.start_time, end_time=note.end_time, clean=False
+            )
+            kept = [p for p in frames if p is not None and not p.is_transition]
+            med = self.get_median_pitches(kept)
+            if med[0] != -1:  # only overwrite when a voiced estimate survives
+                note.midi_num = med
+
 
 
     def run(self, start_time: float=None):

@@ -284,6 +284,7 @@ class Attune(QMainWindow):
         self.instrument_panel.full_score_toggled.connect(self.on_full_score_toggled)
         self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
         self.mistake_widget.selected.connect(self.on_mistake_selected)
+        self.mistake_widget.cleared.connect(self.guitar_hero.clear_highlight)
         self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
         self.tolerance_panel.tolerance_applied.connect(self.on_tolerance_applied)
         self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
@@ -587,6 +588,14 @@ class Attune(QMainWindow):
         # the take's length (also rescales p.distances), then string-edit align
         self._find_best_w2()
         self.detect_notes()
+        # flag high-slope transition frames now (after onset refinement pulls them
+        # back into note spans) so update_alignment_distances leaves them grey
+        # instead of letting slides bias a note's coloring / flag false mistakes.
+        rec.detect_transitions()
+        # re-median note pitches over non-transition frames so onset-refinement
+        # slide frames don't bias a note sharp/flat (kills false "too sharp"
+        # substitutions). Must run before detect_mistakes() / the alignment.
+        rec.recompute_note_pitches()
         length = rec.get_length(raw=True)
         rec.resize(new_length=length)
         rec.detect_mistakes()

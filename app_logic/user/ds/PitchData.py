@@ -56,6 +56,12 @@ class Pitch:
         # A pitch inside an insertion gets float('inf') so it always colors red.
         self.align_distance = None
 
+        # whether this frame sits in a high-slope pitch transition (slide between
+        # notes). None until NoteDetector.detect_transitions() runs as a post-pass;
+        # then True/False per frame. Transition frames are excluded from alignment
+        # distances so they don't bias a note's median or get colored as mistakes.
+        self.is_transition = None
+
 class PitchData:
     def __init__(self, config: Config):
         """

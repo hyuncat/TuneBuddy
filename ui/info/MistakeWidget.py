@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QRectF, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QSize, QEvent, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -165,6 +165,7 @@ class MistakeWidget(QWidget):
     """
     selected = pyqtSignal(int)         # emits mistake index on row click
     override_toggled = pyqtSignal(int) # emits mistake index when Override cell is clicked
+    cleared = pyqtSignal()             # emits when the selection is cleared (e.g. click empty space)
 
     _TYPE_COL = 2
     _OVERRIDE_COL = 5
@@ -244,6 +245,9 @@ class MistakeWidget(QWidget):
     def init_signals(self):
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         self.tree.itemClicked.connect(self._on_item_clicked)
+        # clicking empty space in the tree should clear the selection (and thus the
+        # GuitarHero highlight); QTreeWidget doesn't do this on its own
+        self.tree.viewport().installEventFilter(self)
 
     # --- PUBLIC API ---
     def load_mistakes(self, mistakes: list[Mistake]):
@@ -319,10 +323,13 @@ class MistakeWidget(QWidget):
             item.setData(col, _OVERRIDE_ROLE, overridden)
 
     def _on_selection_changed(self):
-        item = self.tree.currentItem()
-        if item is None:
+        # read the selection, not currentItem(): clicking empty space clears the
+        # selection but leaves currentItem set, so we'd never detect the deselect.
+        items = self.tree.selectedItems()
+        if not items:
+            self.cleared.emit()
             return
-        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        idx = items[0].data(0, Qt.ItemDataRole.UserRole)
         if idx is not None:
             self.selected.emit(idx)
 
@@ -332,3 +339,12 @@ class MistakeWidget(QWidget):
         idx = item.data(0, Qt.ItemDataRole.UserRole)
         if idx is not None:
             self.override_toggled.emit(idx)
+
+    def eventFilter(self, obj, event):
+        # a press on empty tree space (no item under the cursor) clears the
+        # selection, which fires _on_selection_changed -> `cleared`
+        if (obj is self.tree.viewport()
+                and event.type() == QEvent.Type.MouseButtonPress
+                and self.tree.itemAt(event.position().toPoint()) is None):
+            self.tree.clearSelection()
+        return super().eventFilter(obj, event)
