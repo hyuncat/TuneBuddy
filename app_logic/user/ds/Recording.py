@@ -95,6 +95,12 @@ class Recording:
         detect_mistakes()."""
         self.note_detector.recompute_note_pitches(self.note_data, self.pitch_data)
 
+    def prune_transition_notes(self):
+        """drop phantom notes that are almost entirely transition frames (notes
+        'detected' inside a slide because the ND window is wide). Run after
+        detect_transitions(), before detect_mistakes()."""
+        self.note_data = self.note_detector.prune_transition_notes(self.note_data, self.pitch_data)
+
     def detect_mistakes(self):
         user_notes, midi_notes = self.note_data, self.score_data.note_datas[self.active_instrument]
         notes, mistakes = self.string_editor.string_edit(user_string=user_notes, midi_string=midi_notes)

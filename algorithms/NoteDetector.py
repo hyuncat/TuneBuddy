@@ -325,7 +325,7 @@ class NoteDetector(QObject):
         # independent of the note-segmentation window self.w.
         w = 9
         h = 7
-        slope_thresh = 0.75 / w
+        slope_thresh = 0.5 / w
         for i in range(0, len(pitches) - w, h):
             window = pitches[i:i + w]
             if window[0] is None:
@@ -358,6 +358,37 @@ class NoteDetector(QObject):
             med = self.get_median_pitches(kept)
             if med[0] != -1:  # only overwrite when a voiced estimate survives
                 note.midi_num = med
+
+    def prune_transition_notes(self, note_data: NoteData, pitch_data: PitchData,
+                               frac_thresh: float = 0.5) -> NoteData:
+        """Drop notes that are almost entirely transition frames.
+
+        The note-detection window (self.w) is wide, so a note can be 'detected'
+        sitting inside a long slide between two real notes. Once detect_transitions
+        flags the slide frames, any note whose voiced frames are more than
+        `frac_thresh` transition is a phantom of that slide -> remove it. Notes
+        with no voiced frames (rests) are left untouched. Returns a rebuilt,
+        reindexed NoteData.
+
+        Run after detect_transitions(), before detect_mistakes()."""
+        survivors = []
+        for note in note_data.read(i=0, j=len(note_data.times)):
+            if note is None:
+                continue
+            voiced = pitch_data.read(
+                start_time=note.start_time, end_time=note.end_time, clean=True
+            )
+            n_trans = sum(1 for p in voiced if p.is_transition)
+            if voiced and n_trans > frac_thresh * len(voiced):
+                continue  # phantom slide note -> drop
+            survivors.append(note)
+
+        # rebuild so NoteData's dict/times index reflects the dropped notes
+        pruned = NoteData()
+        for idx, n in enumerate(survivors):
+            n.id = idx
+            pruned.write_note(n)
+        return pruned
 
 
 

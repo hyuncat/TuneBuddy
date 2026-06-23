@@ -596,6 +596,9 @@ class Attune(QMainWindow):
         # slide frames don't bias a note sharp/flat (kills false "too sharp"
         # substitutions). Must run before detect_mistakes() / the alignment.
         rec.recompute_note_pitches()
+        # drop phantom notes that are almost entirely slide (the wide ND window can
+        # detect a "note" inside a long transition). Also before detect_mistakes().
+        rec.prune_transition_notes()
         length = rec.get_length(raw=True)
         rec.resize(new_length=length)
         rec.detect_mistakes()
