@@ -39,7 +39,7 @@ from ui.info.Settings import SettingsDialog
 
 # app logic imports
 from app_logic.user.ds.Recording import Recording
-from app_logic.user.ds.PitchData import PitchConfig
+# from app_logic.user.ds.PitchData import PitchConfig
 from app_logic.user.AudioPlayer import AudioPlayer
 from app_logic.user.AudioRecorder import AudioRecorder
 from app_logic.midi.ScoreData import ScoreData
@@ -48,7 +48,7 @@ from app_logic.midi.MidiPlayer import MidiPlayer
 from app_logic.Alignment import Alignment
 from app_logic.NoteData import NoteData
 
-from algorithms.Config import Config
+# from algorithms.Config import Config
 from practice import PracticeAttune
 
 class Attune(QMainWindow):
