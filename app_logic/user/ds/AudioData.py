@@ -1,7 +1,6 @@
 import numpy as np
 import threading
 import soundfile as sf
-import librosa
 from pydub import AudioSegment
 
 from algorithms.Config import Config
