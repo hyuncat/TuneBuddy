@@ -274,3 +274,27 @@ class Recording:
     def has_analysis(self):
         """Return True if this recording has been analyzed (notes detected => alignment filled in)"""
         return len(self.note_data.times) > 0
+    
+    def trim_end(self):
+        """Remove trailing silence after the last voiced pitch."""
+        last_voiced_idx = None
+        for i in range(0, len(self.pitch_data.data)):
+            ##index moving backwards
+            rev_index = len(self.pitch_data.data)-1-i
+            pitch = self.pitch_data.data[rev_index]
+            if pitch is not None and pitch.unvoiced_prob < self.pitch_data.UNVOICED_THRESHOLD:
+                last_voiced_idx = rev_index
+                break
+
+        if last_voiced_idx is None:
+            return
+
+        # 200ms buffer just in case
+        trim_time = self.pitch_data.data[last_voiced_idx].time + 0.2
+        #check against original time
+        maximum_time = len(self.audio_data.data) / self.audio_data.sr
+        trim_time = min(trim_time, maximum_time)
+
+        with self.pitch_data.lock:
+            self.pitch_data.data = self.pitch_data.data[:last_voiced_idx + 1]
+        self.audio_data.end_index = int(trim_time * self.audio_data.sr)

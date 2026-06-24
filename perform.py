@@ -404,6 +404,7 @@ class PerformPanel(QWidget):
         # detect notes (at the best ND frame size), stretch the score to match
         # the take's length (also rescales p.distances), then string-edit align
         self._find_best_w2()
+        #rec.trim_end()
         self.detect_notes()
         # flag high-slope transition frames now (after onset refinement pulls them
         # back into note spans) so update_alignment_distances leaves them grey
