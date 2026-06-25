@@ -315,21 +315,24 @@ class PerformTab(QWidget):
         print("analyzing... ")
         rec.reset_analysis()  # clear stale notes/alignment/mistakes before recomputing
 
-        # detect notes (at the best ND frame size), stretch the score to match
-        # the take's length (also rescales p.distances), then string-edit align
+        # Detect notes at the best ND frame size, stretch the score to match the
+        # take, then build the final alignment against those resized score notes.
+        # Alignment stores score Note objects directly; if we align before the
+        # resize, overlays keep pointing at the old note timings.
         rec.note_detector.find_best_w2()
         rec.detect_notes()
         # re-median note pitches over non-transition frames
         rec.detect_transitions()
         rec.recompute_note_pitches()
         rec.prune_transition_notes()
-        rec.detect_mistakes()
-        rec.mistake_checker.mistake_correction_loop()
-        rec.update_alignment_distances() # color the user pitches by the final alignment
 
         # resize the score data to the new length
         length = rec.get_length(raw=False)
         rec.resize(new_length=length)
+
+        rec.detect_mistakes()
+        rec.mistake_checker.mistake_correction_loop()
+        rec.update_alignment_distances() # color the user pitches by the final alignment
 
         # reload every view with the fresh analysis (note/alignment may have been
         # overwritten by the correction loop)

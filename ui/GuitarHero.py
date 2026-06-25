@@ -450,6 +450,70 @@ class GuitarHero(QWidget):
         Single source of truth: ScoreData.clip_bounds()."""
         return self.score_data.clip_bounds() if self.score_data else None
 
+    def _active_score_notes_by_id(self) -> dict[int, object]:
+        """Current score notes for the active instrument, keyed by stable note id."""
+        if self.score_data is None:
+            return {}
+        note_data = self.score_data.note_datas.get(self.score_data.active_instrument)
+        if note_data is None:
+            return {}
+        notes_by_id = {}
+        for note in note_data.data.values():
+            note_id = getattr(note, "id", None)
+            if note_id is not None:
+                notes_by_id[note_id] = note
+        return notes_by_id
+
+    @staticmethod
+    def _resolve_score_note(note, score_notes_by_id: dict[int, object]):
+        """Return this score note's current-timing counterpart when available."""
+        if note is None:
+            return None
+        note_id = getattr(note, "id", None)
+        if note_id is None:
+            return note
+        return score_notes_by_id.get(note_id, note)
+
+    def _sync_alignment_score_notes(self):
+        """Refresh score-side alignment refs after score timing is rebuilt.
+
+        ScoreData.change_tempo()/resize() rebuilds NoteData with new Note
+        objects. Alignment stores the old objects, so relink by stable note id
+        before using alignment times for filtering, match lines, deletions, or
+        mistake highlights.
+        """
+        if self.alignment is None or self.score_data is None:
+            return
+        score_notes_by_id = self._active_score_notes_by_id()
+        if not score_notes_by_id:
+            return
+
+        changed = False
+        replacements = {}
+        pairs = []
+        for user_note, score_note in self.alignment.pairs:
+            current_score_note = self._resolve_score_note(score_note, score_notes_by_id)
+            if current_score_note is not score_note:
+                changed = True
+                if score_note is not None:
+                    replacements[id(score_note)] = current_score_note
+            pairs.append((user_note, current_score_note))
+
+        if not changed:
+            return
+
+        self.alignment.pairs = pairs
+        for mistake in self.alignment.mistakes:
+            midi_note = getattr(mistake, "midi_note", None)
+            if midi_note is None:
+                continue
+            current_midi_note = replacements.get(id(midi_note))
+            if current_midi_note is None:
+                current_midi_note = self._resolve_score_note(midi_note, score_notes_by_id)
+            if current_midi_note is not midi_note:
+                mistake.midi_note = current_midi_note
+        self.alignment.init_2(pairs)
+
     def update_clip_overlay(self):
         """Darken the area OUTSIDE the clip: two dim bands left of b0 / right of b1
         (hidden when unclipped). Only re-positions the bands when the clip window
@@ -633,6 +697,7 @@ class GuitarHero(QWidget):
             self.midi_notes_del.setOpts(x=[], width=[], y0=[], height=[])
             self.match_lines.setData(x=[], y=[])
             return
+        self._sync_alignment_score_notes()
         
         # --- CORRECTIONS OVERLAY ---
         # retrieve all alignment related components for the xrange
@@ -696,6 +761,7 @@ class GuitarHero(QWidget):
 
     def highlight_mistake(self, mistake):
         """Pan to and highlight the note(s) involved in a mistake."""
+        self._sync_alignment_score_notes()
         if not mistake.user_note and not mistake.midi_note:
             return
         
