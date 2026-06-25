@@ -152,6 +152,21 @@ class PerformTab(QWidget):
         if self.mistake_widget is not None:
             self.mistake_widget.clear()
 
+    def _clear_analysis(self):
+        """Clear stale analysis (notes/alignment/mistakes/overrides) and refresh
+        the views, but KEEP the recording's audio + pitch data. Used before a
+        re-detection: unlike cleanup() (which calls Recording.cleanup() and so
+        wipes audio_data back to a 60s zero buffer), this preserves the take we
+        just loaded so detection actually runs on the real waveform."""
+        self.stop_recording()
+        self.stop_playback()
+        rec = self.recording
+        if rec is not None:
+            rec.reset_analysis()
+            self.guitar_hero.load_user(rec)
+        if self.mistake_widget is not None:
+            self.mistake_widget.clear()
+
     def set_active_instrument(self, channel: int):
         """Make `channel` the active instrument: wipe analysis-derived data, re-init
         the algorithms from the (unchanged) Config, and re-render the views."""
@@ -185,7 +200,7 @@ class PerformTab(QWidget):
         rec = self.recording
         if rec is None or rec.audio_data.end_index <= 0:
             return
-        self.cleanup()
+        self._clear_analysis()  # clear stale analysis but KEEP the loaded audio
         self._wire_detector(rec)  # just in case
         rec.pitch_detector.detect_pitches_async()
 
