@@ -24,6 +24,19 @@ g.note.playing {
   fill: rgb(6, 114, 197);
 }
 
+/* --- CLIP SELECTION --- */
+/* measures are always clickable to pick a clip start/end */
+g.measure { cursor: pointer; }
+
+/* the in-progress pick: a translucent box spanning the STAFF height (the
+   per-measure clip-highlight rect, sized to the staff lines), behind the notes
+   so the measure reads as selected without recoloring the noteheads. */
+g.measure.selected rect.clip-highlight { fill: rgba(6, 114, 197, 0.20); }
+
+/* once clipped, measures OUTSIDE the focus range dim (the full score stays
+   laid out — clipping never re-renders, it just greys the context). */
+g.measure.clipped-out { opacity: 0.28; }
+
 /* Mirror qdarktheme's dark scrollbars (the rest of the app uses Qt's
    styled scrollbars; this web view renders its own Chromium ones). */
 ::-webkit-scrollbar {

@@ -5,9 +5,9 @@ from pathlib import Path
 
 import numpy as np
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QSplitter, QStackedLayout
+    QWidget, QVBoxLayout, QSplitter
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.midi.MidiPlayer import MidiPlayer
@@ -19,24 +19,9 @@ from ui.ScoreViewer import ScoreViewer
 from ui.GuitarHero import GuitarHero
 
 
-class PracticePanel(QWidget):
-    """
-    Embeddable practice-mode panel — the "Practice" tab of the main window's
-    center splitter (see ``Attune.init_ui``). It is a plain ``QWidget`` holding
-    only the *views* (a ScoreViewer over a GuitarHero); the play / record /
-    slider / status-bar transport at the bottom of the window is **shared** with
-    the "Perform" tab and handed to this panel via :meth:`attach_transport`. The
-    host app (``Attune``) routes the transport's button clicks and the shared
-    clock/slider ticks to this panel's methods whenever the Practice tab is
-    active, and re-syncs the slider's range/position on every tab switch.
+class PracticeTab(QWidget):
 
-    The panel keeps its *own* Recording (so live practice never clobbers the
-    analyzed take in the Perform tab) but *shares* the main app's ScoreData, so
-    instrument / tempo changes made in the side panels show up here automatically.
-    The app pushes side-panel changes in via the public setters below
-    (``set_active_instrument`` / ``set_range`` / ``set_tuning`` /
-    ``set_tolerance`` / ``on_tempo_changed``) and a fresh score via ``load_score``.
-    """
+    clip_changed = pyqtSignal(object)  # (i0,i1) note-index clip or None; host mirrors it onto the other tab
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,13 +44,14 @@ class PracticePanel(QWidget):
         self._RENDER_INTERVAL = 1.0 / 30.0
         self._last_render = 0.0
 
-        # score viewer renders only the active instrument's part (matches the
-        # main app default); never the full score in practice mode.
+        # score viewer: render only the active instrument's part (default) or the
+        # full score. The host (app.py) owns the toggle and pushes it in via
+        # set_show_full; this is the panel's render-time cache of it.
         self.viewer_show_full = False
 
         self.audio_recorder = AudioRecorder(self.recording)
 
-        # shared transport, injected by the host via attach_transport()
+        # shared transport, injected by the host via attach_timekeeping()
         self.wall_clock = None
         self.slider = None
         self.status_bar = None
@@ -82,16 +68,9 @@ class PracticePanel(QWidget):
 
         ABSOLUTE_PROJECT_ROOT = Path(__file__).resolve().parent
 
-        # score viewer requires a loading screen until Verovio's JS is ready
-        self.score_viewer_container = QWidget()
-        stack = QStackedLayout(self.score_viewer_container)
+        # the score viewer owns its own "Loading..." placeholder until Verovio's
+        # JS API is ready (see ScoreViewer).
         self.score_viewer = ScoreViewer(project_root=ABSOLUTE_PROJECT_ROOT)
-        loading = QLabel("Loading...")
-        loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        stack.addWidget(loading)
-        stack.addWidget(self.score_viewer)
-        stack.setCurrentWidget(loading)  # show loading screen until viewer is ready
-        self.score_viewer.load_finished.connect(lambda ok: stack.setCurrentIndex(1) if ok else 0)
 
         self.guitar_hero = GuitarHero(self.recording)
         self.guitar_hero.load_score(self.score_data)
@@ -99,7 +78,7 @@ class PracticePanel(QWidget):
         # score viewer stacked ON TOP of the guitar hero, in a vertical splitter
         # so both are adjustable in height (mirrors the main app's center column).
         self.center_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.center_splitter.addWidget(self.score_viewer_container)
+        self.center_splitter.addWidget(self.score_viewer)
         self.center_splitter.addWidget(self.guitar_hero)
         self.center_splitter.setStretchFactor(0, 1)  # score viewer grows
         self.center_splitter.setStretchFactor(1, 1)  # guitar hero grows
@@ -107,10 +86,10 @@ class PracticePanel(QWidget):
         self._layout.addWidget(self.center_splitter)
 
     def init_signals(self):
-        self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
+        self.score_viewer.load_finished.connect(self.refresh_score_viewer)
         self.recording.pitch_detector.pitch_detected.connect(self.pitch_detected)
 
-    def attach_transport(self, wall_clock, slider, status_bar, midi_synth):
+    def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth):
         """Inject the shared transport components (owned by the host app). The
         panel drives these directly during practice playback/recording; the host
         routes the matching button clicks / clock+slider ticks back to us.
@@ -125,7 +104,32 @@ class PracticePanel(QWidget):
         # times, not the clock): keep the shared slider following it.
         self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
 
-    # --- PUBLIC API (driven by app.py when the side panels change) ---
+    def load_score(self, filepath):
+        """Load a score from `filepath` into practice mode. Practice parses its
+        OWN ScoreData copy (rather than sharing the app's) so Perform's resize /
+        tempo edits never mutate the MIDI shown here; the app keeps the active
+        instrument in sync via set_active_instrument. The slider range is re-synced
+        by the host."""
+        self.score_data = ScoreData()
+        self.score_data.load(filepath)
+        # match the app's default: first real (non-metronome) instrument channel
+        self.score_data.active_instrument = next(
+            (ch for ch in self.score_data.instruments
+             if ch != self.score_data.metronome_channel),
+            0,
+        )
+        self.recording = Recording(score_data=self.score_data)
+        if self.midi_player is not None:
+            self.midi_player.load_score(self.score_data)
+        self.guitar_hero.load_score(self.score_data)
+        self.guitar_hero.load_user(self.recording)
+        self.audio_recorder.load_recording(self.recording)
+        self.recording.pitch_detector.pitch_detected.connect(self.pitch_detected)
+        # render the score into the viewer (no-op if its JS API isn't ready yet;
+        # on_score_viewer_loaded re-renders once it is).
+        self.refresh_score_viewer()
+
+    # --- SETTINGS-RELATED ---
     def set_active_instrument(self, channel: int):
         """Mirror an instrument change made in the main app. ScoreData is shared,
         so its `active_instrument` is already set by the time we're called; we
@@ -136,13 +140,12 @@ class PracticePanel(QWidget):
         self.refresh_score_viewer()
         self.guitar_hero.update_view_items()
 
-    def set_range(self, low_midi: int, high_midi: int):
-        """Mirror a frequency-range change: set our Recording's Config fmin/fmax
-        from the chosen note bounds so the next live take detects in that range.
-        (No offline re-detection — practice detects pitches live.)"""
+    def set_freq_range(self, fmin: float, fmax: float):
+        """Update config with new fmin/fmax. Triggered when user updates range and
+        this tab is open"""
         config = self.recording.config
-        config.fmin = config.midi_to_freq(low_midi)
-        config.fmax = config.midi_to_freq(high_midi)
+        config.fmin = fmin
+        config.fmax = fmax
         self.recording.update_config(config)
 
     def set_tuning(self, tuning: float):
@@ -156,15 +159,15 @@ class PracticePanel(QWidget):
         pitch is close enough to let the playhead advance."""
         self.recording.config.tolerance = tolerance
         self.recording.update_config(self.recording.config)
-        # the GuitarHero's green band / red ramp track this recording's tolerance
+        # the guitarHero's green band / red ramp track this recording's tolerance
         self.guitar_hero.load_user(self.recording)
 
-    def on_tempo_changed(self):
-        """Mirror a tempo change. ScoreData is shared, so change_tempo already ran
-        on it in the main app; we just refresh our views to the new tempo (the
-        shared slider's range is re-synced by the host — for the active tab — in
-        Attune.on_tempo_changed / on_center_tab_changed)."""
-        self.guitar_hero.update_view_items()
+    def set_show_full(self, show_full: bool):
+        """Host-driven (app.py owns the toggle): show the full score (True) or just
+        the active instrument's part (False), then re-render the viewer. Mirrors
+        the Perform tab so the full-score view stays consistent across both."""
+        self.viewer_show_full = show_full
+        self.refresh_score_viewer()
 
     # --- PLAYBACK / RECORDING (called by the host when this tab is active) ---
     def toggle_playback(self) -> bool:
@@ -177,6 +180,7 @@ class PracticePanel(QWidget):
         return self.is_playing
 
     def start_playback(self):
+        self.slider.sync_clip_window(self.score_data)  # clipped -> begin at b0
         t = self.slider.get_time()
         self.is_playing = True
         self.wall_clock.start(t)
@@ -192,19 +196,15 @@ class PracticePanel(QWidget):
         self.status_bar.update_status("")
 
     def start_recording(self):
-        """Begin a pitch-driven take. The host calls this after the shared
-        count-in finishes.
-
-        Recording is NOT driven by the wall clock — the slider/cursor follow the
-        PitchDetector's emitted pitch times instead (see pitch_detected), which
-        only advance on a correct pitch. So we pause the wall clock here (a tick
-        would otherwise jump the slider before any pitch is validated) and let
-        the buffer start unblocked at the slider's current time.
+        """Begin a practice run. 
+        Advances forward only when user's pitch matches the score.
         """
         self.midi_player.stop()           # stop things we don't want
         self.wall_clock.pause()           # the clock must NOT advance the slider
         self.recording.pitch_detector.block = False
-        # seed the pitch-driven playhead at the current slider position
+        # seed the pitch-driven playhead at the current slider position (a clipped
+        # take begins at the clip start, bounds[0])
+        self.slider.sync_clip_window(self.score_data)
         t = self.slider.get_time()
         self.practice_time = t
         self._last_render = 0.0
@@ -227,10 +227,14 @@ class PracticePanel(QWidget):
         self.score_viewer.set_playback_time(self._score_viewer_time(t))
         self.guitar_hero.move_plot(t)
 
+    def render_at(self, t: float):
+        """Public alias used by the host (e.g. on tab switch) to line this tab's
+        views up with a given time."""
+        self._move_views(t)
+
     def on_clock_tick(self, t: float):
-        """Shared wall-clock tick. Only drives the views during plain PLAYBACK —
-        while recording the wall clock is paused and the views follow the emitted
-        pitch times instead (see pitch_detected)."""
+        """Called whenever the WallClock ticks forward.
+        Only triggers move during playback; recording driven by PitchDetector"""
         if not self.is_playing:
             return
         self._move_views(t)
@@ -249,12 +253,6 @@ class PracticePanel(QWidget):
         self.stop_recording()
         self.stop_playback()
 
-    def render_at(self, t: float):
-        """Render this tab's views at time `t`. Used by the host when the
-        Practice tab becomes active, to line the cursor up with the shared
-        slider's current (possibly re-ranged) position."""
-        self._move_views(t)
-
     def pitch_detected(self, t: float):
         """Master driver while recording. `t` is the time of the just-emitted
         pitch frame; because the audio->pitch buffer only advances its read time
@@ -271,7 +269,16 @@ class PracticePanel(QWidget):
         self.recording.pitch_detector.block = not self._pitch_matches(t)
         # `t` is the time of the last emitted pitch -> drive the whole UI from it
         self.practice_time = t
-        self._render_practice(t)
+        # Throttled repaint: the detector emits hundreds of frames/sec; repainting
+        # (and calling the Verovio JS cursor) on every one would swamp the UI, so cap
+        # redraws to ~30 fps. `t` itself is always current — only the redraw is
+        # throttled. The shared time label follows along: move_plot emits plot_moved ->
+        # the slider updates, whose slider_changed the host uses to refresh the label.
+        now = time.monotonic()
+        if now - self._last_render < self._RENDER_INTERVAL:
+            return
+        self._last_render = now
+        self._move_views(t)
 
     def _pitch_matches(self, t: float) -> bool:
         """Whether the detected pitch at time `t` should let the playhead advance.
@@ -309,19 +316,6 @@ class PracticePanel(QWidget):
         self.status_bar.update_status(f"{state}! Detected note: {u:.1f}, Target note: {m:.1f}")
         return on_pitch
 
-    def _render_practice(self, t: float):
-        """Throttled repaint of the practice playhead at time `t`. The detector
-        emits hundreds of frames/sec; repainting (and calling the Verovio JS
-        cursor) on every one would swamp the UI, so cap redraws to ~30 fps. `t`
-        itself is always current — only the redraw is throttled. The shared time
-        label follows along: move_plot emits plot_moved -> the slider updates,
-        whose slider_changed the host uses to refresh the label."""
-        now = time.monotonic()
-        if now - self._last_render < self._RENDER_INTERVAL:
-            return
-        self._last_render = now
-        self._move_views(t)
-
     # --- SCORE VIEWER ---
     def _score_viewer_time(self, t: float) -> float:
         """Map a wall-clock time `t` (current tempo) back into the *original*
@@ -332,40 +326,90 @@ class PracticePanel(QWidget):
             return t
         return t * self.score_data.bpm / bpm_og
 
-    def refresh_score_viewer(self):
-        """(Re)render the score viewer to match the active instrument's part.
-        The single expensive Verovio layout step — never called per tick."""
+    def refresh_score_viewer(self, *_):
+        """Re-render the score viewer to match the active instrument's part.
+        Rk: Accepts ignored signal args so load_finished(bool) can connect directly.
+        """
         if self.score_data is None or self.score_data.score is None:
             return
         channel = None if self.viewer_show_full else self.score_data.active_instrument
         self.score_viewer.load_score(self.score_data, channel=channel)
+        # re-assert the clip grey-out so it survives the re-layout (and clears
+        # itself when the score isn't clipped, e.g. on a freshly loaded score).
+        self._refresh_clip_focus()
 
     def on_score_viewer_loaded(self, ok: bool = True):
         """Practice score viewer finished loading its JS API; render whatever
         score is currently loaded (no-op if none yet)."""
         self.refresh_score_viewer()
 
-    def load_score(self, filepath):
-        """Load a score from `filepath` into practice mode. Practice parses its
-        OWN ScoreData copy (rather than sharing the app's) so Perform's resize /
-        tempo edits never mutate the MIDI shown here; the app keeps the active
-        instrument in sync via set_active_instrument. The slider range is re-synced
-        by the host."""
-        self.score_data = ScoreData()
-        self.score_data.load(filepath)
-        # match the app's default: first real (non-metronome) instrument channel
-        self.score_data.active_instrument = next(
-            (ch for ch in self.score_data.instruments
-             if ch != self.score_data.metronome_channel),
-            0,
-        )
-        self.recording = Recording(score_data=self.score_data)
-        if self.midi_player is not None:
-            self.midi_player.load_score(self.score_data)
-        self.guitar_hero.load_score(self.score_data)
-        self.guitar_hero.load_user(self.recording)
-        self.audio_recorder.load_recording(self.recording)
-        self.recording.pitch_detector.pitch_detected.connect(self.pitch_detected)
-        # render the score into the viewer (no-op if its JS API isn't ready yet;
-        # on_score_viewer_loaded re-renders once it is).
-        self.refresh_score_viewer()
+    def cleanup(self):
+        """Clean-up any moving parts + clear audio and pitch data. 
+        Called before load_score."""
+        self.stop_recording()
+        self.stop_playback()
+        self.practice_time = 0.0
+        self._last_render = 0.0
+        self.recording.cleanup() # get rid of any stale pitch/audio data
+
+    # --- CLIP (measure-range focus; stored on ScoreData as note indices) ---
+    def apply_clip(self):
+        """Clip menu 'Clip': clip to the measures selected in the score viewer."""
+        self.score_viewer.get_clip_selection(self._on_clip_selection)
+
+    def _on_clip_selection(self, sel: dict | None):
+        """Turn a pulled measure selection into a note-index clip (viewer/original-
+        tempo seconds -> app time -> note indices)."""
+        if not sel:
+            return  # nothing selected -> leave the current clip as-is
+        bpm = self.score_data.bpm
+        bpm_og = self.score_data.bpm_og or bpm
+        factor = (bpm_og / bpm) if bpm else 1.0
+        b0 = max(0.0, sel["startSec"] * factor)
+        b1 = sel["endSec"] * factor
+        clip = self.score_data.note_index_range(b0, b1)
+        if clip is None:
+            return
+        self.set_clip(clip, seek=True)
+        self.clip_changed.emit(clip)  # mirror onto the other tab (global clip)
+
+    def reset_clip(self):
+        """Clip menu 'Reset': drop the clip (mirrored onto the other tab)."""
+        self.set_clip(None)
+        self.clip_changed.emit(None)
+
+    def set_clip(self, clip, seek: bool = False):
+        """Apply `clip` ((i0, i1) note indices, or None) to THIS tab's score and
+        refresh its slider window / grey-out / views. Used both to clip/reset here
+        and by the host to mirror the clip onto the inactive tab."""
+        if clip is None:
+            self.score_data.clear_clip()
+        else:
+            self.score_data.set_clip(*clip)
+        self.score_viewer.clear_clip_selection()
+        self.slider.update_range(score_data=self.score_data, recording=self.recording)
+        if seek:
+            b = self.score_data.clip_bounds()
+            if b is not None:
+                self.slider.set_time(b[0])
+        self._refresh_clip_focus()
+        self._move_views(self.slider.get_time())
+
+    def sync_clip(self, clip):
+        """Mirror a clip made in the OTHER tab onto this score (the clip is global).
+        Updates this tab's grey-out + guitar-hero but NOT the shared slider."""
+        if clip is None:
+            self.score_data.clear_clip()
+        else:
+            self.score_data.set_clip(*clip)
+        self._refresh_clip_focus()
+        self.guitar_hero.update_view_items()
+
+    def _refresh_clip_focus(self):
+        """(Re)assert (or clear) the score-viewer grey-out from the clip window."""
+        b = self.score_data.clip_bounds()
+        if b is not None:
+            self.score_viewer.set_clip_range(
+                self._score_viewer_time(b[0]), self._score_viewer_time(b[1]))
+        else:
+            self.score_viewer.clear_clip_range()

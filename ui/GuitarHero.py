@@ -202,6 +202,7 @@ class GuitarHero(QWidget):
         """Define all colors used in the plot."""
         self.colors = {
             'midi': pg.mkBrush(255, 255, 255, 200), # white
+            'midi_dim': pg.mkBrush(120, 120, 120, 150), # score notes OUTSIDE the clip
             'user_note': pg.mkBrush(55, 155, 144, 150),
             'user_pitch': pg.mkBrush(41, 177, 240, 255), 
             'timeline': pg.mkPen(0, 255, 0, 255), # green
@@ -316,6 +317,28 @@ class GuitarHero(QWidget):
         self.GRIDLINE_Z = 0  # above the MIDI background (-1), below the notes (1)
         self.gridlines: list[pg.InfiniteLine] = []
 
+        # --- clip dimming ---
+        # When the score is clipped, the regions OUTSIDE [b0, b1] are darkened: two
+        # translucent black bands (left of b0, right of b1) drawn above the
+        # background/gridlines but below the notes (so score notes keep their own
+        # dimmed-grey brush — see update_midi_items). Hidden when not clipped.
+        self.dim_brush = pg.mkBrush(0, 0, 0, 110)
+        self._last_dim_bounds = None  # cache so the bands only re-position on change
+        self.dim_left = pg.LinearRegionItem(
+            values=(0, 0), orientation='vertical', brush=self.dim_brush,
+            pen=pg.mkPen(None), hoverBrush=self.dim_brush, hoverPen=pg.mkPen(None),
+            movable=False,
+        )
+        self.dim_right = pg.LinearRegionItem(
+            values=(0, 0), orientation='vertical', brush=self.dim_brush,
+            pen=pg.mkPen(None), hoverBrush=self.dim_brush, hoverPen=pg.mkPen(None),
+            movable=False,
+        )
+        for region in (self.dim_left, self.dim_right):
+            region.setZValue(0.5)  # over bg/gridlines, under notes (z>=1)
+            region.hide()
+            self.plot.addItem(region, ignoreBounds=True)  # never affect autorange
+
     def init_view(self):
         """initialize the viewbox settings"""
         vb = self.plot.getViewBox()
@@ -420,6 +443,32 @@ class GuitarHero(QWidget):
         self.update_user_items(x_range)
         self.update_midi_items(x_range)
         self.update_alignment_items(x_range)
+        self.update_clip_overlay()
+
+    def _clip_bounds(self) -> tuple[float, float] | None:
+        """The clip's [b0, b1] window (derived from note indices), or None.
+        Single source of truth: ScoreData.clip_bounds()."""
+        return self.score_data.clip_bounds() if self.score_data else None
+
+    def update_clip_overlay(self):
+        """Darken the area OUTSIDE the clip: two dim bands left of b0 / right of b1
+        (hidden when unclipped). Only re-positions the bands when the clip window
+        actually CHANGES — otherwise pyqtgraph just transforms the existing static
+        bands as the view scrolls, which avoids the per-tick setRegion flicker."""
+        clip = self._clip_bounds()
+        if clip == self._last_dim_bounds:
+            return
+        self._last_dim_bounds = clip
+        if clip is None:
+            self.dim_left.hide()
+            self.dim_right.hide()
+            return
+        b0, b1 = clip
+        BIG = 1e6  # well past any view; small enough to avoid transform precision jitter
+        self.dim_left.setRegion((-BIG, b0))
+        self.dim_right.setRegion((b1, BIG))
+        self.dim_left.show()
+        self.dim_right.show()
 
 
     def update_user_items(self, x_range: tuple[float, float]):
@@ -519,8 +568,22 @@ class GuitarHero(QWidget):
         width = (ends - starts)
         y0 = (midis - 0.5*self.NOTE_HEIGHT)
         height = np.full_like(midis, self.NOTE_HEIGHT)
-        
-        self.midi_notes.setOpts(x=x, width=width, y0=y0, height=height)
+
+        # when clipped, score notes OUTSIDE the clip are drawn dimmer grey so the
+        # focus stays on the clipped span. A note is "in the clip" iff its START is
+        # in [b0, b1) — exactly the notes the alignment uses (no neighbour bleed).
+        # (brushes=None => every bar uses the default white brush.)
+        clip = self._clip_bounds()
+        brushes = None
+        if clip is not None:
+            b0, b1 = clip
+            brushes = [
+                self.colors['midi'] if (b0 - 1e-6 <= n.start_time < b1 - 1e-6)
+                else self.colors['midi_dim']
+                for n in midi_notes
+            ]
+        self.midi_notes.setOpts(x=x, width=width, y0=y0, height=height,
+                                brush=self.colors['midi'], brushes=brushes)
 
     def _get_gridline(self, idx: int) -> pg.InfiniteLine:
         """Return the idx-th pooled gridline, lazily creating (and adding) it."""

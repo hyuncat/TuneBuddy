@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
 
 from ui.info.MistakeWidget import _svg_icon
 
-class TolerancePanel(QWidget):
+class ToleranceWidget(QWidget):
     """
     Small panel beneath the MistakeWidget for tuning the string-edit
     `tolerance` — the semitone slack within which a played note still counts as

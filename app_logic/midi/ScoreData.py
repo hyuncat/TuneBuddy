@@ -18,10 +18,7 @@ class ScoreData:
         # score metadata
         self.length = 0.0 # sec
         self.bpm, self.bpm_og = 120, 120
-        # the score's display title (source of truth lives in the RecordingTree;
-        # defaults to the loaded file's stem). Always stamped onto the metadata
-        # so Verovio renders it — see to_musicxml_bytes / _stamp_title.
-        self.title: str = ""
+        self.title: str = "" # display title written to verovio
 
         # instrument selection
         self.instruments: dict[int, int] = {} # {channel: program_number}
@@ -30,8 +27,15 @@ class ScoreData:
         self.playing_instruments: set[int] = set() # channels to play
         self.metronome_channel: int = None
         # self.metronome_on: bool = True
-        # clipping
-        self.bounds: tuple[float, float] = (0.0, 0.0) # (start_time, end_time)
+        # --- CLIPPING (non-destructive measure-range focus) ---
+        # The clip is stored as a (first, last) pair of NOTE INDICES into the
+        # active instrument's NoteData — NOT as times. Indices are stable across
+        # tempo changes / resize (which rebuild the NoteData but preserve count +
+        # order) and are tab-independent (both tabs parse the same file), so the
+        # same clip is shared globally and never goes stale. None = no clip.
+        # Everything else (the [b0, b1] time window, the clipped notes) is DERIVED
+        # from this via clip_bounds() / clipped_note_data(). See those + is_clipped.
+        self.clip: tuple[int, int] | None = None
 
         # metronome beat grid: (time_sec, is_downbeat) tuples, also drives the
         # GuitarHero vertical gridlines. `beats_og` is the baseline at the
@@ -71,7 +75,68 @@ class ScoreData:
         if self.i < len(note_data.times):
             return note_data.read_note(i=self.i)
         return None
-        
+
+    # --- CLIPPING API (the single source of truth; see self.clip) ---
+    def is_clipped(self) -> bool:
+        return self.clip is not None
+
+    def set_clip(self, i0: int, i1: int) -> None:
+        """Clip to the active instrument's notes [i0, i1] (inclusive indices)."""
+        if i1 < i0:
+            i0, i1 = i1, i0
+        self.clip = (i0, i1)
+
+    def clear_clip(self) -> None:
+        self.clip = None
+
+    def note_index_range(self, t0: float, t1: float, channel: int | None = None
+                         ) -> tuple[int, int] | None:
+        """Indices of the active instrument's notes whose START falls in the
+        half-open span [t0, t1) — i.e. ONLY notes inside the selected measures
+        (a note exactly at t1, the next measure's first note, is excluded; a note
+        ending at t0 is excluded since its start is < t0). None if none match."""
+        channel = self.active_instrument if channel is None else channel
+        nd = self.note_datas.get(channel)
+        if not nd or not nd.times:
+            return None
+        eps = 1e-6
+        idxs = [i for i, t in enumerate(nd.times) if t0 - eps <= t < t1 - eps]
+        if not idxs:
+            return None
+        return (idxs[0], idxs[-1])
+
+    def clip_bounds(self, channel: int | None = None) -> tuple[float, float] | None:
+        """The clip's [start, end] time window in CURRENT app-time, DERIVED from
+        the live note positions (so it auto-tracks tempo/resize). None = no clip.
+        Used by the slider window, GuitarHero dimming, and the Verovio grey-out."""
+        if self.clip is None:
+            return None
+        channel = self.active_instrument if channel is None else channel
+        nd = self.note_datas.get(channel)
+        if not nd or not nd.times:
+            return None
+        i0, i1 = self.clip
+        if not (0 <= i0 <= i1 < len(nd.times)):
+            return None
+        return (nd.read_note(i=i0).start_time, nd.read_note(i=i1).end_time)
+
+    def clipped_note_data(self, channel: int | None = None) -> NoteData:
+        """The active instrument's notes WITHIN the clip (exactly indices i0..i1),
+        or the full NoteData when unclipped. This is what the StringEditor /
+        MistakeChecker / alignment consume so they only ever see the clip."""
+        channel = self.active_instrument if channel is None else channel
+        nd = self.note_datas[channel]
+        if self.clip is None:
+            return nd
+        i0, i1 = self.clip
+        if not (0 <= i0 <= i1 < len(nd.times)):
+            return nd
+        sub = NoteData()
+        notes = nd.read(i=i0, j=i1 + 1)  # inclusive of i1
+        sub.data = {n.start_time: n for n in notes}
+        sub.times = sorted(sub.data.keys())
+        return sub
+
     def load(self, filepath: str|Path):
         """Load a score file, either MIDI or MusicXML. Converts either 
         into the other such that we have both representations available.
@@ -103,7 +168,7 @@ class ScoreData:
         # can be mapped back into the original timeframe (and so change_tempo /
         # resize compute their factors against the true original tempo).
         self.bpm_og = self.bpm
-        self.bounds = (0.0, self.length)
+        self.clip = None  # a freshly loaded score is unclipped
 
         # initialize metronome beats from the score; keep an untransformed
         # baseline so tempo/resize changes can rebuild the live grid (and the
@@ -118,10 +183,20 @@ class ScoreData:
         self.instruments = self.midi_data.instruments
 
         # reset other shit
-        self.active_instrument = 0
         self.displayed_instruments = set(self.instruments.keys())
         self.playing_instruments = set(self.instruments.keys())
         self.metronome_channel = len(self.instruments.keys()) - 1 # last channel
+        self.active_instrument = self.get_default_instrument()
+
+    def get_default_instrument(self) -> int:
+        """Called at the beginning to set a default first instrument (non-metronome)"""
+        # default to the first real (non-metronome) instrument channel
+        first_ch = next(
+            (ch for ch in self.instruments
+             if ch != self.metronome_channel),
+            0,
+        )
+        return first_ch
 
     def to_musicxml_bytes(self, channel: int | None = None) -> bytes:
         """Export the current score to MusicXML bytes for Verovio.
@@ -166,70 +241,6 @@ class ScoreData:
 
         self._pin_tempo(source, self.bpm_og)
         return self._strip_engraving_credits(self._write_musicxml(source))
-
-    def set_title(self, title: str):
-        """Update the score's display title (the RecordingTree is the source of
-        truth and calls this on rename). The next render stamps it onto the
-        metadata so Verovio shows it; callers re-render the score viewer."""
-        self.title = title
-
-    @staticmethod
-    def _stamp_title(source, title: str):
-        """Force `source`'s metadata title to `title` so Verovio renders it as
-        the score title. music21 writes both <work-title> and <movement-title>;
-        we set both to the same value for a single, consistent heading."""
-        if not title:
-            return
-        from music21 import metadata
-        if source.metadata is None:
-            source.insert(0, metadata.Metadata())
-        source.metadata.title = title
-        source.metadata.movementName = title
-
-    @staticmethod
-    def _strip_engraving_credits(xml: bytes) -> bytes:
-        """Drop the absolutely-positioned <credit> blocks MuseScore exports (laid
-        out for a full page, they'd be Verovio's page header but get clipped by
-        our single-system page trimming) plus the placeholder composer creator.
-        With those gone, Verovio generates a clean header from the encoded
-        work/movement title — i.e. it always renders the filename."""
-        import re
-        text = xml.decode("utf-8")
-        text = re.sub(r"<credit\b[^>]*>.*?</credit>", "", text, flags=re.DOTALL)
-        text = re.sub(r'<creator type="composer">.*?</creator>', "", text, flags=re.DOTALL)
-        return text.encode("utf-8")
-
-    def _part_for_channel(self, channel: int):
-        """Resolve a MIDI instrument channel to its music21 Part, or None if it
-        can't be resolved (caller falls back to the full score).
-
-        Maps by position among the real (non-metronome) channels, which matches
-        the order music21 writes parts out to MIDI. This is the same channel-
-        ordering assumption the rest of the app already relies on.
-        """
-        if self.score is None:
-            return None
-        real_channels = [ch for ch in self.instruments if ch != self.metronome_channel]
-        if channel not in real_channels:
-            return None
-        idx = real_channels.index(channel)
-        parts = list(self.score.parts)
-        if 0 <= idx < len(parts):
-            return parts[idx]
-        return None
-
-    @staticmethod
-    def _pin_tempo(source, bpm: float):
-        """Force `source`'s tempo to `bpm` (flattening to a single mark) so its
-        Verovio timemap matches the original-tempo timeframe."""
-        marks = list(source.recurse().getElementsByClass(tempo.MetronomeMark))
-        if marks:
-            for m in marks:
-                m.number = bpm
-        else:
-            parts = list(source.parts) if hasattr(source, "parts") else []
-            target = parts[0] if parts else source
-            target.insert(0, tempo.MetronomeMark(number=bpm))
 
     @staticmethod
     def _write_musicxml(stream_obj) -> bytes:
@@ -414,3 +425,63 @@ class ScoreData:
         # aligned with the transposed notes (idempotent: rebuilt from baseline).
         self._beat_offset = offset_sec
         self._rebuild_beats()
+
+    
+    # --- score METADATA MANAGEMENT ---
+    def set_title(self, title: str):
+        """Update display title -> included in next render's metadata."""
+        self.title = title
+
+    @staticmethod
+    def _stamp_title(source, title: str):
+        """Force `source`'s metadata title to `title` so Verovio renders it as
+        the score title. music21 writes both <work-title> and <movement-title>;
+        we set both to the same value for a single, consistent heading."""
+        if not title:
+            return
+        from music21 import metadata
+        if source.metadata is None:
+            source.insert(0, metadata.Metadata())
+        source.metadata.title = title
+        source.metadata.movementName = title
+
+    @staticmethod
+    def _strip_engraving_credits(xml: bytes) -> bytes:
+        """Drop the absolutely-positioned <credit> blocks MuseScore exports (laid
+        out for a full page, they'd be Verovio's page header but get clipped by
+        our single-system page trimming) plus the placeholder composer creator.
+        With those gone, Verovio generates a clean header from the encoded
+        work/movement title — i.e. it always renders the filename."""
+        import re
+        text = xml.decode("utf-8")
+        text = re.sub(r"<credit\b[^>]*>.*?</credit>", "", text, flags=re.DOTALL)
+        text = re.sub(r'<creator type="composer">.*?</creator>', "", text, flags=re.DOTALL)
+        return text.encode("utf-8")
+
+    def _part_for_channel(self, channel: int):
+        """Resolve a MIDI instrument channel to its music21 Part, or None if it
+        can't be resolved (caller falls back to the full score).
+        """
+        if self.score is None:
+            return None
+        real_channels = [ch for ch in self.instruments if ch != self.metronome_channel]
+        if channel not in real_channels:
+            return None
+        idx = real_channels.index(channel)
+        parts = list(self.score.parts)
+        if 0 <= idx < len(parts):
+            return parts[idx]
+        return None
+
+    @staticmethod
+    def _pin_tempo(source, bpm: float):
+        """Force `source`'s tempo to `bpm` (flattening to a single mark) so its
+        Verovio timemap matches the original-tempo timeframe."""
+        marks = list(source.recurse().getElementsByClass(tempo.MetronomeMark))
+        if marks:
+            for m in marks:
+                m.number = bpm
+        else:
+            parts = list(source.parts) if hasattr(source, "parts") else []
+            target = parts[0] if parts else source
+            target.insert(0, tempo.MetronomeMark(number=bpm))

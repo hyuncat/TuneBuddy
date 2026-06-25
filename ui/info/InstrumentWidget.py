@@ -37,7 +37,7 @@ def name_to_midi(name: str) -> int | None:
     return (octave + 1) * 12 + pc
 
 
-class InstrumentPanel(QWidget):
+class InstrumentWidget(QWidget):
     """
     Left-column panel (below the RecordingTree) for picking the active
     instrument and the expected pitch range of the active recording.

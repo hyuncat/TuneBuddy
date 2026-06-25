@@ -1,4 +1,5 @@
 import numpy as np
+from numpy import rec
 
 from app_logic.user.ds.AudioData import AudioData
 from app_logic.user.ds.PitchData import PitchData, Pitch
@@ -69,6 +70,18 @@ class Recording:
         cleanup + detection together so the views reset as one)."""
         self.audio_data.load_data(audio_filepath)
 
+    def cleanup(self):
+        """Re-init essential data structures. Called before load_score() in app."""
+        self.audio_data = AudioData(config=self.config)
+        self.pitch_data = PitchData(config=self.config)
+        self.reset_analysis()
+
+    def reset_analysis(self):
+        """Re-init analysis-derived data structures. Called before re-analyze() in app."""
+        self.note_data = NoteData()
+        self.alignment = Alignment(config=self.config)
+        self.overridden_mistake_indices = set()
+
     def detect_pitches(self, on_phase=None):
         """run pitch detection, then smoothing, on the current audio data.
         `on_phase(text)`, if given, is called at the start of each stage so a
@@ -102,11 +115,14 @@ class Recording:
         self.note_data = self.note_detector.prune_transition_notes(self.note_data, self.pitch_data)
 
     def detect_mistakes(self):
-        user_notes, midi_notes = self.note_data, self.score_data.note_datas[self.active_instrument]
+        # the StringEditor only ever sees the clip's score notes (the full
+        # NoteData when unclipped) — see ScoreData.clipped_note_data.
+        user_notes = self.note_data
+        midi_notes = self.score_data.clipped_note_data(channel=self.active_instrument)
         notes, mistakes = self.string_editor.string_edit(user_string=user_notes, midi_string=midi_notes)
         self.alignment.load_alignment(notes, mistakes)
         self.alignment.reapply_overrides(self.overridden_mistake_indices)
-    
+
     def correct_mistakes(self):
         nd, alignment = self.mistake_checker.check_mistakes(recording=self)
         self.note_data = nd
@@ -137,6 +153,7 @@ class Recording:
         end_time = self._get_last_note(voiced=True).end_time
         return end_time - start_time
     
+    # get first/last notes (used in ___ find later)
     def _get_first_note(self, voiced=True):
         if not voiced:
             return self.note_data.data[0] if self.note_data.data else None
@@ -155,7 +172,12 @@ class Recording:
     
     def resize(self, new_length: float):
         """Resize the score_data to a new length by changing the BPM of the score data,
-        updating the note timings and pitch distances as well."""
+        updating the note timings and pitch distances as well.
+
+        The WHOLE score is stretched to `new_length` (the take's length). A clip
+        is non-destructive and index-based, so it simply rides along: the rebuilt
+        notes keep their indices, and ScoreData.clip_bounds() re-derives the clip
+        window at the new tempo for free (no special clip-resize path)."""
         # Derive the target bpm against the ORIGINAL length/tempo and let
         # change_tempo recompute the stretch factor from it (factor defaults to
         # bpm_og / new_bpm). This makes a resize behave exactly like a manual

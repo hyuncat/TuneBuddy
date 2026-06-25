@@ -63,8 +63,38 @@ class MistakeChecker:
         new_alignment = self._realign(new_nd)
         return new_nd, new_alignment
 
-    # --- mistake handlers ---------------------------------------------------
+    def mistake_correction_loop(self):
+        """Repeatedly apply mistake correction until it stops reducing the mistake
+        count, leaving the recording on its best-scoring note_data/alignment.
 
+        Each pass calls recording.correct_mistakes() (which routes back through
+        this checker's check_mistakes); a pass that doesn't lower the count is
+        rolled back, so a regression never sticks. Called from the Perform tab's
+        analyze()."""
+        rec = self.recording
+        if not rec or not rec.alignment:
+            print("No active recording or alignment to correct mistakes on.")
+            return
+        n_mistakes = len(rec.alignment.mistakes)
+        print(f"initial mistakes: {n_mistakes}")
+        while True:
+            # keep the current (best-so-far) state in case this pass regresses
+            prev_nd = rec.note_data
+            prev_alignment = rec.alignment
+
+            rec.correct_mistakes()
+            new_n_mistakes = len(rec.alignment.mistakes)
+            print(f" > mistakes after correction: {new_n_mistakes}")
+
+            if new_n_mistakes >= n_mistakes:
+                # correction stopped helping -> revert to the better previous state
+                rec.note_data = prev_nd
+                rec.alignment = prev_alignment
+                print("no improvement after correction, breaking loop")
+                break
+            n_mistakes = new_n_mistakes  # made progress -> raise the baseline
+
+    # --- mistake handlers ---------------------------------------------------
     def handle_deletion(self, mistake: Mistake):
         """A deletion means a score note had no match. If the user actually played
         it but it got merged into a neighbor, split that neighbor in two.
@@ -112,7 +142,6 @@ class MistakeChecker:
 
 
     # --- helpers ------------------------------------------------------------
-
     def _pick_host(self, prev_note: Note, next_note: Note, intended: Note):
         """Decide which neighbor (if any) actually swallowed the intended note,
         based on how many of its pitch frames land on the intended pitch.
@@ -273,8 +302,12 @@ class MistakeChecker:
         return new_nd
 
     def _realign(self, note_data: NoteData) -> Alignment:
-        """Re-run string editing against the score to produce a fresh Alignment."""
-        midi_notes = self.recording.score_data.note_datas[self.recording.active_instrument]
+        """Re-run string editing against the score to produce a fresh Alignment.
+        Uses the CLIPPED score notes (the full NoteData when unclipped) — the same
+        set detect_mistakes aligns against — so the correction loop stays within
+        the clip and never merges the note after the clip into a clipped neighbor."""
+        midi_notes = self.recording.score_data.clipped_note_data(
+            channel=self.recording.active_instrument)
         notes, mistakes = self.recording.string_editor.string_edit(
             user_string=note_data, midi_string=midi_notes)
         alignment = Alignment(self.config)

@@ -3,6 +3,28 @@ let tk = null;
 let currentPage = 1; // verovio pages start at 1
 // rk: also have verovio loaded from verovio-toolkit-wasm.js
 
+// --- CLIP SELECTION STATE ---
+// Measure-range clipping lives entirely here: the user clicks a start measure
+// then an end measure, and Python pulls the resulting time range on demand
+// (window.getClipSelection). Two independent bits of state:
+//   1. the in-progress SELECTION (selStartId/selEndId -> selInterval) drawn with
+//      `.selected`, and
+//   2. the active CLIP RANGE (clipRange, set by Python via window.setClipRange)
+//      drawn by greying everything OUTSIDE it with `.clipped-out`.
+// Both are stored as time intervals in SECONDS (Verovio's original-tempo
+// timeframe) and re-applied on every renderPage so they survive page flips
+// (the viewer lays out one system per page, so off-page measures aren't in DOM).
+let measureOnsets = new Map(); // measureId -> onset (sec)
+let measureOrder = [];         // [{id, onset}] sorted by onset, whole score
+let scoreEndSec = 0;           // largest onset seen (approx score end)
+const TO_END = 1e9;            // sentinel end for "clip runs to the score end"
+
+let selStartId = null;
+let selEndId = null;
+let selStage = 0;              // 0 none, 1 start placed, 2 range complete
+let selInterval = null;        // {startSec, endSec} | null
+let clipRange = null;          // {startSec, endSec} | null (grey-out focus)
+
 // --- HELPERS ---
 function setStatus(msg) {
     document.getElementById("status").textContent = msg;
@@ -12,8 +34,189 @@ function setStatus(msg) {
 // string from verovio, wrapped in a div with class "page" (for styling)
 function renderPage(pageNo) {
     const svgStr = tk.renderToSVG(pageNo);
-    document.getElementById("notation").innerHTML = 
+    document.getElementById("notation").innerHTML =
         `<div class="page">${svgStr}</div>`;
+    // innerHTML was just replaced, so (re)add hit areas, (re)bind clicks and
+    // (re)paint overlays.
+    addMeasureHitAreas();
+    bindMeasureClicks();
+    applyOverlays();
+}
+
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function makeRect(cls, bb) {
+    const rect = document.createElementNS(SVGNS, "rect");
+    rect.setAttribute("class", cls);
+    rect.setAttribute("x", bb.x);
+    rect.setAttribute("y", bb.y);
+    rect.setAttribute("width", bb.width);
+    rect.setAttribute("height", bb.height);
+    return rect;
+}
+
+// The vertical extent of a measure's staff = the union of its 5 staff-line paths
+// (the bare <path> children of <g class="staff">), i.e. top line -> bottom line.
+// This is uniform across measures (the lines sit at fixed y), unlike the measure
+// getBBox which hugs the notes and so varies in height. Width = the staff width.
+function staffBBox(measureEl) {
+    const staff = measureEl.querySelector("g.staff");
+    if (!staff) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const child of staff.children) {
+        if (child.tagName.toLowerCase() !== "path") continue; // staff lines only
+        let bb;
+        try { bb = child.getBBox(); } catch (e) { continue; }
+        minX = Math.min(minX, bb.x); minY = Math.min(minY, bb.y);
+        maxX = Math.max(maxX, bb.x + bb.width); maxY = Math.max(maxY, bb.y + bb.height);
+    }
+    if (minX === Infinity) return null;
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+// Verovio measures are <g> wrappers with no fill of their own, so only the drawn
+// glyphs catch clicks — clicking blank space inside a measure hits nothing. Give
+// each measure two rects, both BEHIND the notes (inserted as first children):
+//   1. `clip-hit`       — the FULL measure bbox, transparent, pointer-events:all,
+//                         so a click ANYWHERE in the measure registers (bubbles
+//                         to the measure's click handler).
+//   2. `clip-highlight` — the STAFF bbox (uniform height), the selection-highlight
+//                         surface (filled translucent via CSS when `.selected`),
+//                         pointer-events:none so it never steals clicks.
+function addMeasureHitAreas() {
+    const measures = document.querySelectorAll("#notation g.measure");
+    for (const m of measures) {
+        if (m.querySelector("rect.clip-hit")) continue; // already added
+
+        const sb = staffBBox(m);
+        if (sb) {
+            const hl = makeRect("clip-highlight", sb);
+            hl.setAttribute("fill", "none");
+            hl.setAttribute("pointer-events", "none");
+            m.insertBefore(hl, m.firstChild);
+        }
+
+        let mb;
+        try { mb = m.getBBox(); } catch (e) { mb = null; }
+        if (mb && mb.width > 0 && mb.height > 0) {
+            const hit = makeRect("clip-hit", mb);
+            hit.setAttribute("fill", "transparent");
+            hit.setAttribute("pointer-events", "all");
+            m.insertBefore(hit, m.firstChild);
+        }
+    }
+}
+
+// Build the whole-score measure -> onset map from Verovio's timemap so we know
+// each measure's start time (and ordering) regardless of which page is rendered.
+function buildMeasureMap() {
+    measureOnsets = new Map();
+    measureOrder = [];
+    scoreEndSec = 0;
+
+    let timemap = [];
+    try {
+        timemap = tk.renderToTimemap({ includeMeasures: true, includeRests: true });
+    } catch (e) {
+        console.warn("renderToTimemap failed:", e);
+    }
+    if (typeof timemap === "string") {
+        try { timemap = JSON.parse(timemap); } catch (_) { timemap = []; }
+    }
+    if (!Array.isArray(timemap)) timemap = [];
+
+    for (const entry of timemap) {
+        const tsec = (entry.tstamp || 0) / 1000;
+        if (tsec > scoreEndSec) scoreEndSec = tsec;
+        const mid = entry.measureOn;
+        if (mid && !measureOnsets.has(mid)) {
+            measureOnsets.set(mid, tsec);
+            measureOrder.push({ id: mid, onset: tsec });
+        }
+    }
+    measureOrder.sort((a, b) => a.onset - b.onset);
+}
+
+// Onset (sec) for a measure id: prefer the prebuilt map, else ask Verovio
+// directly (covers builds whose timemap lacks measure entries). Returns null
+// if it can't be resolved.
+function measureOnsetFor(id) {
+    if (measureOnsets.has(id)) return measureOnsets.get(id);
+    let t = -1;
+    try { t = tk.getTimeForElement(id); } catch (e) { /* ignore */ }
+    if (typeof t === "number" && t >= 0) {
+        const s = t / 1000;
+        measureOnsets.set(id, s);
+        return s;
+    }
+    return null;
+}
+
+// Onset of the measure immediately AFTER `id` in score order, or TO_END if `id`
+// is the last measure (so the clip extends through the final measure).
+function onsetAfter(id) {
+    const onset = measureOnsetFor(id);
+    if (onset === null) return TO_END;
+    for (const m of measureOrder) {
+        if (m.onset > onset + 1e-6) return m.onset;
+    }
+    return TO_END;
+}
+
+// Recompute the selection interval [startSec, endSec) from the picked measures.
+function recomputeSelInterval() {
+    if (!selStartId) { selInterval = null; return; }
+    const a = measureOnsetFor(selStartId);
+    const b = measureOnsetFor(selEndId || selStartId);
+    if (a === null || b === null) { selInterval = null; return; }
+    const startSec = Math.min(a, b);
+    // the later-onset measure ends the range; include its full bar
+    const lastId = (a <= b) ? (selEndId || selStartId) : selStartId;
+    const endSec = onsetAfter(lastId);
+    selInterval = { startSec, endSec };
+}
+
+// Paint `.selected` (in-progress pick) and `.clipped-out` (focus grey-out) on
+// every measure currently in the DOM, by comparing each measure's onset to the
+// two intervals. Idempotent; safe to call on every render.
+function applyOverlays() {
+    const measures = document.querySelectorAll("#notation g.measure");
+    for (const m of measures) {
+        const onset = measureOnsetFor(m.id);
+        const inSel = selInterval && onset !== null
+            && onset >= selInterval.startSec - 1e-6
+            && onset < selInterval.endSec - 1e-6;
+        m.classList.toggle("selected", !!inSel);
+
+        const outOfClip = clipRange && onset !== null
+            && (onset < clipRange.startSec - 1e-6 || onset >= clipRange.endSec - 1e-6);
+        m.classList.toggle("clipped-out", !!outOfClip);
+    }
+}
+
+function onMeasureClick(ev) {
+    const id = ev.currentTarget.id;
+    if (!id) return;
+    if (selStage === 1) {
+        // second click closes the range
+        selEndId = id;
+        selStage = 2;
+    } else {
+        // first click (stage 0) or a click after a complete range (stage 2):
+        // start a fresh single-measure selection
+        selStartId = id;
+        selEndId = id;
+        selStage = 1;
+    }
+    recomputeSelInterval();
+    applyOverlays();
+}
+
+function bindMeasureClicks() {
+    const measures = document.querySelectorAll("#notation g.measure");
+    for (const m of measures) {
+        m.addEventListener("click", onMeasureClick);
+    }
 }
 
 // --- INIT VEROVIO TOOLKIT ---
@@ -48,6 +251,15 @@ window.loadScore = function(b64) {
         // decode from base64 -> ascii and load into toolkit as string
         tk.loadData(atob(b64));
 
+        // rebuild the measure->onset map for the freshly loaded score, and reset
+        // the in-progress selection (a new layout invalidates it). The active
+        // clip range is left to Python: it re-asserts it after re-renders (e.g.
+        // instrument toggle) via setClipRange, and clears it on a new score.
+        buildMeasureMap();
+        selStartId = selEndId = null;
+        selStage = 0;
+        selInterval = null;
+
         // now render the loaded page (first line) with verovio
         currentPage = 1;
         renderPage(currentPage);
@@ -61,7 +273,7 @@ window.loadScore = function(b64) {
 
 window.timeChanged = function(sec) {
     if (!tk) return;
-    
+
     // 1) remove 'playing' from any notes previously highlighted
     const playingNotes = document.querySelectorAll("g.note.playing");
     for (const n of playingNotes) n.classList.remove("playing");
@@ -82,4 +294,33 @@ window.timeChanged = function(sec) {
         const el = document.getElementById(noteId);
         if (el) el.classList.add("playing");
     }
+}
+
+// --- CLIP API (called from python) ---
+// The in-progress measure selection, in SECONDS (original-tempo timeframe), or
+// null if nothing is selected. Python pulls this when the user presses Clip.
+window.getClipSelection = function() {
+    if (!selInterval) return null;
+    return { startSec: selInterval.startSec, endSec: selInterval.endSec };
+}
+
+// Clear the in-progress selection + its `.selected` highlight.
+window.clearClipSelection = function() {
+    selStartId = selEndId = null;
+    selStage = 0;
+    selInterval = null;
+    applyOverlays();
+}
+
+// Set the active clip range (grey out everything outside it). startSec/endSec in
+// the viewer's original-tempo timeframe.
+window.setClipRange = function(startSec, endSec) {
+    clipRange = { startSec: startSec, endSec: endSec };
+    applyOverlays();
+}
+
+// Clear the active clip range (un-grey all measures).
+window.clearClipRange = function() {
+    clipRange = null;
+    applyOverlays();
 }

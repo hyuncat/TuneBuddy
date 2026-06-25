@@ -26,6 +26,14 @@ class Slider(QWidget):
         self.midi_length_sec = self.DEFAULT_LENGTH_SEC
         self.slider.setRange(0, self.midi_length_ticks)
 
+        # Clip window: when a clip is active the slider keeps its FULL range (the
+        # whole piece stays visible) but the cursor is constrained to this
+        # [b0, b1] sub-range so it can't escape the clip. Derived from the active
+        # tab's score_data.clip_bounds() on every update_range (None = no constraint).
+        # `_clamping` guards the setValue -> valueChanged -> slider_moved re-entry.
+        self.clip_window: tuple[float, float] | None = None
+        self._clamping = False
+
         # slider emissions
         # self.slider.sliderMoved.connect(self.slider_moved)
         self.slider.valueChanged.connect(self.slider_moved)
@@ -36,17 +44,38 @@ class Slider(QWidget):
     def slider_moved(self, value: int) -> None:
         """is called whenever the slider moves. emits the slider_changed signal
         corresponding to what time in the plot it now is at.
-        
+
         Args:
             value (int): the current tick value of the slider
         """
-        self.current_tick = value
+        if self._clamping:
+            return  # re-entrant call from our own setValue (clip snap-back)
+
         t = value / self.TICKS_PER_SEC # convert to seconds
+        # constrain to the clip window: a scrub past either edge snaps back in.
+        if self.clip_window is not None:
+            b0, b1 = self.clip_window
+            t = min(max(t, b0), b1)
+        tick = int(round(t * self.TICKS_PER_SEC))
+        if tick != value:
+            self._clamping = True
+            self.slider.setValue(tick)
+            self._clamping = False
+
+        self.current_tick = tick
         self.slider_changed.emit(t)
         # print(f"Slider moved to {t} sec")
-        
-        if value >= self.midi_length_ticks: # emit signal when reached end of slider
+
+        if tick >= self._max_tick(): # emit signal when reached end of (clipped) range
             self.slider_end.emit(True)
+
+    def _max_tick(self) -> int:
+        """The furthest tick the cursor may reach: the clip window's end when a
+        clip is active, otherwise the full slider length."""
+        if self.clip_window is not None:
+            b1_tick = int(round(self.clip_window[1] * self.TICKS_PER_SEC))
+            return min(b1_tick, self.midi_length_ticks)
+        return self.midi_length_ticks
 
     # --- RANGE HANDLING ---
     def update_range(self, score_data=None, recording=None):
@@ -77,6 +106,32 @@ class Slider(QWidget):
         x1 = max(m1, u1+m0)
         self._update_range(x0, x1)
 
+        # (Re)derive the clip window from the ACTIVE tab's bounds. Because the
+        # host re-calls update_range on every tab switch, a tab with no clip
+        # (bounds == full score) clears the window here — so a Perform clip never
+        # carries over to the shared slider on the Practice tab.
+        self.clip_window = self._derive_clip_window(score_data)
+
+    def sync_clip_window(self, score_data) -> None:
+        """Re-derive the clip window from the current bounds (so it can't go stale)
+        and snap the cursor to the clip start if it's currently outside the clip.
+        Called right before playback/recording starts so a clipped take always
+        begins at the clip's start time `b0`."""
+        self.clip_window = self._derive_clip_window(score_data)
+        if self.clip_window is not None:
+            b0, b1 = self.clip_window
+            raw = self.slider.value() / self.TICKS_PER_SEC
+            if raw < b0 - 1e-9 or raw > b1 + 1e-9:
+                self.set_time(b0)
+
+    @staticmethod
+    def _derive_clip_window(score_data) -> tuple[float, float] | None:
+        """The clip's [b0, b1] time window (derived from the score's note indices),
+        or None when unclipped. Single source of truth: ScoreData.clip_bounds()."""
+        if score_data is None:
+            return None
+        return score_data.clip_bounds()
+
     @staticmethod
     def _user_first_note_start(recording) -> float | None:
         """Start time of the recording's first voiced note (the same note resize()
@@ -102,18 +157,31 @@ class Slider(QWidget):
         tick = int(t * self.wall_clock.hz)
         self.current_tick = tick
 
-        # ensure current tick never exceeds maximum
-        if self.current_tick > self.slider.maximum():
-            self.current_tick = self.slider.maximum()
+        # ensure current tick never exceeds the (possibly clipped) maximum; on a
+        # clip, hitting b1 fires slider_end so playback stops at the clip end.
+        if self.current_tick > self._max_tick():
+            self.current_tick = self._max_tick()
             self.slider_end.emit(True)
             # self.wall_clock.stop() # this may not always be good
 
         self.slider.setValue(self.current_tick)
 
     # utils
+    def set_time(self, t: float) -> None:
+        """Move the slider (and cursor) to `t` seconds, clamped to the clip
+        window if one is active. Used to jump the cursor to the clip start."""
+        if self.clip_window is not None:
+            b0, b1 = self.clip_window
+            t = min(max(t, b0), b1)
+        self.slider.setValue(int(round(t * self.TICKS_PER_SEC)))
+
     def get_time(self):
-        """get current time of slider in seconds"""
-        return self.slider.value() / self.wall_clock.hz
+        """get current time of slider in seconds (clamped to the clip window)"""
+        t = self.slider.value() / self.wall_clock.hz
+        if self.clip_window is not None:
+            b0, b1 = self.clip_window
+            t = min(max(t, b0), b1)
+        return t
     
     def get_total_time(self):
         """get total time of slider in seconds"""

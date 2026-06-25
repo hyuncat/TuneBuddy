@@ -20,9 +20,9 @@ class Toolbar(QToolBar):
     score_uploaded = pyqtSignal(str)
     audio_uploaded = pyqtSignal(str)
     show_settings = pyqtSignal(bool)
-    show_clipper = pyqtSignal(bool)
+    clip_requested = pyqtSignal() # apply the clip to the selected measure range
+    clip_reset = pyqtSignal()     # restore the full score
     user_audio_toggled = pyqtSignal(bool) # value = user audio on/off
-    practice_toggled = pyqtSignal()
     tempo_changed = pyqtSignal(int) # value = new tempo in BPM
 
     def __init__(self, score_data: ScoreData):
@@ -32,7 +32,6 @@ class Toolbar(QToolBar):
 
         # important references
         self.score_data = score_data
-
         self.init_ui()
 
     def init_upload_widget(self):
@@ -63,6 +62,36 @@ class Toolbar(QToolBar):
             }
         """)
         self.addWidget(upload_button)
+
+    def init_clip_widget(self):
+        """A 'Clip' button whose dropdown holds two items:
+          - 'Clip': clip to the measure range selected in the score viewer (click
+            a start + end measure anytime to highlight the range).
+          - 'Reset': restores the full score.
+        """
+        self.clip_button = QToolButton(self)
+        self.clip_button.setText("Clip")
+
+        self.clip_menu = QMenu(self)
+        self.clip_action = QAction("Clip", self)
+        self.clip_action.setStatusTip("Clip to the selected start/end measures")
+        self.clip_action.triggered.connect(self.clip_requested.emit)
+        self.clip_menu.addAction(self.clip_action)
+
+        self.reset_clip_action = QAction("Reset", self)
+        self.reset_clip_action.setStatusTip("Restore the full score (undo the clip)")
+        self.reset_clip_action.triggered.connect(self.clip_reset.emit)
+        self.clip_menu.addAction(self.reset_clip_action)
+
+        self.clip_button.setMenu(self.clip_menu)
+        self.clip_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.clip_button.setStyleSheet("""
+            QToolButton::menu-indicator {
+                image: none;
+                width: 0px;
+            }
+        """)
+        self.addWidget(self.clip_button)
 
     def init_instrument_select(self):
         # --- instrument multi-select dropdown ---
@@ -119,21 +148,10 @@ class Toolbar(QToolBar):
         settings.triggered.connect(self.trigger_settings)
         self.addAction(settings)
 
-        clip = QAction("Clip", self)
-        clip.setStatusTip("Clip active MIDI to certain range")
-        clip.triggered.connect(self.trigger_clip)
-        self.addAction(clip)
+        self.init_clip_widget()
 
         self.addSeparator()
         self.init_instrument_select()
-        self.addSeparator()
-
-        # --- practice mode toggle ---
-        practice = QAction("Practice", self)
-        practice.setStatusTip("Click to enter practice mode")
-        practice.triggered.connect(self.practice_toggled.emit)
-        self.addAction(practice)
-
 
         # --- RIGHT SIDE: TIMEKEEPING ---
         # stretch so right-side controls don’t crowd left actions
@@ -192,10 +210,6 @@ class Toolbar(QToolBar):
     def trigger_settings(self):
         """Open the settings dialog."""
         self.show_settings.emit(True)
-
-    def trigger_clip(self):
-        """Open the clip dialog."""
-        self.show_clipper.emit(True)
 
     def populate_instrument_menu(self):
         """Dynamically populate the instrument multi-select dropdown
