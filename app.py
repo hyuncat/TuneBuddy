@@ -801,6 +801,32 @@ class Attune(QMainWindow):
         self.perform_tab.transpose(delta)
         self.practice_tab.transpose(delta)
         self._sync_transpose_input()
+        # the score's pitches moved, so its note range moved too: slide the
+        # detection frequency range along with it (and refresh the Range inputs).
+        self._sync_range_after_transpose(delta)
+
+    def _sync_range_after_transpose(self, delta: int):
+        """A transpose of `delta` half steps shifts every note, so the score's
+        note range — and the frequency range pitch detection should look in —
+        moves with it. Refresh the Range inputs from the transposed score and
+        slide each recording's Config fmin/fmax by `delta`. Forward-looking only:
+        the existing take's already-detected pitches are left alone, since
+        transposing the SCORE doesn't change the recorded audio."""
+        # 1. displayed Range defaults track the (now transposed) score
+        self.settings_widget.populate_range_from_score(
+            self._active_score_data(), self.settings_widget.current_channel()
+        )
+        # 2. slide the detection range so a future take is detected in the new
+        #    range (mirror the explicit Apply path, minus the re-detect)
+        if not self._has_recording():
+            return
+        config = self.active_recording.config
+        fmin = config.midi_to_freq(config.freq_to_midi(config.fmin) + delta)
+        fmax = config.midi_to_freq(config.freq_to_midi(config.fmax) + delta)
+        config.fmin = fmin
+        config.fmax = fmax
+        self.active_recording.update_config(config)
+        self.practice_tab.set_freq_range(fmin, fmax)
 
     def _sync_transpose_input(self):
         """Reflect the active tab's current first-note pitch in the settings
