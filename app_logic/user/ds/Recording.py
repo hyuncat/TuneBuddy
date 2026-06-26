@@ -1,20 +1,16 @@
 import numpy as np
 from pathlib import Path
-from dataclasses import fields
-import json
-import math
 
 from app_logic.user.ds.AudioData import AudioData
 from app_logic.user.ds.PitchData import PitchData, Pitch
 from app_logic.midi.ScoreData import ScoreData
-from app_logic.Alignment import Alignment, Mistake
-from app_logic.NoteData import NoteData, Note
+from app_logic.Alignment import Alignment
+from app_logic.NoteData import NoteData
 from app_logic.user.ds.Buffer import Buffer
+from app_logic.JsonHandler import JsonHandler
 from algorithms.Config import Config
 
 class Recording:
-    CACHE_VERSION = 1
-
     def __init__(self, score_data: ScoreData=None, config: Config=None):
         """the user data, associated with a singular recording of a score.
         each recording has its own audio data, pitch data, note data, and alignment
@@ -78,22 +74,11 @@ class Recording:
 
     @staticmethod
     def cache_path_for(audio_filepath: str | Path) -> Path:
-        """Hidden JSON sidecar path for an audio file.
-
-        `take.wav` -> `.take.json`, matching the requested `.filename.json`
-        convention while keeping the audio file extension out of the cache name.
-        """
-        path = Path(audio_filepath)
-        return path.with_name(f".{path.stem}.json")
+        return JsonHandler.cache_path_for(audio_filepath)
 
     @staticmethod
     def delete_cache_for(audio_filepath: str | Path) -> None:
-        path = Recording.cache_path_for(audio_filepath)
-        try:
-            if path.exists() and path.is_file():
-                path.unlink()
-        except OSError as e:
-            print(f"Could not delete recording cache '{path}': {e}")
+        JsonHandler.delete_cache_for(audio_filepath)
 
     def cache_path(self) -> Path | None:
         return self.cache_path_for(self.audio_filepath) if self.audio_filepath else None
@@ -102,33 +87,7 @@ class Recording:
         return self.audio_filepath is not None and Path(self.audio_filepath).exists()
 
     def rename_files(self, new_stem: str) -> Path | None:
-        """Rename the on-disk audio file and its hidden cache sidecar now.
-
-        Returns the new audio path, or None for unsaved in-memory recordings that
-        do not have files yet. Raises on filesystem conflicts/failures so the UI
-        can revert the tree edit.
-        """
-        if self.audio_filepath is None:
-            return None
-        old_audio = Path(self.audio_filepath)
-        if not old_audio.exists():
-            raise FileNotFoundError(old_audio)
-
-        new_audio = old_audio.with_name(f"{new_stem}{old_audio.suffix}")
-        old_cache = self.cache_path_for(old_audio)
-        new_cache = self.cache_path_for(new_audio)
-
-        if new_audio != old_audio and new_audio.exists():
-            raise FileExistsError(new_audio)
-        if new_cache != old_cache and new_cache.exists():
-            raise FileExistsError(new_cache)
-
-        if new_audio != old_audio:
-            old_audio.rename(new_audio)
-            self.audio_filepath = new_audio
-        if old_cache.exists() and new_cache != old_cache:
-            old_cache.rename(new_cache)
-        return self.audio_filepath
+        return JsonHandler.rename_recording_files(self, new_stem)
 
     def load_audio(
         self,
@@ -170,435 +129,20 @@ class Recording:
         score_filepath: str | Path | None = None,
         recording_name: str | None = None,
     ) -> bool:
-        """Persist analysis/cache metadata next to the audio file.
-
-        The cache is intentionally derived-state only: audio stays in the audio
-        file, score content stays in the score file, and this JSON stores the
-        per-recording score state plus pitch/note/alignment results.
-        """
-        path = self.cache_path()
-        if path is None:
-            return False
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = self._to_cache_payload(score_filepath, recording_name)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-            tmp.replace(path)
-            return True
-        except Exception as e:
-            print(f"Could not save recording cache '{path}': {e}")
-            return False
+        return JsonHandler(self).save_cache(
+            score_filepath=score_filepath,
+            recording_name=recording_name,
+        )
 
     def load_cache(
         self,
         score_filepath: str | Path | None = None,
         recording_name: str | None = None,
     ) -> bool:
-        path = self.cache_path()
-        if path is None or not path.exists():
-            return False
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("version") != self.CACHE_VERSION:
-                return False
-            if not self._cache_matches_audio(payload):
-                return False
-            if not self._cache_matches_score(payload, score_filepath):
-                return False
-            self._load_cache_payload(payload, score_filepath=score_filepath)
-            self.unsaved_changes = False
-            self.loaded_from_cache = True
-            print(f"Loaded recording cache: {path}")
-            return True
-        except Exception as e:
-            print(f"Could not load recording cache '{path}': {e}")
-            return False
-
-    def _cache_matches_audio(self, payload: dict) -> bool:
-        if self.audio_filepath is None or not self.audio_filepath.exists():
-            return False
-        meta = payload.get("recording") or {}
-        cached_name = meta.get("audio_file")
-        if cached_name and cached_name != self.audio_filepath.name:
-            return False
-        cached_size = meta.get("audio_size")
-        cached_mtime = meta.get("audio_mtime_ns")
-        stat = self.audio_filepath.stat()
-        if cached_size is not None and int(cached_size) != stat.st_size:
-            return False
-        if cached_mtime is not None and int(cached_mtime) != stat.st_mtime_ns:
-            return False
-        return True
-
-    @staticmethod
-    def _cache_matches_score(payload: dict, score_filepath: str | Path | None) -> bool:
-        if score_filepath is None:
-            return True
-        cached_file = (payload.get("score") or {}).get("file")
-        if not cached_file:
-            return True
-        return cached_file == Path(score_filepath).name
-
-    # --- JSON CACHE SERIALIZATION ---
-    def _to_cache_payload(
-        self,
-        score_filepath: str | Path | None = None,
-        recording_name: str | None = None,
-    ) -> dict:
-        audio_path = Path(self.audio_filepath) if self.audio_filepath else None
-        score_path = Path(score_filepath) if score_filepath is not None else getattr(self.score_data, "filepath", None)
-        score_path = Path(score_path) if score_path is not None else None
-        return {
-            "version": self.CACHE_VERSION,
-            "recording": {
-                "name": recording_name,
-                "audio_file": audio_path.name if audio_path else None,
-                "audio_path": str(audio_path) if audio_path else None,
-                "audio_size": audio_path.stat().st_size if audio_path and audio_path.exists() else None,
-                "audio_mtime_ns": audio_path.stat().st_mtime_ns if audio_path and audio_path.exists() else None,
-                "active_instrument": self.active_instrument,
-                "audio_t_origin": self._pack_number(self.audio_data.t_origin),
-                "audio_end_index": int(self.audio_data.end_index),
-            },
-            "score": self._score_to_payload(score_path),
-            "config": self._config_to_payload(self.config),
-            "pitch_data": self._pitch_data_to_payload(),
-            "note_data": self._note_data_to_payload(self.note_data),
-            "alignment": self._alignment_to_payload(),
-            "overridden_mistake_indices": sorted(int(i) for i in self.overridden_mistake_indices),
-        }
-
-    def _load_cache_payload(
-        self,
-        payload: dict,
-        score_filepath: str | Path | None = None,
-    ) -> None:
-        self._restore_score_from_payload(payload.get("score") or {}, score_filepath)
-
-        rec_payload = payload.get("recording") or {}
-        active = rec_payload.get("active_instrument")
-        if active in self.score_data.note_datas:
-            self.score_data.active_instrument = int(active)
-            self.active_instrument = int(active)
-        else:
-            self.active_instrument = self.score_data.active_instrument
-
-        self.config = self._config_from_payload(payload.get("config") or {})
-        self.update_config(self.config)
-
-        self.audio_data.t_origin = self._unpack_number(rec_payload.get("audio_t_origin"), default=0.0)
-        end_index = rec_payload.get("audio_end_index")
-        if isinstance(end_index, int) and end_index >= 0:
-            self.audio_data.end_index = min(end_index, len(self.audio_data.data))
-
-        self.pitch_data = self._pitch_data_from_payload(payload.get("pitch_data") or {})
-        self.note_data = self._note_data_from_payload(payload.get("note_data") or [])
-        self.alignment = self._alignment_from_payload(payload.get("alignment") or {})
-        self.overridden_mistake_indices = {
-            int(i) for i in payload.get("overridden_mistake_indices", [])
-            if isinstance(i, int)
-        }
-        self.alignment.reapply_overrides(self.overridden_mistake_indices)
-
-    def _score_to_payload(self, score_path: Path | None) -> dict:
-        sd = self.score_data
-        return {
-            "path": str(score_path) if score_path is not None else None,
-            "file": score_path.name if score_path is not None else None,
-            "title": sd.title,
-            "bpm": self._pack_number(sd.bpm),
-            "bpm_og": self._pack_number(sd.bpm_og),
-            "active_instrument": sd.active_instrument,
-            "transpose_semitones": sd.transpose_semitones,
-            "transpose_offset": self._pack_number(sd.transpose_offset),
-            "clip": list(sd.clip) if sd.clip is not None else None,
-            "displayed_instruments": sorted(int(ch) for ch in sd.displayed_instruments),
-            "playing_instruments": sorted(int(ch) for ch in sd.playing_instruments),
-        }
-
-    def _restore_score_from_payload(
-        self,
-        payload: dict,
-        score_filepath: str | Path | None = None,
-    ) -> None:
-        score_path = score_filepath or payload.get("path") or getattr(self.score_data, "filepath", None)
-        if score_path and self._score_needs_cache_reset(score_path):
-            self.score_data.load(score_path)
-
-        sd = self.score_data
-        title = payload.get("title")
-        if title:
-            sd.set_title(title)
-
-        active = payload.get("active_instrument")
-        if active in sd.note_datas:
-            sd.active_instrument = int(active)
-
-        transpose_semitones = int(payload.get("transpose_semitones") or 0)
-        if transpose_semitones and sd.first_note_midi() is not None:
-            sd.transpose(transpose_semitones)
-
-        bpm = self._unpack_number(payload.get("bpm"), default=sd.bpm)
-        if bpm and round(bpm) != round(sd.bpm):
-            sd.change_tempo(int(round(bpm)))
-
-        offset = self._unpack_number(payload.get("transpose_offset"), default=0.0)
-        if offset:
-            sd.transpose_notes(offset)
-
-        clip = payload.get("clip")
-        if isinstance(clip, list) and len(clip) == 2:
-            sd.set_clip(int(clip[0]), int(clip[1]))
-        else:
-            sd.clear_clip()
-
-        displayed = self._valid_channels(payload.get("displayed_instruments"), sd)
-        if displayed:
-            sd.displayed_instruments = displayed
-        playing = self._valid_channels(payload.get("playing_instruments"), sd)
-        if playing:
-            sd.playing_instruments = playing
-
-    def _score_needs_cache_reset(self, score_path: str | Path) -> bool:
-        """True when cached state should be applied to a fresh score parse."""
-        if self.score_data.score is None:
-            return True
-        current = getattr(self.score_data, "filepath", None)
-        try:
-            if current is None or Path(current).expanduser().resolve() != Path(score_path).expanduser().resolve():
-                return True
-        except OSError:
-            return True
-        return (
-            self.score_data.clip is not None
-            or self.score_data.transpose_semitones != 0
-            or abs(self.score_data.transpose_offset) > 1e-9
-            or round(self.score_data.bpm) != round(self.score_data.bpm_og)
+        return JsonHandler(self).load_cache(
+            score_filepath=score_filepath,
+            recording_name=recording_name,
         )
-
-    @staticmethod
-    def _valid_channels(value, score_data: ScoreData) -> set[int]:
-        if not isinstance(value, list):
-            return set()
-        channels = set()
-        for ch in value:
-            try:
-                channel = int(ch)
-            except (TypeError, ValueError):
-                continue
-            if channel in score_data.instruments:
-                channels.add(channel)
-        return channels
-
-    def _config_to_payload(self, config: Config) -> dict:
-        return {f.name: self._pack_number(getattr(config, f.name)) for f in fields(Config)}
-
-    def _config_from_payload(self, payload: dict) -> Config:
-        valid = {f.name for f in fields(Config)}
-        defaults = Config()
-        kwargs = {}
-        for k in payload:
-            if k not in valid:
-                continue
-            value = self._unpack_number(payload[k])
-            if isinstance(getattr(defaults, k), int):
-                value = int(round(value))
-            kwargs[k] = value
-        config = Config(**kwargs)
-        if "h2" not in payload:
-            config.h2 = config.w2 - 2
-        if "slope_thresh" not in payload:
-            config.slope_thresh = 0.75 / config.w2
-        return config
-
-    def _pitch_data_to_payload(self) -> dict:
-        last = -1
-        for i in range(len(self.pitch_data.data) - 1, -1, -1):
-            if self.pitch_data.data[i] is not None:
-                last = i
-                break
-        pitches = [] if last < 0 else [
-            self._pitch_to_payload(p) for p in self.pitch_data.data[:last + 1]
-        ]
-        return {
-            "t_origin": self._pack_number(self.pitch_data.t_origin),
-            "pitches": pitches,
-        }
-
-    def _pitch_data_from_payload(self, payload: dict) -> PitchData:
-        pd = PitchData(config=self.config)
-        pd.t_origin = self._unpack_number(payload.get("t_origin"), default=0.0)
-        pd.data = [self._pitch_from_payload(p) for p in payload.get("pitches", [])]
-        if not pd.data:
-            pd = PitchData(config=self.config)
-        return pd
-
-    def _pitch_to_payload(self, pitch: Pitch | None):
-        if pitch is None:
-            return None
-        return [
-            self._pack_number(pitch.time),
-            [[self._pack_number(m), self._pack_number(prob)] for m, prob in pitch.candidates],
-            self._pack_number(pitch.volume),
-            self._pack_number(pitch.unvoiced_prob),
-            self._pack_number(pitch.distance),
-            self._pack_number(pitch.align_distance),
-            pitch.is_transition,
-        ]
-
-    def _pitch_from_payload(self, payload) -> Pitch | None:
-        if payload is None:
-            return None
-        candidates = [
-            (self._unpack_number(c[0], default=0.0), self._unpack_number(c[1], default=0.0))
-            for c in payload[1]
-        ]
-        pitch = Pitch(
-            time=self._unpack_number(payload[0], default=0.0),
-            candidates=candidates,
-            volume=self._unpack_number(payload[2], default=0.0),
-            unvoiced_prob=self._unpack_number(payload[3], default=1.0),
-            distance=self._unpack_number(payload[4], default=None),
-            config=self.config,
-        )
-        pitch.align_distance = self._unpack_number(payload[5], default=None)
-        pitch.is_transition = payload[6] if len(payload) > 6 else None
-        return pitch
-
-    def _note_data_to_payload(self, note_data: NoteData) -> list:
-        return [self._note_to_payload(note_data.data[t]) for t in note_data.times]
-
-    def _note_data_from_payload(self, payload: list) -> NoteData:
-        nd = NoteData()
-        for item in payload:
-            nd.write_note(self._note_from_payload(item))
-        return nd
-
-    def _note_to_payload(self, note: Note) -> list:
-        return [
-            int(note.id),
-            self._pack_number(note.start_time),
-            self._pack_number(note.end_time),
-            [self._pack_number(m) for m in note.midi_num],
-            note.velocity,
-            note.instrument,
-            self._pack_number(note.base_start_time),
-            self._pack_number(note.base_end_time),
-        ]
-
-    def _note_from_payload(self, payload: list) -> Note:
-        note = Note(
-            i=int(payload[0]),
-            start_time=self._unpack_number(payload[1], default=0.0),
-            end_time=self._unpack_number(payload[2], default=0.0),
-            midi_num=[self._unpack_number(m, default=-1) for m in payload[3]],
-            velocity=payload[4],
-            instrument=payload[5],
-        )
-        if len(payload) > 6:
-            note.base_start_time = self._unpack_number(payload[6], default=note.start_time)
-        if len(payload) > 7:
-            note.base_end_time = self._unpack_number(payload[7], default=note.end_time)
-        return note
-
-    def _alignment_to_payload(self) -> dict:
-        user_notes = self.note_data.read(i=0, j=len(self.note_data.times))
-        score_nd = self.score_data.note_datas.get(self.active_instrument)
-        score_notes = score_nd.read(i=0, j=len(score_nd.times)) if score_nd else []
-        user_index = self._note_index_maps(user_notes)
-        score_index = self._note_index_maps(score_notes)
-
-        def uidx(note):
-            return self._lookup_note_index(note, user_index)
-
-        def sidx(note):
-            return self._lookup_note_index(note, score_index)
-
-        return {
-            "pairs": [[uidx(u), sidx(s)] for u, s in self.alignment.pairs],
-            "mistakes": [
-                [
-                    m.type,
-                    uidx(m.user_note),
-                    sidx(m.midi_note),
-                    int(m.get_pair_index()) if m.get_pair_index() is not None else None,
-                    bool(m.is_overridden()),
-                ]
-                for m in self.alignment.mistakes
-            ],
-        }
-
-    def _alignment_from_payload(self, payload: dict) -> Alignment:
-        user_notes = self.note_data.read(i=0, j=len(self.note_data.times))
-        score_nd = self.score_data.note_datas.get(self.active_instrument)
-        score_notes = score_nd.read(i=0, j=len(score_nd.times)) if score_nd else []
-
-        def note_at(notes, idx):
-            if idx is None:
-                return None
-            return notes[idx] if isinstance(idx, int) and 0 <= idx < len(notes) else None
-
-        pairs = [
-            (note_at(user_notes, uidx), note_at(score_notes, sidx))
-            for uidx, sidx in payload.get("pairs", [])
-        ]
-        mistakes = []
-        for item in payload.get("mistakes", []):
-            if len(item) < 5:
-                continue
-            mistake = Mistake(
-                type=item[0],
-                user_note=note_at(user_notes, item[1]),
-                midi_note=note_at(score_notes, item[2]),
-            )
-            if item[3] is not None:
-                mistake.set_pair_index(int(item[3]))
-            mistake.set_override(bool(item[4]))
-            mistakes.append(mistake)
-
-        alignment = Alignment(config=self.config)
-        alignment.load_alignment(pairs, mistakes)
-        return alignment
-
-    @staticmethod
-    def _note_index_maps(notes: list[Note]) -> dict:
-        return {
-            "object": {id(note): i for i, note in enumerate(notes)},
-            "note_id": {note.id: i for i, note in enumerate(notes)},
-        }
-
-    @staticmethod
-    def _lookup_note_index(note: Note | None, maps: dict) -> int | None:
-        if note is None:
-            return None
-        by_object = maps["object"].get(id(note))
-        if by_object is not None:
-            return by_object
-        return maps["note_id"].get(getattr(note, "id", None))
-
-    @staticmethod
-    def _pack_number(value):
-        if value is None:
-            return None
-        value = float(value)
-        if math.isinf(value):
-            return "inf" if value > 0 else "-inf"
-        if math.isnan(value):
-            return "nan"
-        return value
-
-    @staticmethod
-    def _unpack_number(value, default=None):
-        if value is None:
-            return default
-        if value == "inf":
-            return float("inf")
-        if value == "-inf":
-            return float("-inf")
-        if value == "nan":
-            return float("nan")
-        return float(value)
 
     def cleanup(self):
         """Re-init essential data structures. Called before load_score() in app."""

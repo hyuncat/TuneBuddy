@@ -33,6 +33,7 @@ from ui.info.Settings import SettingsDialog
 from app_logic.user.ds.Recording import Recording
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.midi.MidiSynth import MidiSynth
+from app_logic.JsonHandler import JsonHandler
 
 # the two center "mode" tabs, each in its own file
 from perform import PerformTab
@@ -356,7 +357,7 @@ class Attune(QMainWindow):
             self.active_recording_name = new_name
             self.status_bar.update_name(new_name)
             self.recordings_tree.update_recording_file(new_name, filepath)
-            rec.save_cache(score_filepath=self.current_score_path, recording_name=new_name)
+            self._save_recording_cache(rec, recording_name=new_name)
         self.sync_slider()
         # make it playable + (re-)detect pitches in the background (the Perform
         # tab owns the audio player + detection pipeline)
@@ -471,7 +472,7 @@ class Attune(QMainWindow):
             with self._pitch_detection_semaphore:
                 try:
                     rec.detect_pitches(on_phase=rec.pitch_detector.status_changed.emit)
-                    rec.save_cache(score_filepath=score_path, recording_name=recording_name)
+                    self._save_recording_cache(rec, recording_name=recording_name, score_path=score_path)
                 except Exception as e:
                     print(f"[PitchDetector] imported recording detection failed: {e}")
                 finally:
@@ -508,6 +509,17 @@ class Attune(QMainWindow):
 
     def _show_saved_status(self):
         self.status_bar.update_status("Saved!")
+
+    def _save_recording_cache(
+        self,
+        rec: Recording,
+        recording_name: str | None = None,
+        score_path: str | Path | None = None,
+    ) -> bool:
+        return JsonHandler(rec).save_cache(
+            score_filepath=score_path or self.current_score_path,
+            recording_name=recording_name,
+        )
 
     def _save_practice_recording(self) -> bool:
         rec = self.practice_tab.recording
@@ -555,7 +567,7 @@ class Attune(QMainWindow):
                 if rec is self.active_recording
                 else default_name
             )
-            if not rec.save_cache(score_filepath=self.current_score_path, recording_name=cache_name):
+            if not self._save_recording_cache(rec, recording_name=cache_name):
                 QMessageBox.warning(self, "Save failed", "Could not save recording metadata.")
                 return False
             rec.unsaved_changes = False
@@ -594,7 +606,7 @@ class Attune(QMainWindow):
                 self.status_bar.update_name(new_name)
                 self.recordings_tree.update_recording_file(new_name, save_path)
                 cache_name = new_name
-        if not rec.save_cache(score_filepath=self.current_score_path, recording_name=cache_name):
+        if not self._save_recording_cache(rec, recording_name=cache_name):
             QMessageBox.warning(self, "Save failed", "Could not save recording metadata.")
             return False
         self._show_saved_status()
@@ -843,7 +855,7 @@ class Attune(QMainWindow):
             self.base_score_data.set_title(title)
         for name, rec in self.recordings.items():
             rec.score_data.set_title(title)
-            rec.save_cache(score_filepath=self.current_score_path, recording_name=name)
+            self._save_recording_cache(rec, recording_name=name)
         self.score_data.set_title(title)
         self.practice_tab.score_data.set_title(title)
         self.perform_tab.refresh_score_viewer()
@@ -856,7 +868,7 @@ class Attune(QMainWindow):
         if self.active_recording_name == old_name or self.active_recording is rec:
             self.active_recording_name = new_name
             self.status_bar.update_name(new_name)
-        rec.save_cache(score_filepath=self.current_score_path, recording_name=new_name)
+        self._save_recording_cache(rec, recording_name=new_name)
 
     # ------> SELECT INSTRUMENT PANEL
     def on_instrument_applied(self, channel: int):
@@ -871,10 +883,7 @@ class Attune(QMainWindow):
         self.practice_tab.set_active_instrument(channel)
         # the transpose anchor (first note) follows the newly selected instrument
         self._sync_transpose_input()
-        self.active_recording.save_cache(
-            score_filepath=self.current_score_path,
-            recording_name=self.active_recording_name,
-        )
+        self._save_recording_cache(self.active_recording, recording_name=self.active_recording_name)
 
     def on_transpose_applied(self, target_midi: int):
         """Transpose BOTH tabs' scores so the active instrument's first note lands
@@ -899,10 +908,7 @@ class Attune(QMainWindow):
         if self.active_recording is not None and not self._practice_active():
             if self.active_recording.has_analysis():
                 self.active_recording.update_alignment_distances()
-            self.active_recording.save_cache(
-                score_filepath=self.current_score_path,
-                recording_name=self.active_recording_name,
-            )
+            self._save_recording_cache(self.active_recording, recording_name=self.active_recording_name)
 
     def _sync_range_after_transpose(self, delta: int):
         """A transpose of `delta` half steps shifts every note, so the score's
@@ -926,10 +932,7 @@ class Attune(QMainWindow):
         config.fmax = fmax
         self.active_recording.update_config(config)
         self.practice_tab.set_freq_range(fmin, fmax)
-        self.active_recording.save_cache(
-            score_filepath=self.current_score_path,
-            recording_name=self.active_recording_name,
-        )
+        self._save_recording_cache(self.active_recording, recording_name=self.active_recording_name)
 
     def _sync_transpose_input(self):
         """Reflect the active tab's current first-note pitch in the settings
@@ -986,7 +989,7 @@ class Attune(QMainWindow):
         # mirror into the Practice tab (drives its live pitch match)
         self.practice_tab.set_tolerance(tolerance)
         self.perform_tab.reanalyze_if_analyzed()
-        rec.save_cache(score_filepath=self.current_score_path, recording_name=self.active_recording_name)
+        self._save_recording_cache(rec, recording_name=self.active_recording_name)
 
     # --- TOOLBAR THINGS ---
     def _is_live(self) -> bool:
@@ -1004,10 +1007,7 @@ class Attune(QMainWindow):
             return
         if not self._practice_active() and self.active_recording is not None:
             self.active_recording.change_tempo(new_bpm)
-            self.active_recording.save_cache(
-                score_filepath=self.current_score_path,
-                recording_name=self.active_recording_name,
-            )
+            self._save_recording_cache(self.active_recording, recording_name=self.active_recording_name)
         else:
             sd.change_tempo(new_bpm)
         self._active_tab().guitar_hero.update_view_items()

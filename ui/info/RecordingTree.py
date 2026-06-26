@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 
 from app_logic.user.ds.Recording import Recording
 from app_logic.midi.ScoreData import ScoreData
+from app_logic.JsonHandler import JsonHandler
 from resources.program_map import program_to_name, name_to_program
 
 
@@ -480,7 +481,7 @@ class RecordingTree(QWidget):
     def _delete_recording_file(self, recording_path: str | Path) -> bool:
         path = Path(recording_path)
         if not path.exists():
-            Recording.delete_cache_for(path)
+            JsonHandler.delete_cache_for(path)
             return True
         if not path.is_file():
             QMessageBox.warning(
@@ -491,7 +492,7 @@ class RecordingTree(QWidget):
             return False
         try:
             path.unlink()
-            Recording.delete_cache_for(path)
+            JsonHandler.delete_cache_for(path)
         except OSError as e:
             QMessageBox.warning(
                 self,
@@ -567,7 +568,7 @@ class RecordingTree(QWidget):
         new_audio_path = None
         if rec is not None:
             try:
-                new_audio_path = rec.rename_files(new_name)
+                new_audio_path = JsonHandler.rename_recording_files(rec, new_name)
             except FileExistsError as e:
                 target = e.filename or (e.args[0] if e.args else "")
                 QMessageBox.warning(

@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.midi.MidiPlayer import MidiPlayer
+from app_logic.JsonHandler import JsonHandler
 from app_logic.user.ds.Recording import Recording
 from app_logic.user.AudioPlayer import AudioPlayer
 from app_logic.user.AudioRecorder import AudioRecorder
@@ -228,7 +229,7 @@ class PerformTab(QWidget):
         self._clear_analysis()  # clear stale analysis but KEEP the loaded audio
         rec.pitch_data = PitchData(config=rec.config)
         self.guitar_hero.load_user(rec)
-        rec.save_cache()
+        JsonHandler(rec).save_cache()
         self._wire_detector(rec)  # just in case
         rec.pitch_detector.detect_pitches_async()
 
@@ -250,7 +251,7 @@ class PerformTab(QWidget):
         self.status_bar.update_status("")
         self.guitar_hero.load_user(self.recording)
         self._refresh_guitar_hero_now()
-        self.recording.save_cache()
+        JsonHandler(self.recording).save_cache()
 
     def _refresh_guitar_hero_now(self):
         """Rebuild visible GuitarHero items and ask Qt to repaint immediately."""
@@ -403,7 +404,7 @@ class PerformTab(QWidget):
             self.slider.set_time(b[0])
         self.guitar_hero.update_clip_overlay()
         self.mistake_widget.load_mistakes(rec.alignment.mistakes)
-        rec.save_cache()
+        JsonHandler(rec).save_cache()
 
         # the resize stretched the score to match the take => its BPM/length
         # changed; let the host reflect that in the tempo display.
@@ -437,7 +438,7 @@ class PerformTab(QWidget):
         self.mistake_widget.refresh_override(idx)
         self.guitar_hero.update_highlight_override(mistake.is_overridden())
         self.guitar_hero.update_view_items()
-        self.recording.save_cache()
+        JsonHandler(self.recording).save_cache()
 
     # --- SCORE VIEWER ---
     def _score_viewer_time(self, t: float) -> float:
@@ -534,7 +535,7 @@ class PerformTab(QWidget):
         self._refresh_clip_focus()
         self.move_views(self.slider.get_time())
         if self.recording is not None:
-            self.recording.save_cache()
+            JsonHandler(self.recording).save_cache()
 
     def sync_clip(self, clip):
         """Mirror a clip made in the OTHER tab onto this score (the clip is global).
@@ -547,7 +548,7 @@ class PerformTab(QWidget):
         self._refresh_clip_focus()
         self.guitar_hero.update_view_items()
         if self.recording is not None:
-            self.recording.save_cache()
+            JsonHandler(self.recording).save_cache()
 
     def _refresh_clip_focus(self):
         """(Re)assert (or clear) the score-viewer grey-out from the clip. Keyed on
