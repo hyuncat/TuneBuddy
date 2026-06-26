@@ -302,6 +302,7 @@ class Attune(QMainWindow):
         self.settings_widget.transpose_applied.connect(self.on_transpose_applied)
         # tolerance panel
         self.tolerance_widget.tolerance_applied.connect(self.on_tolerance_applied)
+        self.mistake_widget.mode_changed.connect(self.on_mistake_mode_changed)
 
     # --- ACTIVE-TAB HELPERS ---
     def _practice_active(self) -> bool:
@@ -822,7 +823,7 @@ class Attune(QMainWindow):
         # push config into side panels
         self.settings_widget.set_active_instrument(rec.active_instrument)
         self.settings_widget.set_tuning(rec.config.tuning)
-        self.tolerance_widget.set_tolerance(rec.config.tolerance)
+        self._sync_tolerance_widget()
         self.status_bar.update_name(recording_name)
         # also pass to Performance Tab
         self.perform_tab.set_active_recording(rec)
@@ -986,16 +987,38 @@ class Attune(QMainWindow):
         self.perform_tab.detect_pitches()
 
     # ------> TOLERANCE PANEL
-    def on_tolerance_applied(self, tolerance: float):
-        """Set the active recording's Config tolerance, mirror it into Practice,
-        then re-run just the mistake step (if the take is already analyzed)."""
+    def _sync_tolerance_widget(self):
+        if self.active_recording is None:
+            return
+        self.tolerance_widget.set_tolerances(
+            self.active_recording.config.pitch_tolerance,
+            self.active_recording.config.timing_tolerance,
+        )
+
+    def on_mistake_mode_changed(self, mode: str):
+        """The MistakeWidget tab controls which tolerance the side control edits."""
+        self._sync_tolerance_widget()
+        self.tolerance_widget.set_mode(mode)
+
+    def on_tolerance_applied(self, mode: str, tolerance: float):
+        """Set the active recording's pitch or timing tolerance and refresh the
+        relevant mistake view."""
         if not self._has_recording():
             return
         rec = self.active_recording
-        rec.config.tolerance = tolerance
+        if mode == "timing":
+            rec.config.timing_tolerance = tolerance
+            rec.update_config(rec.config)
+            if rec.has_analysis():
+                rec.detect_timing_mistakes()
+                self.perform_tab.refresh_mistake_widget(rec)
+            self._save_recording_cache(rec, recording_name=self.active_recording_name)
+            return
+
+        rec.config.pitch_tolerance = tolerance
         rec.update_config(rec.config)
         # mirror into the Practice tab (drives its live pitch match)
-        self.practice_tab.set_tolerance(tolerance)
+        self.practice_tab.set_pitch_tolerance(tolerance)
         self.perform_tab.reanalyze_if_analyzed()
         self._save_recording_cache(rec, recording_name=self.active_recording_name)
 

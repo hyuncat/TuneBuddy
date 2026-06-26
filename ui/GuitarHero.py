@@ -235,9 +235,9 @@ class GuitarHero(QWidget):
 
         # --- POST-ANALYSIS (alignment-based) palette ---
         # Used after analyze() for pitches that carry an `align_distance`. Both
-        # bounds scale with the recording's string-edit tolerance: green within
-        # `tolerance` semitones of the aligned score note, then ramps green->red
-        # out to ALIGN_MAX_MULT * tolerance (insertions, stored as inf, clamp to
+        # bounds scale with the recording's string-edit pitch_tolerance: green
+        # within that many semitones of the aligned score note, then ramps
+        # green->red out to ALIGN_MAX_MULT * pitch_tolerance (insertions clamp to
         # the max bucket => solid red). Rebuilt per-recording in load_user().
         self.ALIGN_MAX_MULT = 4.0
         self.align_distance_brushes = []
@@ -414,7 +414,7 @@ class GuitarHero(QWidget):
         self.score_data = recording.score_data
         self.alignment = recording.alignment
         # green band + red ramp track this recording's string-edit tolerance
-        self._build_align_brushes(tolerance=recording.config.tolerance)
+        self._build_align_brushes(tolerance=recording.config.pitch_tolerance)
         self.clear_highlight()
         self.update_view_items()
 
@@ -776,7 +776,14 @@ class GuitarHero(QWidget):
             notes.append(mistake.user_note)
         elif mistake.type == "deletion":
             notes.append(mistake.midi_note)
+        else:
+            # timing mistakes (early / late / short / long): both notes exist, so
+            # box them both to make the onset/duration discrepancy visible.
+            notes.extend(n for n in (mistake.user_note, mistake.midi_note)
+                         if n is not None)
 
+        if not notes:
+            return
         med_time = np.mean([0.5*(n.start_time + n.end_time) for n in notes])
         self.move_plot(med_time)
         starts = np.array([n.start_time for n in notes], dtype=np.float64)
@@ -813,10 +820,9 @@ class GuitarHero(QWidget):
         return self.distance_brushes[idx]
 
     def _build_align_brushes(self, tolerance: float):
-        """(Re)build the post-analysis palette from the string-edit `tolerance`:
-        green within `tolerance` semitones of the aligned note, ramping green->red
-        out to ALIGN_MAX_MULT * tolerance. Both bounds scale with tolerance so a
-        looser tolerance widens the whole green->red span."""
+        """(Re)build the post-analysis palette from the string-edit
+        pitch_tolerance: green within that many semitones of the aligned note,
+        ramping green->red out to ALIGN_MAX_MULT * tolerance."""
         green_thresh = max(float(tolerance), 0.0)
         # keep at least one bucket of ramp even if tolerance is ~0
         max_dist = max(self.ALIGN_MAX_MULT * green_thresh, green_thresh + self.distance_step)

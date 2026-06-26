@@ -8,30 +8,37 @@ from ui.info.MistakeWidget import _svg_icon
 
 class ToleranceWidget(QWidget):
     """
-    Small panel beneath the MistakeWidget for tuning the string-edit
-    `tolerance` — the semitone slack within which a played note still counts as
-    correct.
+    Small panel beneath the MistakeWidget for tuning whichever tolerance belongs
+    to the current mistake tab.
 
-    Presented to the user purely in **semitones**: a graduated slider (1-5) plus
-    an editable readout that is the source of truth. The box accepts manual
-    values, including ones beyond the slider's range. The widget converts back to
-    raw `tolerance` and emits `tolerance_applied`; app.py owns the Config and
-    re-runs detect_mistakes.
+    Pitch mode presents the string-edit tolerance in semitone units. Timing mode
+    presents the post-alignment timing tolerance in seconds. In both modes the
+    line edit is the source of truth and accepts any non-negative number; the
+    slider is a bounded convenience control.
     """
-    tolerance_applied = pyqtSignal(float)  # emits the new tolerance (raw units)
+    tolerance_applied = pyqtSignal(str, float)  # mode ("pitch"/"timing"), raw value
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._HELP_TEXT = "How close to the intended note (in semitones)\nthe user can play to be counted correct.\n1 = Nearest semitone, 2 = Nearest whole step, etc."
-        # The user only ever sees/edits *semitones*. The Config stores a raw `tolerance`
-        # (the string-edit semitone slack); the two are linearly related: each whole
-        # semitone step on the slider is worth `_TOL_PER_SEMITONE` of raw tolerance.
-        #   semitones 1 2 3 4 5  <->  tolerance 0.25 0.5 0.75 1.0 1.25
+        self._PITCH_HELP_TEXT = "How close to the intended note (in semitones)\nthe user can play to be counted correct.\n1 = Nearest semitone, 2 = Nearest whole step, etc."
+        self._TIMING_HELP_TEXT = "How far off +/- the user's note can vary from the score in timing."
+        # Pitch is shown/edited in semitones. The Config stores raw
+        # pitch_tolerance (the string-edit semitone slack); the two are linearly
+        # related: each whole semitone step on the slider is worth
+        # `_TOL_PER_SEMITONE` of raw tolerance.
+        #   semitones 1 2 3 4 5  <->  pitch_tolerance 0.25 0.5 0.75 1.0 1.25
         self._TOL_PER_SEMITONE = 0.25
         self._SEMITONE_MIN = 1
         self._SEMITONE_MAX = 5
         self._DEFAULT_SEMITONES = 2  # -> 0.5 tolerance
+        self._TIMING_SLIDER_MIN = 1    # hundredths of a second, i.e. 0.01s
+        self._TIMING_SLIDER_MAX = 100  # 1.00s
+        self._DEFAULT_TIMING = 0.25
+
+        self._mode = "pitch"
+        self._pitch_tolerance = self._semitones_to_tolerance(self._DEFAULT_SEMITONES)
+        self._timing_tolerance = self._DEFAULT_TIMING
 
         self.init_ui()
     
@@ -44,7 +51,7 @@ class ToleranceWidget(QWidget):
         help_icon = _svg_icon("circle-help.svg", px=32)
         self.help_label = QLabel()
         self.help_label.setPixmap(help_icon.pixmap(QSize(14, 14)))
-        self.help_label.setToolTip(self._HELP_TEXT)
+        self.help_label.setToolTip(self._help_text())
         self.help_label.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         # hover tooltips can silently fail to appear on macOS (see below), so the
         # icon is also clickable: a click forces the same text into a small popup.
@@ -52,14 +59,10 @@ class ToleranceWidget(QWidget):
         self.help_label.installEventFilter(self)
         layout.addWidget(self.help_label)
 
-        layout.addWidget(QLabel("Tolerance:"))
+        self.label = QLabel("Tolerance:")
+        layout.addWidget(self.label)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setMinimum(self._SEMITONE_MIN)
-        self.slider.setMaximum(self._SEMITONE_MAX)
-        self.slider.setSingleStep(1)
-        self.slider.setPageStep(1)
-        self.slider.setValue(self._DEFAULT_SEMITONES)
 
         # square off the round themed handle into a rectangle
         self._ACCENT = "#8ab4f8" # match qdarktheme
@@ -73,12 +76,10 @@ class ToleranceWidget(QWidget):
         self.slider.valueChanged.connect(self._on_slider_changed)
         layout.addWidget(self.slider, 1)
 
-        # editable semitone readout — the source of truth on Apply.
+        # editable readout — the source of truth on Apply.
         self.value_box = QLineEdit()
         self.value_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.value_box.setFixedWidth(48)
-        self.value_box.setToolTip("Tolerance in semitones")
-        self.value_box.setText(self._fmt(self._DEFAULT_SEMITONES))
         self.value_box.editingFinished.connect(self._on_text_edited)
         layout.addWidget(self.value_box)
 
@@ -92,6 +93,7 @@ class ToleranceWidget(QWidget):
 
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.setMaximumHeight(self.sizeHint().height())
+        self._refresh_controls()
 
     def eventFilter(self, obj, event):
         """Clicking the help icon shows its text in a small popup, right on top
@@ -99,60 +101,122 @@ class ToleranceWidget(QWidget):
         if obj is self.help_label and event.type() == QEvent.Type.MouseButtonPress:
             QToolTip.showText(
                 self.help_label.mapToGlobal(self.help_label.rect().topLeft()),
-                self._HELP_TEXT,
+                self._help_text(),
                 self.help_label,
             )
             return True
         return super().eventFilter(obj, event)
 
     @staticmethod
-    def _fmt(semitones: float) -> str:
-        return f"{semitones:g}"
+    def _fmt(value: float) -> str:
+        return f"{value:g}"
 
-    def _read_semitones(self):
+    def _read_display_value(self):
         """Parse the box (the source of truth); None if blank/invalid/negative."""
         try:
-            semitones = float(self.value_box.text().strip())
+            value = float(self.value_box.text().strip())
         except ValueError:
             return None
-        return semitones if semitones >= 0 else None
+        return value if value >= 0 else None
 
-    def set_tolerance(self, tolerance: float):
-        """Reflect the active recording's current tolerance in the box + slider
-        (no emit). Box is authoritative; slider clamps to its range."""
-        semitones = self._tolerance_to_semitones(tolerance)
-        self.value_box.setText(self._fmt(semitones))
-        self._sync_slider_to(semitones)
+    def set_mode(self, mode: str):
+        """Show the pitch or timing tolerance controls without emitting."""
+        if mode not in ("pitch", "timing") or mode == self._mode:
+            return
+        self._mode = mode
+        self._refresh_controls()
 
-    def _sync_slider_to(self, semitones: float):
-        """Move the slider to match `semitones`, clamped to its range, without
+    def set_pitch_tolerance(self, tolerance: float):
+        self._pitch_tolerance = max(0.0, float(tolerance))
+        if self._mode == "pitch":
+            self._refresh_controls()
+
+    def set_timing_tolerance(self, tolerance: float):
+        self._timing_tolerance = max(0.0, float(tolerance))
+        if self._mode == "timing":
+            self._refresh_controls()
+
+    def set_tolerances(self, pitch_tolerance: float, timing_tolerance: float):
+        self._pitch_tolerance = max(0.0, float(pitch_tolerance))
+        self._timing_tolerance = max(0.0, float(timing_tolerance))
+        self._refresh_controls()
+
+    def _refresh_controls(self):
+        self.label.setText("Tolerance (s):" if self._mode == "timing" else "Tolerance:")
+        self.help_label.setToolTip(self._help_text())
+        self.value_box.setToolTip(
+            "Timing tolerance in seconds"
+            if self._mode == "timing"
+            else "Pitch tolerance in semitones"
+        )
+        self.slider.blockSignals(True)
+        if self._mode == "timing":
+            self.slider.setMinimum(self._TIMING_SLIDER_MIN)
+            self.slider.setMaximum(self._TIMING_SLIDER_MAX)
+            self.slider.setSingleStep(1)
+            self.slider.setPageStep(10)
+        else:
+            self.slider.setMinimum(self._SEMITONE_MIN)
+            self.slider.setMaximum(self._SEMITONE_MAX)
+            self.slider.setSingleStep(1)
+            self.slider.setPageStep(1)
+        value = self._display_value()
+        self.value_box.setText(self._fmt(value))
+        self._sync_slider_to(value)
+        self.slider.blockSignals(False)
+
+    def _display_value(self) -> float:
+        if self._mode == "timing":
+            return self._timing_tolerance
+        return self._tolerance_to_semitones(self._pitch_tolerance)
+
+    def _sync_slider_to(self, display_value: float):
+        """Move the slider to match `display_value`, clamped to its range, without
         looping back into the box (values past the range stay only in the box)."""
-        clamped = round(min(max(semitones, self._SEMITONE_MIN), self._SEMITONE_MAX))
-        blocked = self.slider.blockSignals(True)
-        self.slider.setValue(clamped)
-        self.slider.blockSignals(blocked)
+        if self._mode == "timing":
+            slider_value = round(display_value * 100)
+            clamped = min(max(slider_value, self._TIMING_SLIDER_MIN), self._TIMING_SLIDER_MAX)
+        else:
+            clamped = round(min(max(display_value, self._SEMITONE_MIN), self._SEMITONE_MAX))
+        self.slider.setValue(int(clamped))
 
-    def _on_slider_changed(self, semitones: int):
+    def _on_slider_changed(self, value: int):
         # user dragged the slider -> it becomes the source of truth.
-        self.value_box.setText(self._fmt(semitones))
+        display_value = value / 100.0 if self._mode == "timing" else float(value)
+        self.value_box.setText(self._fmt(display_value))
 
     def _on_text_edited(self):
-        semitones = self._read_semitones()
-        if semitones is None:
+        value = self._read_display_value()
+        if value is None:
             return
-        self._sync_slider_to(semitones)
+        blocked = self.slider.blockSignals(True)
+        self._sync_slider_to(value)
+        self.slider.blockSignals(blocked)
 
     def _on_apply(self):
-        semitones = self._read_semitones()
-        if semitones is None:
+        value = self._read_display_value()
+        if value is None:
             QMessageBox.warning(
                 self, "Invalid tolerance",
-                "Enter a non-negative number of semitones (e.g. 2).",
+                "Enter a non-negative number.",
             )
             return
-        self.tolerance_applied.emit(self._semitones_to_tolerance(semitones))
+        tolerance = self._display_to_tolerance(value)
+        if self._mode == "timing":
+            self._timing_tolerance = tolerance
+        else:
+            self._pitch_tolerance = tolerance
+        self.tolerance_applied.emit(self._mode, tolerance)
 
     # helper helpers
+    def _help_text(self) -> str:
+        return self._TIMING_HELP_TEXT if self._mode == "timing" else self._PITCH_HELP_TEXT
+
+    def _display_to_tolerance(self, value: float) -> float:
+        if self._mode == "timing":
+            return value
+        return self._semitones_to_tolerance(value)
+
     def _semitones_to_tolerance(self, semitones: float) -> float:
         return semitones * self._TOL_PER_SEMITONE
     def _tolerance_to_semitones(self, tolerance: float) -> float:

@@ -22,11 +22,17 @@ class Config:
     ins_cost: float = 5
     del_cost: float = 5
     sub_cost: float = 1
-    tolerance: float = 0.5
+    pitch_tolerance: float = 0.5
 
     # tiger-mom parameter
     tiger_level: int = 1
     min_close: int = 10 # min number of close frames to consider split viable
+
+    # --- TIMING FEEDBACK PARAMETERS ---
+    # Threshold for post-alignment timing mistakes. A matched note is flagged
+    # early/late when its onset is off by more than this many seconds, and
+    # short/long when its duration differs by more than this many seconds.
+    timing_tolerance: float = 0.25
 
     # --- loader ---
     def load_config(self, config: dict):
@@ -47,10 +53,21 @@ class Config:
         self.ins_cost = config.get("ins_cost", self.ins_cost)
         self.del_cost = config.get("del_cost", self.del_cost)
         self.sub_cost = config.get("sub_cost", self.sub_cost)
-        self.tolerance = config.get("tolerance", self.tolerance)
+        self.pitch_tolerance = config.get(
+            "pitch_tolerance",
+            config.get("tolerance", self.pitch_tolerance),
+        )
 
         self.tiger_level = config.get("tiger_level", self.tiger_level)
         self.min_close = config.get("min_close", self.min_close)
+
+        self.timing_tolerance = config.get(
+            "timing_tolerance",
+            config.get(
+                "timing_onset_tol",
+                config.get("timing_dur_tol", self.timing_tolerance),
+            ),
+        )
     # --- pitch conversion methods ---
     def freq_to_midi(self, freq: float) -> float:
         """
@@ -71,4 +88,4 @@ class Config:
     def __repr__(self):
         return (f"Config\n---\n   sr={self.sr}, w1={self.w1}, h1={self.h1}, fmin={self.fmin}, fmax={self.fmax}, tuning={self.tuning}, unv_thresh={self.unv_thresh},\n"
                 f"   w2={self.w2}, h2={self.h2}, pitch_thresh={self.pitch_thresh}, slope_thresh={self.slope_thresh:.3f}, unv_ratio={self.unv_ratio},\n"
-                f"   ins_cost={self.ins_cost}, del_cost={self.del_cost}, sub_cost={self.sub_cost}, tolerance={self.tolerance}, tiger_level={self.tiger_level}")
+                f"   ins_cost={self.ins_cost}, del_cost={self.del_cost}, sub_cost={self.sub_cost}, pitch_tolerance={self.pitch_tolerance}, timing_tolerance={self.timing_tolerance}, tiger_level={self.tiger_level}")

@@ -4,7 +4,7 @@ from pathlib import Path
 from app_logic.user.ds.AudioData import AudioData
 from app_logic.user.ds.PitchData import PitchData, Pitch
 from app_logic.midi.ScoreData import ScoreData
-from app_logic.Alignment import Alignment
+from app_logic.Alignment import Alignment, Mistake
 from app_logic.NoteData import NoteData
 from app_logic.user.ds.Buffer import Buffer
 from app_logic.JsonHandler import JsonHandler
@@ -40,6 +40,7 @@ class Recording:
         self.pitch_data = PitchData(config=self.config)
         self.note_data = NoteData()
         self.alignment: Alignment = Alignment(config=self.config) # filled in later
+        self.timing_mistakes: list[Mistake] = [] # derived from alignment in analyze
         self.overridden_mistake_indices = set()
 
         # Persistence metadata. Folder/library entries point at files until their
@@ -157,6 +158,7 @@ class Recording:
         """Re-init analysis-derived data structures. Called before re-analyze() in app."""
         self.note_data = NoteData()
         self.alignment = Alignment(config=self.config)
+        self.timing_mistakes = []
         self.overridden_mistake_indices = set()
 
     def detect_pitches(self, on_phase=None):
@@ -223,6 +225,75 @@ class Recording:
         nd, alignment = self.mistake_checker.check_mistakes(recording=self)
         self.note_data = nd
         self.alignment = alignment
+        self.reindex_mistakes()
+
+    def reindex_mistakes(self):
+        """Refresh mistake -> alignment-pair indices after note correction.
+
+        Pitch mistakes live on Alignment. Timing mistakes are derived separately,
+        but they still point at the same final alignment pairs for highlighting
+        and future bookkeeping.
+        """
+        if self.alignment is None:
+            return
+        self.alignment.reindex_mistakes()
+        self.alignment.reapply_overrides(self.overridden_mistake_indices)
+        if self.timing_mistakes:
+            self.alignment.reindex_mistakes(self.timing_mistakes)
+
+    def detect_timing_mistakes(self) -> list[Mistake]:
+        """Derive per-note TIMING mistakes (early / late / short / long) from the
+        current alignment, store them on `self.timing_mistakes`, and return them.
+        A pipeline step run by analyze() right after detect_mistakes()/correction
+        (it reads the final `alignment.pairs`). Pure post-processing — no new DSP
+        and no pitch detection, so it's safe to call any time an alignment exists
+        (returns [] before analysis). Drives the MistakeWidget's Timing tab; the
+        same deviations are already shown visually in GuitarHero.
+
+        Only MATCHED pairs (both notes present — string-edit goods *and*
+        substitutions) have a well-defined timing comparison; insertions and
+        deletions have no partner to compare against and are skipped. A note can
+        yield multiple timing mistakes; for example, a note whose onset is late
+        and whose duration is too long gets both rows in the Timing tab.
+
+        NOTE these are RELATIVE deviations. resize() normalizes the take's global
+        tempo to the score and co-anchors the first voiced note at the origin, so
+        this measures rubato / timing *consistency* within the piece, not an
+        absolute "you played the whole thing too fast". The first matched note
+        therefore sits near 0 offset by construction."""
+        timing_tol = max(0.0, float(self.config.timing_tolerance))
+        mistakes: list[Mistake] = []
+        for pair_index, (user_note, score_note) in enumerate(self.alignment.pairs):
+            if user_note is None or score_note is None:
+                continue  # insertion / deletion: no pair to compare timing against
+
+            onset_off = user_note.start_time - score_note.start_time  # + = late
+            user_dur = max(1e-9, user_note.end_time - user_note.start_time)
+            score_dur = max(1e-9, score_note.end_time - score_note.start_time)
+            dur_off = user_dur - score_dur  # + = too long, - = too short
+
+            if abs(onset_off) > timing_tol:
+                m = Mistake(
+                    type="late" if onset_off > 0 else "early",
+                    user_note=user_note,
+                    midi_note=score_note,
+                )
+                m.info = f"{onset_off:+.2f}s"
+                m.set_pair_index(pair_index)
+                mistakes.append(m)
+
+            if abs(dur_off) > timing_tol:
+                m = Mistake(
+                    type="long" if dur_off > 0 else "short",
+                    user_note=user_note,
+                    midi_note=score_note,
+                )
+                m.info = f"{dur_off:+.2f}s"
+                m.set_pair_index(pair_index)
+                mistakes.append(m)
+        self.timing_mistakes = mistakes
+        self.reindex_mistakes()
+        return mistakes
 
     def write_data(self, indata: np.ndarray, start_time: float):
         """write indata to the audio_data at the given start_time
@@ -301,27 +372,40 @@ class Recording:
         return nd.times[0] if nd and nd.times else 0.0
 
     def resize(self, new_length: float):
-        """Stretch the score to match the take (`new_length` = the take's voiced
-        span, rec.end - rec.start), and slide the take so the two line up.
+        """Stretch the score so its NOTE SPAN matches the take (`new_length` =
+        the take's voiced note span, rec.get_length(raw=False)), and slide the
+        take so the two line up.
 
         When CLIPPED, only the clipped span is matched to the take (not the whole
         score) and both are anchored at t=0 — see _resize_to_clip. Otherwise the
-        whole score is stretched and the take slides onto the score's first note."""
+        score's note span is stretched and the take slides onto the score's first
+        note (so its last voiced note lands on the last score note's end)."""
         if self.score_data.clip is not None:
             self._resize_to_clip(new_length, self.score_data.clip)
             return
 
-        # Derive the target bpm against the ORIGINAL length/tempo and let
-        # change_tempo recompute the stretch factor from it (factor defaults to
-        # bpm_og / new_bpm). This makes a resize behave exactly like a manual
-        # tempo change, keeping self.bpm and self.length in the strict 1/bpm
-        # relationship the score-viewer's bpm/bpm_og time mapping relies on.
-        factor = new_length / self.score_data.midi_data.length_og
-        new_bpm = round(self.score_data.bpm_og / factor)
+        # Stretch so the score's NOTE SPAN (first note start -> last note end)
+        # equals the take — NOT midi_data.length_og. The MIDI carries trailing
+        # slack past the last note (a final rest / metronome tail; e.g. the demo
+        # scale's notes span 8.0s inside an 8.5s MIDI), so stretching the TOTAL
+        # length left the notes short and every note drifted progressively 'late'
+        # toward the end. new_bpm = bpm * note_span / new_length mirrors
+        # _resize_to_clip (change_tempo divides bpm_og out, so the current bpm is
+        # the right thing to scale).
+        sd = self.score_data
+        nd = sd.note_datas[self.active_instrument]
+        if new_length <= 0 or not nd.times:
+            return
+        note_span = (nd.read_note(i=len(nd.times) - 1).end_time
+                     - nd.read_note(i=0).start_time)
+        if note_span <= 0:
+            return
+        new_bpm = max(1, round(sd.bpm * note_span / new_length))
+        sd.change_tempo(new_bpm)
 
-        self.score_data.change_tempo(new_bpm)
-        # Keep the score fixed and slide the TAKE instead, so its first voiced note
-        # lands on the score's first note.
+        # Keep the score fixed and slide the TAKE instead, so its first voiced
+        # NOTE lands on the score's first note. With the note span matched above,
+        # the last voiced note then lands on the last score note's end.
         first = self._get_first_note(voiced=True)
         if first != 0:
             self.shift(self._clip_start_time() - first.start_time)
@@ -330,9 +414,10 @@ class Recording:
     def _resize_to_clip(self, new_length: float, clip: tuple[int, int]):
         """Clip-aware resize, in this exact order:
           1. stretch the WHOLE score to a bpm so the CLIPPED span matches the take
-             (note(clip[1]).end - note(clip[0]).start == new_length == rec.end-rec.start),
+             (note(clip[1]).end - note(clip[0]).start == new_length == the take's
+             voiced NOTE span, rec.get_length(raw=False)),
           2. translate the score so the clip's first note starts at t=0,
-          3. slide the take so its first voiced pitch also starts at t=0.
+          3. slide the take so its first voiced note also starts at t=0.
         So the clip and the take are co-anchored at the origin. The clip indices
         ride along the tempo rebuild; clip_bounds() re-derives the [0, new_length]
         window. (The GuitarHero overlay is redrawn by the caller — see analyze.)"""
@@ -353,7 +438,9 @@ class Recording:
         nd = sd.note_datas[self.active_instrument]
         sd.transpose_notes(-nd.read_note(i=i0).start_time)
 
-        # 3) slide the take so its first voiced pitch starts at t=0
+        # 3) slide the take so its first voiced NOTE starts at t=0 (so the take's
+        # first/last voiced note map onto the clip's first-note start / last-note
+        # end — the clip span was matched to the take's note span above).
         first = self._get_first_note(voiced=True)
         if first != 0:
             self.shift(-first.start_time)

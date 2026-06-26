@@ -4,8 +4,9 @@ from PyQt6.QtCore import Qt, QRectF, QSize, QEvent, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
-    QStyledItemDelegate, QStyle, QStyleOptionViewItem, QApplication,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QTreeWidget,
+    QTreeWidgetItem, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
+    QApplication,
 )
 from app_logic.Alignment import Mistake
 
@@ -51,6 +52,12 @@ class _CenteredIconDelegate(QStyledItemDelegate):
         self._icon_px = icon_px
         self._override_brush = override_brush
         self._override_fg = override_fg
+
+    def set_icon_columns(self, columns: set[int]):
+        """Which columns draw a centered icon vs. text. The set changes per
+        MistakeWidget mode: the Type column is icon-only for pitch mistakes but
+        holds a text label ("Too long" etc.) for timing mistakes."""
+        self._columns = set(columns)
 
     def paint(self, painter, option, index):
         overridden = bool(index.data(_OVERRIDE_ROLE))
@@ -147,28 +154,58 @@ def _format_time(seconds: float) -> str:
 
 class MistakeWidget(QWidget):
     """
-    Right-side panel listing all analyzed mistakes for the active recording.
+    Right-side panel listing the analyzed mistakes for the active recording, with
+    a "Mistakes:" Pitch / Timing dropdown that swaps which kind is shown (both
+    share this one tree). Row indices always refer to the list currently *in
+    view* — read it back with mistakes_in_view() rather than indexing
+    alignment.mistakes.
 
-    Columns: Index | Time | Type | Intended | Actual | Override
+    PITCH mode columns:  Index | Time | Type | Intended | Actual | Override
+      Type is an icon: plus (insertion), minus (deletion), flat/sharp
+      (substitution, depending on whether the user played under/over the target).
 
-    The Type column shows an icon instead of text: a plus for an insertion, a
-    minus for a deletion, and a musical flat / sharp for a substitution
-    (depending on whether the user played under or over the target pitch). The
-    Override column is an icon too: a trash-can to override (dismiss)
-    a flagged mistake, and an undo arrow to take that back.
+    TIMING mode columns: Index | Time | Type | Note | Amount | Override
+      Type is a TEXT label ("Too long" / "Too short" / "Early" / "Late"). Amount
+      is a signed-seconds deviation (onset offset for early/late, duration
+      difference for too long/short). Timing mistakes are derived post-alignment
+      (Recording.detect_timing_mistakes).
 
-    Both icon columns are rendered via item decorations + a centered-icon
-    delegate (rather than an embedded widget per row). This avoids the macOS-
-    specific GPU pressure of creating N native widgets when there are many
-    mistakes — which on long pieces was starving the QtWebEngine GPU process and
-    causing segfaults on resize/repaint.
+    Both modes share an Override column: a trash-can to dismiss a flagged mistake,
+    an undo arrow to undo. The Type/Override icon cells are rendered via item
+    decorations + a centered-icon delegate (rather than an embedded widget per
+    row). This avoids the macOS-specific GPU pressure of creating N native widgets
+    when there are many mistakes — which on long pieces was starving the
+    QtWebEngine GPU process and causing segfaults on resize/repaint. (The Type
+    column is text, not an icon, in timing mode — the delegate's icon-column set
+    is swapped per mode, see _apply_headers.)
     """
-    selected = pyqtSignal(int)         # emits mistake index on row click
-    override_toggled = pyqtSignal(int) # emits mistake index when Override cell is clicked
+    selected = pyqtSignal(int)         # emits row index (into the in-view list) on row click
+    override_toggled = pyqtSignal(int) # emits row index (into the in-view list) when Override cell is clicked
     cleared = pyqtSignal()             # emits when the selection is cleared (e.g. click empty space)
+    mode_changed = pyqtSignal(str)     # "pitch" or "timing"
 
     _TYPE_COL = 2
     _OVERRIDE_COL = 5
+
+    # mistake.type values that belong to the Timing tab, mapped to their labels
+    _TIMING_LABELS = {"long": "Too long", "short": "Too short",
+                      "early": "Early", "late": "Late"}
+    _TIMING_TYPES = frozenset(_TIMING_LABELS)
+
+    # per-mode column widths (each sums to the same total so the fixed-width panel
+    # stays valid); timing needs a wider Type for the text labels.
+    _PITCH_WIDTHS = [34, 50, 38, 72, 64, 36]
+    _TIMING_WIDTHS = [34, 50, 70, 42, 62, 36]
+    _COMBO_STYLE = """
+        QComboBox {
+            padding-left: 6px;
+            padding-right: 22px;
+        }
+        QComboBox QAbstractItemView::item {
+            padding: 2px 8px 2px 6px;
+            min-height: 24px;
+        }
+    """
 
     # translucent dark tint laid over an overridden (dismissed) row so it reads
     # as "set aside" — pairs with the green highlight the same note gets in
@@ -182,7 +219,12 @@ class MistakeWidget(QWidget):
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(6, 6, 6, 6)
 
+        # the list currently shown in the tree (pitch or timing); kept in sync by
+        # _populate so refresh_override / mistakes_in_view stay mode-correct
         self._mistakes: list[Mistake] = []
+        self._pitch_mistakes: list[Mistake] = []
+        self._timing_mistakes: list[Mistake] = []
+        self._timing_mode = False
 
         # icons are fixed, so build them once and share across rows
         self._icons = {
@@ -199,31 +241,43 @@ class MistakeWidget(QWidget):
         self.init_signals()
 
     def init_ui(self):
-        self.header_label = QLabel("Mistakes")
-        self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._layout.addWidget(self.header_label)
+        # "Mistakes:" + a dropdown to pick Pitch vs Timing, on one line. Combo
+        # index 0 == Pitch, 1 == Timing (mirrors self._timing_mode).
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        self.header_label = QLabel("Mistakes:")
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItems(["Pitch", "Timing"])
+        # size the combo (button + popup) to its widest item so neither truncates
+        self._mode_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._mode_combo.setMinimumContentsLength(
+            max(len(self._mode_combo.itemText(i))
+                for i in range(self._mode_combo.count())))
+        self._mode_combo.setStyleSheet(self._COMBO_STYLE)
+        self._fit_mode_combo_to_contents()
+        header_row.addWidget(self.header_label)
+        header_row.addWidget(self._mode_combo)
+        header_row.addStretch(1)
+        self._layout.addLayout(header_row)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(6)
         self.tree.setHeaderLabels(["#", "Time", "Type", "Intended", "Actual", ""])
         self.tree.setIndentation(0)
         self.tree.setRootIsDecorated(False)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.tree.setIconSize(QSize(20, 20))
-        self.tree.setItemDelegate(
-            _CenteredIconDelegate(
-                {self._TYPE_COL, self._OVERRIDE_COL},
-                self._OVERRIDE_BG,
-                self._OVERRIDE_FG,
-                parent=self.tree,
-            )
+        self._delegate = _CenteredIconDelegate(
+            {self._TYPE_COL, self._OVERRIDE_COL},
+            self._OVERRIDE_BG,
+            self._OVERRIDE_FG,
+            parent=self.tree,
         )
+        self.tree.setItemDelegate(self._delegate)
 
-        self.tree.setColumnWidth(0, 24)   # "#"        — 1-2 digit index
-        self.tree.setColumnWidth(1, 50)   # "Time"     — "59:59" or "45.67"
-        self.tree.setColumnWidth(2, 38)   # "Type"     — icon only
-        self.tree.setColumnWidth(3, 72)   # "Intended" — header is the wide element
-        self.tree.setColumnWidth(4, 64)   # "Actual"
-        self.tree.setColumnWidth(5, 36)   # pencil     — icon only
+        for col, w in enumerate(self._PITCH_WIDTHS):  # pitch is the default mode
+            self.tree.setColumnWidth(col, w)
 
         # prevent the last column from stretching to fill remaining header width
         self.tree.header().setStretchLastSection(False)
@@ -243,6 +297,7 @@ class MistakeWidget(QWidget):
         self.setMaximumWidth(content_width)
 
     def init_signals(self):
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         self.tree.itemClicked.connect(self._on_item_clicked)
         # clicking empty space in the tree should clear the selection (and thus the
@@ -251,7 +306,30 @@ class MistakeWidget(QWidget):
 
     # --- PUBLIC API ---
     def load_mistakes(self, mistakes: list[Mistake]):
-        """Populate the tree with a new list of mistakes."""
+        """Set the PITCH mistake list (and show it if Pitch mode is active)."""
+        self._pitch_mistakes = mistakes
+        if not self._timing_mode:
+            self._populate(mistakes)
+
+    def load_timing_mistakes(self, mistakes: list[Mistake]):
+        """Set the TIMING mistake list (and show it if Timing mode is active)."""
+        self._timing_mistakes = mistakes
+        if self._timing_mode:
+            self._populate(mistakes)
+
+    def mistakes_in_view(self) -> list[Mistake]:
+        """The list the tree is currently showing — what a `selected` index maps
+        to. Use this rather than indexing alignment.mistakes, since Timing-mode
+        rows aren't part of that list."""
+        return self._mistakes
+
+    def is_timing_mode(self) -> bool:
+        """True when the Timing list is shown (so the host overrides the right
+        list: timing mistakes vs. alignment.mistakes)."""
+        return self._timing_mode
+
+    def _populate(self, mistakes: list[Mistake]):
+        """Render `mistakes` into the tree, replacing whatever was there."""
         self._mistakes = mistakes
         self.tree.clear()
         # Batch the inserts: addTopLevelItems is much cheaper than N calls
@@ -259,12 +337,24 @@ class MistakeWidget(QWidget):
         items = [self._make_item(idx, m) for idx, m in enumerate(mistakes)]
         self.tree.addTopLevelItems(items)
 
+    def _fit_mode_combo_to_contents(self):
+        metrics = self._mode_combo.fontMetrics()
+        width = max(
+            metrics.horizontalAdvance(self._mode_combo.itemText(i))
+            for i in range(self._mode_combo.count())
+        ) + 46
+        self._mode_combo.setMinimumWidth(width)
+        self._mode_combo.view().setMinimumWidth(width)
+        self._mode_combo.view().setTextElideMode(Qt.TextElideMode.ElideNone)
+
     def clear(self):
         self._mistakes = []
+        self._pitch_mistakes = []
+        self._timing_mistakes = []
         self.tree.clear()
 
     def refresh_override(self, idx: int):
-        """Update the override-cell appearance for a single mistake."""
+        """Update the override-cell appearance for a single mistake (in-view list)."""
         if not (0 <= idx < len(self._mistakes)):
             return
         item = self.tree.topLevelItem(idx)
@@ -293,6 +383,8 @@ class MistakeWidget(QWidget):
         return self._icons["sharp"], "Substitution (played sharp)"
 
     def _make_item(self, idx: int, mistake: Mistake) -> QTreeWidgetItem:
+        if mistake.type in self._TIMING_TYPES:
+            return self._make_timing_item(idx, mistake)
         #time is based on the MIDI Note rather than the user note
         time = _format_time(mistake.midi_note.start_time) if mistake.midi_note else "—"
         intended = "—" if mistake.type == "insertion" else self._note_name(mistake.midi_note)
@@ -307,6 +399,20 @@ class MistakeWidget(QWidget):
         item.setIcon(self._TYPE_COL, type_icon)
         item.setToolTip(self._TYPE_COL, type_tip)
 
+        self._set_override_cell(item, mistake.is_overridden())
+        return item
+
+    def _make_timing_item(self, idx: int, mistake: Mistake) -> QTreeWidgetItem:
+        """Build a Timing-mode row: # | Time | Type(text) | Note | Amount | Override.
+        A timing mistake is always a matched pair, so both notes share a pitch —
+        we show that note name once and the signed-seconds deviation as Amount."""
+        time = _format_time(mistake.midi_note.start_time) if mistake.midi_note else "—"
+        note = self._note_name(mistake.midi_note)
+        label = self._TIMING_LABELS.get(mistake.type, mistake.type)
+        item = QTreeWidgetItem([str(idx), time, label, note, mistake.info, ""])
+        item.setData(0, Qt.ItemDataRole.UserRole, idx)
+        for col in range(6):
+            item.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
         self._set_override_cell(item, mistake.is_overridden())
         return item
 
@@ -339,6 +445,43 @@ class MistakeWidget(QWidget):
         idx = item.data(0, Qt.ItemDataRole.UserRole)
         if idx is not None:
             self.override_toggled.emit(idx)
+
+    def _on_mode_changed(self, index: int):
+        """Switch the tree between the Pitch and Timing lists. Repopulating clears
+        the selection (so GuitarHero drops its highlight via `cleared`)."""
+        self._timing_mode = (index == 1)
+        self._apply_headers()
+        self._populate(self._timing_mistakes if self._timing_mode else self._pitch_mistakes)
+        self.mode_changed.emit("timing" if self._timing_mode else "pitch")
+
+    def _apply_headers(self):
+        """Swap the column headers, header tooltips, column widths, and the
+        delegate's icon-column set to match the active mode. Both modes keep the
+        Override column (pencil header icon); only timing makes Type a text
+        column."""
+        if self._timing_mode:
+            self.tree.setHeaderLabels(["#", "Time", "Type", "Note", "Amount", ""])
+            widths = self._TIMING_WIDTHS
+            icon_cols = {self._OVERRIDE_COL}            # Type is text in timing mode
+            type_tip = "The type of timing mistake the user made"
+            note_tip = "The note the user played"
+        else:
+            self.tree.setHeaderLabels(["#", "Time", "Type", "Intended", "Actual", ""])
+            widths = self._PITCH_WIDTHS
+            icon_cols = {self._TYPE_COL, self._OVERRIDE_COL}
+            type_tip = note_tip = ""
+        # setHeaderLabels REBUILDS the header item, so (re)apply everything that
+        # lives on it afterwards: the override pencil icon + its tooltip, the
+        # per-mode column tooltips, and centered alignment.
+        header = self.tree.headerItem()
+        header.setIcon(self._OVERRIDE_COL, self._icons["pencil"])
+        header.setToolTip(self._OVERRIDE_COL, "Override the user mistake")
+        header.setToolTip(self._TYPE_COL, type_tip)
+        header.setToolTip(3, note_tip)  # "Note" / "Intended" column
+        self.tree.header().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._delegate.set_icon_columns(icon_cols)
+        for col, w in enumerate(widths):
+            self.tree.setColumnWidth(col, w)
 
     def eventFilter(self, obj, event):
         # a press on empty tree space (no item under the cursor) clears the

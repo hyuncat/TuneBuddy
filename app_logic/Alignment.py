@@ -10,6 +10,10 @@ class Mistake:
         self.midi_note = midi_note
         self.overridden = False
         self.pair_index = -1
+        # human-readable signed-seconds magnitude for display (e.g. "+0.18s" /
+        # "-0.25s") — onset offset for early/late, duration difference for
+        # too long/short. Used by timing mistakes; empty for pitch mistakes.
+        self.info = ""
 
     def is_overridden(self) -> bool:
         return bool(self.overridden)
@@ -46,13 +50,14 @@ class Alignment:
 
         # our time-indexable {t: (n,m)} dictionary
         # is there any way to make each just store a reference or smth?...
-        if notes and mistakes:
+        if notes:
             self.init_2(notes)
         else:
             self.pairs_1, self.pairs_2 = {}, {}
             self.times_1, self.times_2 = [], []
             self.match_user, self.match_score = {}, {}
-        self.THRESH = 1 # same as StringEditor.TOLERANCE
+        self.THRESH = self.config.pitch_tolerance # same as StringEditor.TOLERANCE
+        self.reindex_mistakes()
 
     def load_alignment(self, notes: list[tuple[Note, Note]], mistakes: list[Mistake]):
         """load in the alignment data, and initialize the pairs dictionaries for time indexing"""
@@ -60,6 +65,61 @@ class Alignment:
         self.mistakes = mistakes
         self.overridden_pair_indices = set()
         self.init_2(notes)
+        self.reindex_mistakes()
+
+    def reindex_mistakes(self, mistakes: list[Mistake] | None = None):
+        """Refresh each mistake's pair_index from the current pair list.
+
+        Mistake correction rebuilds note data and alignments, so a pair index that
+        was correct before correction can point at the wrong row afterward. This
+        derives indices from the actual note objects/times after the final
+        alignment exists.
+        """
+        target = self.mistakes if mistakes is None else mistakes
+        for mistake in target:
+            pair_index = self.pair_index_for_mistake(mistake)
+            mistake.set_pair_index(pair_index if pair_index is not None else -1)
+
+    def pair_index_for_mistake(self, mistake: Mistake) -> int | None:
+        if mistake.type == "insertion":
+            for i, (user_note, midi_note) in enumerate(self.pairs):
+                if midi_note is None and self._same_note(user_note, mistake.user_note):
+                    return i
+            for i, (user_note, _) in enumerate(self.pairs):
+                if self._same_note(user_note, mistake.user_note):
+                    return i
+            return None
+
+        if mistake.type == "deletion":
+            for i, (user_note, midi_note) in enumerate(self.pairs):
+                if user_note is None and self._same_note(midi_note, mistake.midi_note):
+                    return i
+            for i, (_, midi_note) in enumerate(self.pairs):
+                if self._same_note(midi_note, mistake.midi_note):
+                    return i
+            return None
+
+        for i, (user_note, midi_note) in enumerate(self.pairs):
+            if (self._same_note(user_note, mistake.user_note)
+                    and self._same_note(midi_note, mistake.midi_note)):
+                return i
+        return None
+
+    @staticmethod
+    def _same_note(a: Note | None, b: Note | None) -> bool:
+        if a is b:
+            return True
+        if a is None or b is None:
+            return False
+        if getattr(a, "id", None) == getattr(b, "id", None):
+            if (abs(a.start_time - b.start_time) < 1e-9
+                    and abs(a.end_time - b.end_time) < 1e-9):
+                return True
+        return (
+            abs(a.start_time - b.start_time) < 1e-9
+            and abs(a.end_time - b.end_time) < 1e-9
+            and list(a.midi_num) == list(b.midi_num)
+        )
 
     def init_2(self, pairs):
         """initialize the two pairs dictionaries for faster time indexing

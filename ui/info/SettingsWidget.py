@@ -66,6 +66,16 @@ class SettingsWidget(QWidget):
 
     # the discretized note bins the range / transpose inputs auto-complete to
     _NOTE_BIN_NAMES = [midi_to_name(m) for m in range(128)]
+    _COMBO_STYLE = """
+        QComboBox {
+            padding-left: 6px;
+            padding-right: 22px;
+        }
+        QComboBox QAbstractItemView::item {
+            padding: 2px 8px 2px 6px;
+            min-height: 24px;
+        }
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -104,8 +114,14 @@ class SettingsWidget(QWidget):
 
         # --- ACTIVE INSTRUMENT SELECT ---
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(QLabel("Instrument:"))
         self.instrument_combo = QComboBox()
+        self.instrument_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.instrument_combo.setStyleSheet(self._COMBO_STYLE)
+        self.instrument_combo.view().setTextElideMode(Qt.TextElideMode.ElideNone)
         row.addWidget(self.instrument_combo, 1)
 
         self.instrument_apply = self._make_apply_button("Apply instrument")
@@ -187,6 +203,17 @@ class SettingsWidget(QWidget):
         box.setCompleter(completer)
         return box
 
+    def _fit_instrument_combo_to_contents(self):
+        if self.instrument_combo.count() == 0:
+            return
+        metrics = self.instrument_combo.fontMetrics()
+        width = max(
+            metrics.horizontalAdvance(self.instrument_combo.itemText(i))
+            for i in range(self.instrument_combo.count())
+        ) + 46
+        self.instrument_combo.setMinimumWidth(width)
+        self.instrument_combo.view().setMinimumWidth(width)
+
     def eventFilter(self, obj, event):
         """Clicking the transpose help icon shows its text in a small popup on top
         of the icon — a reliable fallback for when hover tooltips don't fire."""
@@ -261,6 +288,7 @@ class SettingsWidget(QWidget):
                 if channel == self.score_data.metronome_channel:
                     continue  # don't expose the metronome click track
                 self.instrument_combo.addItem(program_to_name(program), channel)
+        self._fit_instrument_combo_to_contents()
         self.instrument_combo.blockSignals(False)
 
     def _on_instrument_apply(self):

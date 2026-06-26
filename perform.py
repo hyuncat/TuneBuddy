@@ -124,7 +124,7 @@ class PerformTab(QWidget):
         self.guitar_hero.load_user(rec)
         self.audio_player.load_audio(rec.audio_data)
         self.audio_recorder.load_recording(rec)
-        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
+        self._refresh_mistake_widget(rec)
 
     def _wire_detector(self, rec: Recording):
         """Each recording owns its own pitch detector; connect each only once."""
@@ -214,7 +214,7 @@ class PerformTab(QWidget):
         self.audio_player.load_audio(self.recording.audio_data)
         if self.recording.has_pitch_data():
             self.guitar_hero.load_user(self.recording)
-            self.mistake_widget.load_mistakes(self.recording.alignment.mistakes)
+            self._refresh_mistake_widget(self.recording)
             self._refresh_guitar_hero_now()
             return
         self.detect_pitches()
@@ -388,13 +388,18 @@ class PerformTab(QWidget):
         rec.recompute_note_pitches()
         rec.prune_transition_notes()
 
-        # resize the score data to the new length
+        # resize the score to the take's voiced NOTE span (first->last voiced
+        # user note). resize() stretches the score's note span — first note start
+        # to last note end — not the MIDI's total length, so trailing slack past
+        # the last note doesn't leave the notes short and drifting 'late'.
         length = rec.get_length(raw=False)
         rec.resize(new_length=length)
 
         rec.detect_mistakes()
         rec.mistake_checker.mistake_correction_loop()
+        rec.reindex_mistakes()
         rec.update_alignment_distances() # color the user pitches by the final alignment
+        rec.detect_timing_mistakes()     # derive early/late/short/long from the final alignment
         rec.truncate_end()
 
         # reload every view with the fresh analysis (note/alignment may have been
@@ -409,7 +414,7 @@ class PerformTab(QWidget):
         if b is not None:
             self.slider.set_time(b[0])
         self.guitar_hero.update_clip_overlay()
-        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
+        self._refresh_mistake_widget(rec)
         JsonHandler(rec).save_cache()
 
         # the resize stretched the score to match the take => its BPM/length
@@ -418,26 +423,57 @@ class PerformTab(QWidget):
 
     def reanalyze_if_analyzed(self):
         """Re-run Analyze only if the take has already been analyzed (used after a
-        tolerance change, which only affects the string-edit step)."""
+        pitch-tolerance change, which affects the string-edit step)."""
         if self._has_analysis(warn=False):
             self.analyze()
 
     # --- MISTAKE LIST <-> GUITAR HERO ---
+    def _refresh_mistake_widget(self, rec: Recording):
+        """Push both mistake lists into the panel: the string-edit PITCH mistakes
+        and the derived TIMING mistakes (early/late/short/long). The dropdown
+        picks which is shown. Timing mistakes are computed as a step of analyze();
+        backfill them here only for an already-analyzed take loaded from cache
+        (its alignment is restored but the derived list isn't persisted)."""
+        if rec.has_analysis() and not rec.timing_mistakes:
+            rec.detect_timing_mistakes()
+        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
+        self.mistake_widget.load_timing_mistakes(rec.timing_mistakes)
+
+    def refresh_mistake_widget(self, rec: Recording | None = None):
+        """Public wrapper used by app-level controls that update derived mistakes
+        without running a full Analyze pass."""
+        rec = rec or self.recording
+        if rec is not None:
+            self._refresh_mistake_widget(rec)
+
     def on_mistake_selected(self, idx: int):
         """Triggered after a mistake is clicked in MistakeWidget.
         Calls GuitarHero to highlight the respective note(s).
-        
+
         Args:
-            idx (int): The index of the selected mistake in the MistakeWidget.
+            idx (int): row index into the list currently shown (pitch OR timing).
         """
         if self.recording is None:
             return
-        mistakes = self.recording.alignment.mistakes
+        # index the in-view list: timing rows aren't part of alignment.mistakes
+        mistakes = self.mistake_widget.mistakes_in_view()
         if 0 <= idx < len(mistakes):
             self.guitar_hero.highlight_mistake(mistakes[idx])
 
     def on_mistake_override_toggled(self, idx: int):
         if self.recording is None:
+            return
+        # idx indexes the in-view list. Timing mistakes aren't part of the
+        # alignment (no pitch recolor / pair bookkeeping); just flip their flag
+        # and grey the row. Pitch mistakes go through the recording's override
+        # machinery (persisted indices + pitch recoloring).
+        if self.mistake_widget.is_timing_mode():
+            mistakes = self.recording.timing_mistakes
+            if not (0 <= idx < len(mistakes)):
+                return
+            mistakes[idx].toggle_override()
+            self.mistake_widget.refresh_override(idx)
+            self.guitar_hero.update_highlight_override(mistakes[idx].is_overridden())
             return
         self.recording.toggle_mistake_override(idx)
         mistake = self.recording.alignment.mistakes[idx]

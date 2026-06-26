@@ -343,6 +343,14 @@ class JsonHandler:
         return {f.name: self._pack_number(getattr(config, f.name)) for f in fields(Config)}
 
     def _config_from_payload(self, payload: dict) -> Config:
+        payload = dict(payload)
+        if "pitch_tolerance" not in payload and "tolerance" in payload:
+            payload["pitch_tolerance"] = payload["tolerance"]
+        if "timing_tolerance" not in payload:
+            if "timing_onset_tol" in payload:
+                payload["timing_tolerance"] = payload["timing_onset_tol"]
+            elif "timing_dur_tol" in payload:
+                payload["timing_tolerance"] = payload["timing_dur_tol"]
         valid = {f.name for f in fields(Config)}
         defaults = Config()
         kwargs = {}

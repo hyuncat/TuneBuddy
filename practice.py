@@ -159,11 +159,11 @@ class PracticeTab(QWidget):
         self.recording.config.tuning = tuning
         self.recording.update_config(self.recording.config)
 
-    def set_tolerance(self, tolerance: float):
-        """Mirror a tolerance change: set our Recording's Config tolerance, which
+    def set_pitch_tolerance(self, tolerance: float):
+        """Mirror a pitch-tolerance change: set our Recording's Config value, which
         is the semitone slack `_pitch_matches` uses to decide whether a live
         pitch is close enough to let the playhead advance."""
-        self.recording.config.tolerance = tolerance
+        self.recording.config.pitch_tolerance = tolerance
         self.recording.update_config(self.recording.config)
         # the guitarHero's green band / red ramp track this recording's tolerance
         self.guitar_hero.load_user(self.recording)
@@ -305,7 +305,7 @@ class PracticeTab(QWidget):
         Advance (True) when there's no note to hold for — a gap, before the first
         note / after the last, or a rest (midi -1) — otherwise the playhead would
         deadlock on a spot with no note. For a real note, advance only when a
-        clean, finite pitch lands within the Config tolerance of the target;
+        clean, finite pitch lands within the Config pitch_tolerance of the target;
         silence, an unvoiced/too-noisy frame, a NaN/inf candidate, or a wrong
         pitch all hold. (The tolerance follows the side-panel Tolerance control.)
         """
@@ -329,7 +329,7 @@ class PracticeTab(QWidget):
             self.status_bar.update_status(f"Waiting for note: {m:.1f}…")
             return False
 
-        tolerance = self.recording.config.tolerance
+        tolerance = self.recording.config.pitch_tolerance
         on_pitch = abs(u - m) <= tolerance
         state = "On" if on_pitch else "Off"
         self.status_bar.update_status(f"{state}! Detected note: {u:.1f}, Target note: {m:.1f}")

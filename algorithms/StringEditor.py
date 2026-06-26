@@ -14,7 +14,7 @@ class StringEditor:
         self.INSERTION_COST = self.config.ins_cost
         self.DELETION_COST = self.config.del_cost
         self.SUBSTITUTION_COST = self.config.sub_cost
-        self.TOLERANCE = self.config.tolerance                                              
+        self.TOLERANCE = self.config.pitch_tolerance
 
         # tiger-mom parameter
         self.TIGER_LEVEL = self.config.tiger_level
@@ -25,7 +25,7 @@ class StringEditor:
         self.INSERTION_COST = self.config.ins_cost
         self.DELETION_COST = self.config.del_cost
         self.SUBSTITUTION_COST = 1
-        self.TOLERANCE = self.config.tolerance
+        self.TOLERANCE = self.config.pitch_tolerance
 
         self.TIGER_LEVEL = self.config.tiger_level
 
