@@ -72,6 +72,9 @@ class Attune(QMainWindow):
         self.midi_synth = MidiSynth(self.SOUNDFONT)
         # the metronome count-in is shared by both tabs
         self.is_counting_in = False
+        # the head (cursor pos) a count-in is scrolling toward; used to snap the
+        # plot back if the user un-arms recording mid-count-in.
+        self._countin_head = 0.0
         # full-score vs active-part view toggle, shared across both tabs: app.py
         # owns it (single source of truth) and pushes it into each tab via
         # set_show_full, like the other side-panel settings.
@@ -272,6 +275,7 @@ class Attune(QMainWindow):
         self.slider.slider_changed.connect(self.slider_changed)
         self.slider.slider_end.connect(self.slider_end)
         self.countdown_timer.finished.connect(self._on_countdown_finished)
+        self.countdown_timer.progress.connect(self._on_countdown_progress)
 
         # --- SIDE PANELS ---
         # recordings tree
@@ -599,32 +603,59 @@ class Attune(QMainWindow):
         if panel is self.perform_tab and not self._has_recording(warn=True):
             return
         if self.is_counting_in:
-            # clicking again during the count-in cancels it (un-arm recording)
+            # clicking again during the count-in cancels it (un-arm recording) and
+            # snaps the plot back to where the user hit record (the head).
             self.countdown_timer.cancel()
             self.is_counting_in = False
             self.record_button.setIcon(self.record_icon)
+            self._active_tab().render_at(self._countin_head)
             return
         if not panel.is_recording:
-            # play a one-measure metronome count-in; _on_countdown_finished starts
-            # the active tab's recording on finish. Use the active tab's score so
-            # the count-in beats land at that tab's (possibly different) tempo.
+            # scroll a one-measure metronome count-in into the head, then begin
+            # recording (_on_countdown_finished). Use the active tab's score so the
+            # count-in beats land at that tab's (possibly different) tempo.
             sd = self._active_score_data()
+            # snap the cursor to the clip start (if any) so the count-in scrolls in
+            # toward THAT head, and remember it for snap-back on cancel.
+            self.slider.sync_clip_window(sd)
+            head = self.slider.get_time()
+            beats = sd.count_in_beats()
+            spb = (beats[1][0] - beats[0][0]) if len(beats) >= 2 else 0.5
+            # Perform records a beat before the head (runway) — even into negative
+            # app-time when recording from the start; the take is realigned to the
+            # clip start at analysis. Practice is pitch-driven, so it starts at the head.
+            record_at = (head - spb) if panel is self.perform_tab else head
+            # Perform's 4th click lands on the record beat — play it only when the
+            # metronome is on (the channel is in the score's playing set).
+            metronome_on = (sd.metronome_channel is not None
+                            and sd.metronome_channel in sd.playing_instruments)
+            self._countin_head = head
             self.is_counting_in = True
             self.record_button.setIcon(self.pause_icon)
             self.countdown_timer.start(
-                beats=sd.count_in_beats(),
+                beats=beats,
                 channel=sd.metronome_channel,
+                head_time=head,
+                record_time=record_at,
+                metronome_on=metronome_on,
             )
         else:
             panel.stop_recording()
             self.record_button.setIcon(self.record_icon)
             self.status_bar.update_status("")
 
-    def _on_countdown_finished(self):
-        """Shared count-in finished: start recording in whichever tab is active."""
+    def _on_countdown_progress(self, t: float):
+        """Count-in tick: scroll the active tab's views to plot time `t`."""
+        if not self.is_counting_in:
+            return
+        self._active_tab().render_at(t)
+
+    def _on_countdown_finished(self, record_time: float):
+        """Shared count-in finished: start recording in whichever tab is active,
+        beginning capture at `record_time` (where the count-in scroll left off)."""
         self.is_counting_in = False
         self.record_button.setIcon(self.pause_icon)
-        self._active_tab().start_recording()
+        self._active_tab().start_recording(record_time)
 
     def update_time_label(self, t: float):
         """Update the shared time label (current/total) from time `t`."""

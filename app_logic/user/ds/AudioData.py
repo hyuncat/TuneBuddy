@@ -26,6 +26,13 @@ class AudioData:
         self.lock = threading.Lock()
         self.end_index = 0 # track end of recorded audio
 
+        # App-time (sec) that buffer index 0 represents. Normally 0, but a Perform
+        # take records a one-beat runway BEFORE the head, so capture can begin at a
+        # NEGATIVE app-time; setting t_origin to that start keeps the buffer
+        # 0-indexed while reads/writes still address samples by their app-time.
+        # Shifting the whole recording (see Recording.shift) is just += on this.
+        self.t_origin = 0.0
+
     def load_data(self, audio_filepath: str, sr: float=44100):
         """
         Load audio data into the recording data array.
@@ -66,7 +73,7 @@ class AudioData:
             buffer (np.ndarray): Temporary buffer of new audio data to be added
             start_time (float), time in seconds to start adding the new chunk
         """
-        start_index = int(start_time * self.sr)
+        start_index = int((start_time - self.t_origin) * self.sr)
         end_index = start_index + len(indata)
 
         if end_index > self.capacity:
@@ -89,8 +96,8 @@ class AudioData:
         Returns:
             data (np.ndarray): audio data array from start_time to end_time
         """
-        start_index = int(start_time * self.sr)
-        end_index = int(end_time * self.sr)
+        start_index = max(0, int((start_time - self.t_origin) * self.sr))
+        end_index = int((end_time - self.t_origin) * self.sr)
 
         with self.lock:
             return self.data[start_index:end_index]

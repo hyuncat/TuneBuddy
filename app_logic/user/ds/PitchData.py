@@ -69,10 +69,15 @@ class PitchData:
 	       - indexable using the (SR / hop size)
         """
         # reference to the global config (for sr + hop size used in pitch detection)
-        self.config = config 
+        self.config = config
+
+        # App-time (sec) that frame 0 represents (mirrors AudioData.t_origin). A
+        # Perform take's one-beat runway records from a NEGATIVE app-time; t_origin
+        # keeps the frame array 0-indexed while time<->index stays in app-time.
+        self.t_origin = 0.0
 
         # the essential time to index lambda
-        self.time_to_index = lambda sec: floor(sec*(self.config.sr / self.config.h1))
+        self.time_to_index = lambda sec: floor((sec - self.t_origin)*(self.config.sr / self.config.h1))
         
         DEFAULT_LENGTH = 60 # (sec)
         self.data: list[Pitch] = [None] * ceil(self.time_to_index(DEFAULT_LENGTH))
@@ -121,4 +126,6 @@ class PitchData:
     def read_pitch(self, start_time: float=0) -> Pitch:
         """returns the closest pitch to the start_time"""
         i = self.time_to_index(start_time)
+        if i < 0 or i >= len(self.data):
+            return None
         return self.data[i]

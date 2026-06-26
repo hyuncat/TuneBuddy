@@ -275,11 +275,23 @@ class PerformTab(QWidget):
         self.audio_player.stop()
         self.status_bar.update_status("")
 
-    def start_recording(self):
-        """Start recording; called after app.py's count-in."""
+    def start_recording(self, start_time: float | None = None):
+        """Start recording; called after app.py's count-in.
+
+        `start_time` is where the count-in left the playhead — one beat BEFORE the
+        head (the runway), which can be NEGATIVE when recording from the very start.
+        We capture that lead-in anyway: a negative time origin keeps the audio/pitch
+        buffers 0-indexed, and the clock floor lets the cursor show the runway. The
+        take is realigned to the score's clip start at analysis (Recording.resize)."""
         # a clipped take always begins at the clip start (bounds[0])
         self.slider.sync_clip_window(self.score_data)
-        t = self.slider.get_time()
+        t = self.slider.get_time() if start_time is None else start_time
+        # record a one-beat runway even into negative app-time: origin (= the
+        # earliest, possibly-negative start) keeps the buffers 0-indexed.
+        origin = min(0.0, t)
+        self.recording.audio_data.t_origin = origin
+        self.recording.pitch_data.t_origin = origin
+        self.wall_clock.set_floor(origin)
         self.is_recording = True
         self.audio_player.stop()
         self.wall_clock.start(t)
@@ -292,6 +304,7 @@ class PerformTab(QWidget):
             return
         self.is_recording = False
         self.wall_clock.pause()
+        self.wall_clock.set_floor(0.0)  # drop the runway floor for plain playback
         self.audio_recorder.stop()
         self.midi_player.stop()
         self.recording.pitch_detector.stop()
@@ -309,16 +322,19 @@ class PerformTab(QWidget):
         self.move_views(t)
 
     def on_clock_tick(self, t: float):
-        """Shared wall-clock tick: move the views during plain PLAYBACK only."""
-        if not self.is_playing:
+        """Shared wall-clock tick: drive the views during playback AND recording.
+        Recording drives off the clock (not the slider) so the cursor can show the
+        negative pre-head runway — the slider clamps to 0 and would otherwise pin
+        the plot there."""
+        if not (self.is_playing or self.is_recording):
             return
         self.move_views(t)
 
     def on_slider_changed(self, t: float):
-        """Shared slider moved: move the views unless we're the one playing
-        (during recording the clock is running and the slider follows it, so the
-        views should track it then too — hence we don't guard on is_recording)."""
-        if self.is_playing:
+        """Shared slider moved: move the views only when we're idle (scrubbing).
+        During playback/recording the wall clock owns the cursor (see
+        on_clock_tick), so ignore the slider's clamped echoes here."""
+        if self.is_playing or self.is_recording:
             return
         self.move_views(t)
 

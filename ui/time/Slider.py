@@ -85,8 +85,8 @@ class Slider(QWidget):
         score's first note (S) and the user's first played note (U), so neither
         gets clipped at the very edge of the comparison. This slider is the master
         timeline driving the ScoreViewer cursor and GuitarHero, so the lead-in
-        lands there rather than in the score translation (resize keeps S aligned
-        as closely as possible to U)."""
+        lands there. (resize keeps the score fixed and slides the TAKE so U lands
+        on S; a Perform runway recorded before t=0 stays left of this edge.)"""
         m0, m1, u1 = 0, 0, 0
         if score_data:
             note_data = score_data.note_datas.get(score_data.active_instrument, None)

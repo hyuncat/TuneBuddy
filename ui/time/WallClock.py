@@ -26,12 +26,22 @@ class WallClock(QObject):
         self._wall_anchor = time.monotonic()
         self._stalling = False
 
+        # lowest tick the clock may report. Normally 0, but a Perform take records
+        # a one-beat runway BEFORE the head, so the clock must be allowed to report
+        # that negative lead-in while recording (set_floor); reset to 0 otherwise.
+        self._floor_tick = 0
+
 
     def start(self, t: float=0.0):
         """Start the wall clock"""
         self.seek(t)
         self._running = True
         self.timer.start()
+
+    def set_floor(self, t: float):
+        """Set the lowest time (sec) the clock may report. Pass a negative `t` to
+        let recording show a pre-head runway; pass 0.0 to restore the default."""
+        self._floor_tick = int(t * self.hz)
 
     def seek(self, t: float):
         """Seek the current_tick to the given time in seconds
@@ -93,4 +103,4 @@ class WallClock(QObject):
         return self._media_anchor + max(0.0, wall_time - self._wall_anchor)
 
     def _set_tick(self, t: float):
-        self.current_tick = max(0, int(round(t * self.hz)))
+        self.current_tick = max(self._floor_tick, int(round(t * self.hz)))

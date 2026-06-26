@@ -47,6 +47,20 @@ class NoteData:
         
         self.data[note.start_time] = note
 
+    def shift(self, delta: float):
+        """Slide every note in time by `delta` seconds (rekeying the dict and
+        sorted-times list so time lookups stay in sync). Used to realign a whole
+        recording's detected notes against the score after analysis."""
+        if not delta:
+            return
+        new_data = {}
+        for note in self.data.values():
+            note.start_time += delta
+            note.end_time += delta
+            new_data[note.start_time] = note
+        self.data = new_data
+        self.times = sorted(new_data.keys())
+
     def get_length(self, bounds: tuple[float, float]=None) -> float:
         """Return the length of the note data in seconds.
         If no bounds are supplied, returns the end_time of the last note; else

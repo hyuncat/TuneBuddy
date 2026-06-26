@@ -110,9 +110,19 @@ class Recording:
         if on_phase:
             on_phase("Detecting pitches...")
         self.pitch_data.data = self.pitch_detector.detect_pitches(self.audio_data.data)
-        if on_phase: 
+        if on_phase:
             on_phase("Smoothing pitches...")
         self.pitch_data.data = self.pitch_smoother.smooth(self.pitch_data.data)
+        # the offline pass stamps frame times relative to buffer index 0, which
+        # represents app-time `t_origin` (NEGATIVE for a Perform runway recorded
+        # before the head). Mirror the audio buffer's origin onto the pitch data
+        # and lift the frame times onto it so notes/alignment read in app-time.
+        origin = self.audio_data.t_origin
+        self.pitch_data.t_origin = origin
+        if origin:
+            for p in self.pitch_data.data:
+                if p is not None:
+                    p.time += origin
 
     def detect_notes(self):
         """run note detection on the current pitch data"""
@@ -194,6 +204,29 @@ class Recording:
                 return n
         return 0
     
+    def shift(self, delta: float):
+        """Slide the WHOLE recorded take (audio, pitches, notes) by `delta` sec on
+        the app-time line. Audio/pitch frames move via their shared time origin (no
+        array copy); notes are rekeyed. Used post-analysis to land the first voiced
+        note on the score's clip start without translating the score."""
+        if not delta:
+            return
+        self.audio_data.t_origin += delta
+        self.pitch_data.t_origin += delta
+        for p in self.pitch_data.data:
+            if p is not None:
+                p.time += delta
+        self.note_data.shift(delta)
+
+    def _clip_start_time(self) -> float:
+        """App-time the take should align its first voiced note to: the score's
+        clip start when clipped, else the score's first note."""
+        cb = self.score_data.clip_bounds()
+        if cb is not None:
+            return cb[0]
+        nd = self.score_data.note_datas.get(self.active_instrument)
+        return nd.times[0] if nd and nd.times else 0.0
+
     def resize(self, new_length: float):
         """Resize the score_data to a new length by changing the BPM of the score data,
         updating the note timings and pitch distances as well.
@@ -213,11 +246,13 @@ class Recording:
         new_bpm = round(self.score_data.bpm_og / factor)
 
         self.score_data.change_tempo(new_bpm)
-        # translate the score so its first note lines up as closely as possible
-        # with the user's first played note (the slider adds the one-tick lead-in
-        # that keeps it off the left edge — see Slider.update_range).
-        start_time = self._get_first_note(voiced=True).start_time
-        self.score_data.transpose_notes(start_time)
+        # Keep the score fixed and slide the TAKE instead, so its first voiced note
+        # lands on the score's clip start. (The old path translated the score onto
+        # the user; that dragged the score left into the count-in when the player
+        # entered early, so the runway recorded before t=0 had nowhere to go.)
+        first = self._get_first_note(voiced=True)
+        if first != 0:
+            self.shift(self._clip_start_time() - first.start_time)
         self._update_pitch_distances()
 
     def change_tempo(self, new_bpm: float):

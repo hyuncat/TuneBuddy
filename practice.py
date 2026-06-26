@@ -211,17 +211,20 @@ class PracticeTab(QWidget):
         self.midi_player.stop()
         self.status_bar.update_status("")
 
-    def start_recording(self):
-        """Begin a practice run. 
+    def start_recording(self, start_time: float | None = None):
+        """Begin a practice run.
         Advances forward only when user's pitch matches the score.
-        """
+
+        `start_time` is the count-in handoff (the head); when None we fall back to
+        the cursor / clip start. Practice is pitch-driven, so this is just where
+        the playhead is seeded — it then only advances on a correct pitch."""
         self.midi_player.stop()           # stop things we don't want
         self.wall_clock.pause()           # the clock must NOT advance the slider
         self.recording.pitch_detector.block = False
         # seed the pitch-driven playhead at the current slider position (a clipped
         # take begins at the clip start, bounds[0])
         self.slider.sync_clip_window(self.score_data)
-        t = self.slider.get_time()
+        t = self.slider.get_time() if start_time is None else max(0.0, start_time)
         self.practice_time = t
         self._last_render = 0.0
         self.is_recording = True
