@@ -1,5 +1,6 @@
 from pathlib import Path
 from music21 import converter, tempo, meter
+from music21 import interval as m21interval, pitch as m21pitch
 import tempfile
 
 from app_logic.midi.MidiData import MidiData
@@ -478,7 +479,12 @@ class ScoreData:
         # 1. MIDI playback (shifts the shared note-message pitch baseline)
         self.midi_data.transpose(semitones)
         # 2. music21 score (drives the MusicXML pushed to Verovio); int == semitones
-        self.score.transpose(semitones, inPlace=True)
+        original_midi = self.first_note_midi()
+        p_from = m21pitch.Pitch(midi=original_midi)
+        p_to   = m21pitch.Pitch(midi=original_midi + semitones)
+        #interval specificity for enharmonic spellings
+        trans  = m21interval.Interval(p_from, p_to)
+        self.score.transpose(trans, inPlace=True)
         # 3. live NoteData pitches — shift in place so the current views update
         #    without a full rebuild. Skip the metronome channel + unvoiced (-1).
         for channel, nd in self.note_datas.items():
