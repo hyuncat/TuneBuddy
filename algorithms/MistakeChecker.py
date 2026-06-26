@@ -16,7 +16,7 @@ class MistakeChecker:
     def __init__(self, recording: Recording = None, config: Config = None, verbose: bool = False):
         self.recording = recording
         self.config = recording.config if recording else config
-        self.pd = self.nd = None
+        self.pd = self.nd = self.alignment = None
         self.verbose = verbose  # print step-by-step edit diagnostics
         self.MIN_CLOSE = self.config.min_close  # min # of close pitch frames to consider a split viable
 
@@ -32,10 +32,27 @@ class MistakeChecker:
             self.recording = recording
         if not self.recording or not self.recording.alignment:
             return None, None
-        self.nd, self.pd = self.recording.note_data, self.recording.pitch_data
+        self.pd = self.recording.pitch_data
 
-        mistakes = self.recording.alignment.mistakes
+        note_data = self.recording.note_data
+        alignment = self.recording.alignment
+        while True:
+            new_nd, new_alignment, n_edits = self._check_mistakes_once(note_data, alignment)
+            if n_edits == 0 or len(new_alignment.mistakes) >= len(alignment.mistakes):
+                return note_data, alignment
+            note_data, alignment = new_nd, new_alignment
+
+    def _check_mistakes_once(self, note_data: NoteData, alignment: Alignment) -> tuple[NoteData, Alignment, int]:
+        """Apply one non-overlapping correction pass to the supplied state."""
+        self.nd = note_data
+        self.alignment = alignment
+
+        mistakes = sorted(
+            alignment.mistakes,
+            key=lambda m: 0 if m.type == "deletion" else 1 if m.type == "insertion" else 2,
+        )
         edits = []  # each edit is (notes_to_remove, notes_to_add)
+        edited_note_times = set()
         for mistake in mistakes:
             edit = None
             if mistake.type == "deletion":
@@ -46,7 +63,15 @@ class MistakeChecker:
                 continue  # substitutions aren't correctable here
 
             if edit is not None:
-                edits.append(edit)
+                removed, _ = edit
+                removed_times = {n.start_time for n in removed}
+                if removed_times & edited_note_times:
+                    if self.verbose:
+                        print(f"  [check_mistakes] skipping overlapping edit for {mistake}")
+                    edit = None
+                else:
+                    edits.append(edit)
+                    edited_note_times.update(removed_times)
 
             if self.verbose:
                 if edit is None:
@@ -61,7 +86,7 @@ class MistakeChecker:
             print(f"[check_mistakes] {len(mistakes)} mistakes -> {len(edits)} edits applied")
         new_nd = self._apply_edits(edits)
         new_alignment = self._realign(new_nd)
-        return new_nd, new_alignment
+        return new_nd, new_alignment, len(edits)
 
     def mistake_correction_loop(self):
         """Repeatedly apply mistake correction until it stops reducing the mistake
@@ -114,6 +139,7 @@ class MistakeChecker:
             if self.verbose:
                 print(f"      [split-fail] host@{host.start_time:.2f}: too few frames ({len(pitches)})")
             return None
+        self._remedian_notes(split, targets)
         ok = self._split_resembles_score(split, targets)
         if self.verbose:
             print(f"      [split] host@{host.start_time:.2f} -> "
@@ -138,6 +164,13 @@ class MistakeChecker:
             return None
 
         merged = self._merge_notes(inserted, neighbor)
+        self._remedian_notes([merged])
+        target = self._score_pitch(neighbor)
+        if abs(merged.midi_num[0] - target) > self.config.pitch_thresh:
+            if self.verbose:
+                print(f"      [merge-fail] merged={merged.midi_num[0]:.1f} "
+                      f"target={target:.1f} (tol={self.config.pitch_thresh})")
+            return None
         return [inserted, neighbor], [merged]
 
 
@@ -170,7 +203,8 @@ class MistakeChecker:
     def _score_pitch(self, user_note: Note) -> float:
         """The pitch of the score note `user_note` aligns to, or its own observed
         pitch if it has no match (e.g. the host is itself an insertion)."""
-        score_note = self.recording.alignment.get_match(user_note=user_note)
+        alignment = self.alignment or self.recording.alignment
+        score_note = alignment.get_match(user_note=user_note)
         return score_note.midi_num[0] if score_note else user_note.midi_num[0]
 
     def _pick_merge_neighbor(self, inserted: Note, prev_note: Note, next_note: Note):
@@ -208,7 +242,8 @@ class MistakeChecker:
         only merge an insertion into such a note (a fragment that broke off a
         correctly-played note); if the neighbor is itself off, the insertion may be
         a genuine extra note, so we leave it alone."""
-        score_note = self.recording.alignment.get_match(user_note=user_note)
+        alignment = self.alignment or self.recording.alignment
+        score_note = alignment.get_match(user_note=user_note)
         if score_note is None:
             return False
         return abs(user_note.midi_num[0] - score_note.midi_num[0]) <= self.config.pitch_thresh
@@ -285,6 +320,60 @@ class MistakeChecker:
             velocity=neighbor.velocity,
             instrument=neighbor.instrument,
         )
+
+    def _remedian_notes(self, notes: list[Note], targets: tuple | list | None = None) -> None:
+        """Recompute replacement-note pitches after split/merge edits.
+
+        MistakeChecker edits are score-guided, so when a target score pitch is
+        known, median only the frames in that replacement span that support that
+        target. This prevents a short corrected note from being pulled back to the
+        neighboring pitch by slide/transition frames. If no target-supporting
+        frames exist, fall back to the span's full voiced median.
+        """
+        targets = targets or [None] * len(notes)
+        for note, target in zip(notes, targets):
+            self._remedian_note(note, target)
+
+    def _remedian_note(self, note: Note, target: float | None = None) -> None:
+        if note is None or self.pd is None:
+            return
+
+        pitches = self.pd.read(
+            start_time=note.start_time,
+            end_time=note.end_time,
+            clean=True,
+        )
+        if not pitches:
+            return
+
+        target_support = []
+        if target is not None:
+            target_support = [
+                p for p in pitches
+                if p.candidates
+                and abs(p.candidates[0][0] - target) <= self.config.pitch_thresh
+            ]
+
+        medians = self._median_pitches(target_support or pitches)
+        if medians[0] != -1:
+            note.midi_num = medians
+
+    @staticmethod
+    def _median_pitches(pitches: list) -> list[float]:
+        medians = [-1, -1, -1]
+        cols = [[] for _ in medians]
+        for p in pitches:
+            if p is None:
+                continue
+            for i in range(min(len(cols), len(p.candidates))):
+                midi = p.candidates[i][0]
+                if midi != -1:
+                    cols[i].append(midi)
+
+        for i, col in enumerate(cols):
+            if col:
+                medians[i] = float(np.median(col))
+        return medians
 
     def _apply_edits(self, edits: list) -> NoteData:
         """Build a fresh NoteData: drop the notes each edit replaces, add its

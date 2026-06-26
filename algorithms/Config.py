@@ -14,8 +14,8 @@ class Config:
     # --- NOTE DETECTION PARAMETERS ---
     w2: int = 29 # frame size (NOTE: should always be odd)
     h2: int = 19 # hop size
-    pitch_thresh: float = 0.75
-    slope_thresh: float = 0.75 / 29
+    pitch_thresh: float = 0.5 # rk: used to be 0.75
+    slope_thresh: float = 0.5 / 29
     unv_ratio: float = 0.8 # proportion of unvoiced pitches in a window to consider the window unvoiced
 
     # --- STRING EDIT PARAMETERS ---
@@ -41,7 +41,7 @@ class Config:
         self.w2 = config.get("w2", self.w2)
         self.h2 = self.w2 - 2
         self.pitch_thresh = config.get("pitch_thresh", self.pitch_thresh)
-        self.slope_thresh = 0.75 / self.w2 # rk: 0.75 is not set in stone
+        self.slope_thresh = self.pitch_thresh / self.w2 
         # self.slope_thresh = config.get("slope_thresh", self.slope_thresh)
 
         self.ins_cost = config.get("ins_cost", self.ins_cost)

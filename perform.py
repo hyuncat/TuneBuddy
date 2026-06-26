@@ -376,10 +376,15 @@ class PerformTab(QWidget):
         # take, then build the final alignment against those resized score notes.
         # Alignment stores score Note objects directly; if we align before the
         # resize, overlays keep pointing at the old note timings.
+        # Flag pitch-transition (slide) frames up front so the PELT detector can
+        # exclude them — otherwise a slide's ramping pitch reads as a phantom
+        # mid-slide note. detect_transitions only reads the pitch track, so it's
+        # safe (and now required) to run before note detection.
+        rec.detect_transitions()
         rec.note_detector.find_best_w2()
         rec.detect_notes()
-        # re-median note pitches over non-transition frames
-        rec.detect_transitions()
+        # re-median note pitches over non-transition frames, then drop any note
+        # that is still almost entirely slide frames
         rec.recompute_note_pitches()
         rec.prune_transition_notes()
 
@@ -390,6 +395,7 @@ class PerformTab(QWidget):
         rec.detect_mistakes()
         rec.mistake_checker.mistake_correction_loop()
         rec.update_alignment_distances() # color the user pitches by the final alignment
+        rec.truncate_end()
 
         # reload every view with the fresh analysis (note/alignment may have been
         # overwritten by the correction loop)

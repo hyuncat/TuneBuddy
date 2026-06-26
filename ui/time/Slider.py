@@ -87,13 +87,14 @@ class Slider(QWidget):
         timeline driving the ScoreViewer cursor and GuitarHero, so the lead-in
         lands there. (resize keeps the score fixed and slides the TAKE so U lands
         on S; a Perform runway recorded before t=0 stays left of this edge.)"""
-        m0, m1, u1 = 0, 0, 0
+        m0, m1 = 0, 0
+        user_audio_bounds = None
         if score_data:
             note_data = score_data.note_datas.get(score_data.active_instrument, None)
             if note_data:
                 m0, m1 = note_data.get_bounds()
         if recording and recording.audio_data:
-            u1 = recording.audio_data.get_length()
+            user_audio_bounds = recording.audio_bounds()
 
         # one slider click before min(S, U), clamped to 0 (can't seek negative)
         one_click = 1.0 / self.TICKS_PER_SEC
@@ -103,7 +104,10 @@ class Slider(QWidget):
             first_notes.append(u0)
         x0 = max(0.0, min(first_notes) - one_click)
 
-        x1 = max(m1, u1+m0)
+        end_times = [m1]
+        if user_audio_bounds is not None:
+            end_times.append(user_audio_bounds[1])
+        x1 = max(end_times)
         self._update_range(x0, x1)
 
         # (Re)derive the clip window from the ACTIVE tab's bounds. Because the

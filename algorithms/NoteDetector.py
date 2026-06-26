@@ -11,7 +11,12 @@ from algorithms.Config import Config
 
 class NoteDetector(QObject):
     note_detected = pyqtSignal(float)
-    
+
+    # A/B toggle for the offline segmenter: True -> PELT/L2 (detect_notes2),
+    # False -> the sliding-window detector (detect_notes). Both find_best_w2()
+    # and Recording.detect_notes() read this so they stay in sync.
+    USE_PELT = True
+
     def __init__(self, recording: Recording=None, config: Config=None, parent: QObject|None=None):
         """initialize the note detection algorithm parameters"""
         super().__init__(parent)
@@ -129,6 +134,11 @@ class NoteDetector(QObject):
         each candidate size; updating the recording's Config re-inits every
         algorithm (including this detector's own w/hop) so each size is a clean
         run. Offline analysis helper, called from the Perform tab's analyze()."""
+        # PELT segmentation ignores w2/h2 entirely (it sizes segments from the
+        # score and penalises via PITCH_THRESH), so sweeping w2 would just rerun
+        # the identical detection N times. Skip the sweep when PELT is active.
+        if self.USE_PELT:
+            return
         W2_SIZES = [33, 31, 29, 27, 25, 23, 21, 19, 17]
         rec = self.recording
 
@@ -209,6 +219,153 @@ class NoteDetector(QObject):
 
         # post-process: pull the hop-quantized boundaries onto the true onsets
         nd = self.refine_onsets(nd, pitch_data)
+        return nd
+
+    # ------------------------------------------------------------------ #
+    # alternative offline detector (ruptures PELT / L2)
+    # ------------------------------------------------------------------ #
+    def _pelt_min_size_from_score(self) -> int:
+        """Minimum PELT segment size in pitch frames.
+
+        Derive it from the current score context: 60% of the shortest note in the
+        active clip (or the full active part when unclipped), converted from
+        seconds to pitch frames via sr / h1. If no score context is available,
+        fall back to the current note-detector hop in pitch-frame units.
+        """
+        fallback = max(1, int(self.config.h2))
+        if self.recording is None or self.recording.score_data is None:
+            return fallback
+
+        try:
+            score_notes = self.recording.score_data.clipped_note_data(
+                channel=self.recording.active_instrument
+            )
+        except (AttributeError, KeyError):
+            return fallback
+
+        notes = score_notes.read(i=0, j=len(score_notes.times))
+        durations = [
+            n.end_time - n.start_time
+            for n in notes
+            if n is not None and n.end_time > n.start_time
+        ]
+        if not durations:
+            return fallback
+
+        frame_rate = self.config.sr / self.config.h1
+        return max(1, int(np.ceil(0.6 * min(durations) * frame_rate)))
+
+    def _pelt_penalty(self, min_size: int) -> float:
+        """Penalty tuned to the existing pitch-change threshold.
+
+        For two equal min-size segments, a mean shift of PITCH_THRESH reduces L2
+        cost by roughly 0.5 * min_size * PITCH_THRESH^2, so use that as the PELT
+        split threshold.
+        """
+        return 0.5 * min_size * (self.PITCH_THRESH ** 2)
+
+    def _pelt_signal(self, pitches: list[Pitch]) -> np.ndarray:
+        """Primary MIDI pitch per frame, with rests/unvoiced frames encoded as -1."""
+        values = []
+        for p in pitches:
+            midi = self._frame_pitch(p)
+            voiced = (
+                p is not None
+                and p.unvoiced_prob < self.UNV_THRESH
+                and midi not in (None, -1)
+            )
+            values.append(float(midi) if voiced else -1.0)
+        return np.asarray(values, dtype=float).reshape(-1, 1)
+
+    def _pelt_segment_pitch(self, pitches: list[Pitch]) -> list[float]:
+        """Summarize a PELT segment in the same 3-candidate format as detect_notes."""
+        if not pitches:
+            return [-1, -1, -1]
+        unvoiced_probs = [p.unvoiced_prob if p else 1.0 for p in pitches]
+        if self.is_unvoiced(unvoiced_probs):
+            return [-1, -1, -1]
+        return self.get_median_pitches(pitches)
+
+    def _pelt_boundary_time(self, pitches: list[Pitch], i: int) -> float:
+        """Time for the boundary before frame i; i == len gives one frame past end."""
+        if i <= 0:
+            return pitches[0].time
+        if i < len(pitches):
+            return pitches[i].time
+        return pitches[-1].time + (self.config.h1 / self.config.sr)
+
+    def _same_note_pitch(self, a: Note, b_midi: list[float]) -> bool:
+        if a is None or not a.midi_num or not b_midi:
+            return False
+        a0, b0 = a.midi_num[0], b_midi[0]
+        if a0 == -1 and b0 == -1:
+            return True
+        if a0 == -1 or b0 == -1:
+            return False
+        return abs(a0 - b0) <= self.PITCH_THRESH
+
+    def detect_notes2(self, pitch_data: PitchData) -> NoteData:
+        """Offline note detection using ruptures' PELT L2 change-point detector.
+
+        This matches detect_notes(pitch_data) -> NoteData so Recording.py can swap
+        between the two implementations with a one-line call change.
+
+        Pitch-transition (slide) frames are excluded from the signal: their pitch
+        ramps from one note to the next, which PELT would otherwise split into a
+        phantom mid-slide note (and drag the preceding note's boundary into the
+        slide). They must be flagged by detect_transitions() first — analyze()
+        runs it before this. `is_transition` is None until then, so an unflagged
+        track keeps every frame (backward compatible).
+        """
+        nd = NoteData()
+        pitches = [p for p in pitch_data.data
+                   if p is not None and not p.is_transition]
+        if not pitches:
+            return nd
+
+        min_size = self._pelt_min_size_from_score()
+        signal = self._pelt_signal(pitches)
+        n_frames = len(pitches)
+
+        if n_frames < 2 * min_size:
+            bkps = [n_frames]
+        else:
+            try:
+                bkps = rpt.Pelt(model="l2", min_size=min_size, jump=1).fit(signal).predict(
+                    pen=self._pelt_penalty(min_size)
+                )
+            except rpt.exceptions.BadSegmentationParameters:
+                bkps = [n_frames]
+
+        prev = 0
+        note_index = 0
+        for bkp in bkps:
+            end = min(int(bkp), n_frames)
+            if end <= prev:
+                continue
+
+            segment = pitches[prev:end]
+            midi_num = self._pelt_segment_pitch(segment)
+            start_time = self._pelt_boundary_time(pitches, prev)
+            end_time = self._pelt_boundary_time(pitches, end)
+            if end_time <= start_time:
+                prev = end
+                continue
+
+            last = nd.read_note(i=len(nd.times) - 1) if nd.times else None
+            if self._same_note_pitch(last, midi_num):
+                last.end_time = end_time
+            else:
+                nd.write_note(Note(
+                    i=note_index,
+                    start_time=start_time,
+                    end_time=end_time,
+                    midi_num=midi_num,
+                ))
+                note_index += 1
+
+            prev = end
+
         return nd
 
     # ------------------------------------------------------------------ #
@@ -327,8 +484,11 @@ class NoteDetector(QObject):
         sets `Pitch.is_transition = True` for any frame inside a window whose
         |slope| >= SLOPE_THRESH, else False. Downstream, update_alignment_distances
         leaves these frames' distances unset (grey) so they aren't scored.
-        Call after detect_notes() (i.e. after refine_onsets) and before
-        Recording.update_alignment_distances()."""
+
+        Order: it only reads the pitch track (no note dependency), so analyze()
+        runs it BEFORE detect_notes2() (PELT), which excludes the flagged slide
+        frames from segmentation. It must precede recompute_note_pitches(),
+        prune_transition_notes() and update_alignment_distances()."""
         pitches = pitch_data.data
 
         # default every present frame to non-transition first (idempotent re-runs)

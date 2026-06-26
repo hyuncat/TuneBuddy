@@ -57,7 +57,7 @@ class AudioPlayer:
         self.playback_thread.start()
 
     def _play(self, start_time: float=0):
-        audio_array = self.audio_data.read_data(start_time, self.audio_data.get_length())
+        audio_array = self.audio_data.read_data(start_time, self.audio_data.get_end_time())
 
         # basic error checking
         if len(audio_array) == 0:

@@ -561,12 +561,22 @@ class Attune(QMainWindow):
             return False
 
         default_name = self._safe_filename(default_name or "recording")
-        if rec.audio_file_exists():
+        rec.truncate_end()
+        writable_suffixes = {".wav", ".wave", ".flac", ".ogg", ".aif", ".aiff"}
+        current_suffix = rec.audio_filepath.suffix.lower() if rec.audio_filepath else ""
+        can_overwrite_audio = current_suffix in writable_suffixes
+        if rec.audio_file_exists() and (not rec.unsaved_changes or can_overwrite_audio):
             cache_name = (
                 self.active_recording_name
                 if rec is self.active_recording
                 else default_name
             )
+            if rec.unsaved_changes:
+                try:
+                    rec.save_audio(rec.audio_filepath)
+                except Exception as e:
+                    QMessageBox.warning(self, "Save failed", f"Could not save recording:\n{e}")
+                    return False
             if not self._save_recording_cache(rec, recording_name=cache_name):
                 QMessageBox.warning(self, "Save failed", "Could not save recording metadata.")
                 return False
@@ -574,8 +584,6 @@ class Attune(QMainWindow):
             self._show_saved_status()
             return rec.audio_filepath
 
-        writable_suffixes = {".wav", ".wave", ".flac", ".ogg", ".aif", ".aiff"}
-        current_suffix = rec.audio_filepath.suffix.lower() if rec.audio_filepath else ""
         default_suffix = current_suffix if current_suffix in writable_suffixes else ".wav"
         default_path = score_dir / f"{default_name}{default_suffix or '.wav'}"
         file_path, _ = QFileDialog.getSaveFileName(

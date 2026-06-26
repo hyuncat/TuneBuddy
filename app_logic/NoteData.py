@@ -82,8 +82,8 @@ class NoteData:
         if not self.times:
             return (0.0, 0.0)
         first_time = self.times[0]
-        last_time = self.get_length()
-        return (first_time, last_time)
+        last_time = self.times[-1]
+        return (first_time, self.data[last_time].end_time)
 
     def get_minimum_note_length(self) -> float:
         """return the minimum note length in seconds"""

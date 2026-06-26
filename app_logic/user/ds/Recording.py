@@ -11,6 +11,8 @@ from app_logic.JsonHandler import JsonHandler
 from algorithms.Config import Config
 
 class Recording:
+    TRAILING_AUDIO_PAD_SEC = 0.2
+
     def __init__(self, score_data: ScoreData=None, config: Config=None):
         """the user data, associated with a singular recording of a score.
         each recording has its own audio data, pitch data, note data, and alignment
@@ -111,6 +113,7 @@ class Recording:
 
     def save_audio(self, audio_filepath: str | Path):
         """Persist this recording's current audio buffer to disk."""
+        self.truncate_end(mark_unsaved=False)
         path = Path(audio_filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.audio_data.save_data(str(path))
@@ -162,7 +165,8 @@ class Recording:
         caller can surface progress (e.g. a status-bar message)."""
         if on_phase:
             on_phase("Detecting pitches...")
-        self.pitch_data.data = self.pitch_detector.detect_pitches(self.audio_data.data)
+        audio = self.audio_data.read_all()
+        self.pitch_data.data = self.pitch_detector.detect_pitches(audio)
         if on_phase:
             on_phase("Smoothing pitches...")
         self.pitch_data.data = self.pitch_smoother.smooth(self.pitch_data.data)
@@ -178,8 +182,14 @@ class Recording:
                     p.time += origin
 
     def detect_notes(self):
-        """run note detection on the current pitch data"""
-        self.note_data = self.note_detector.detect_notes(self.pitch_data)
+        """run note detection on the current pitch data.
+
+        A/B toggle lives on NoteDetector.USE_PELT (flip it to switch detectors;
+        find_best_w2 reads the same flag and no-ops under PELT)."""
+        if self.note_detector.USE_PELT:
+            self.note_data = self.note_detector.detect_notes2(self.pitch_data)
+        else:
+            self.note_data = self.note_detector.detect_notes(self.pitch_data)
 
     def detect_transitions(self):
         """flag high-slope (pitch-transition) frames in the pitch data. Run after
@@ -239,6 +249,16 @@ class Recording:
         start_time = self._get_first_note(voiced=True).start_time
         end_time = self._get_last_note(voiced=True).end_time
         return end_time - start_time
+
+    def audio_bounds(self) -> tuple[float, float] | None:
+        """App-time bounds for the recording audio currently considered live."""
+        if self.audio_data.end_index <= 0:
+            return None
+        return self.audio_data.get_bounds()
+
+    def audio_end_time(self) -> float:
+        """App-time of the recording's logical audio end."""
+        return self.audio_data.get_end_time()
     
     # get first/last notes (used in ___ find later)
     def _get_first_note(self, voiced=True):
@@ -440,27 +460,52 @@ class Recording:
     def has_analysis(self):
         """Return True if this recording has been analyzed (notes detected => alignment filled in)"""
         return len(self.note_data.times) > 0
-    
-    def trim_end(self):
-        """Remove trailing silence after the last voiced pitch."""
-        last_voiced_idx = None
-        for i in range(0, len(self.pitch_data.data)):
-            ##index moving backwards
-            rev_index = len(self.pitch_data.data)-1-i
-            pitch = self.pitch_data.data[rev_index]
-            if pitch is not None and pitch.unvoiced_prob < self.pitch_data.UNVOICED_THRESHOLD:
-                last_voiced_idx = rev_index
-                break
 
+    def _last_voiced_pitch_index(self) -> int | None:
+        for i in range(len(self.pitch_data.data) - 1, -1, -1):
+            pitch = self.pitch_data.data[i]
+            if (pitch is not None
+                    and pitch.candidates
+                    and pitch.unvoiced_prob < self.pitch_data.UNVOICED_THRESHOLD):
+                return i
+        return None
+
+    def truncate_end(
+        self,
+        pad_sec: float = TRAILING_AUDIO_PAD_SEC,
+        mark_unsaved: bool = True,
+    ) -> bool:
+        """Remove trailing silence after the last voiced pitch.
+
+        Pitch times live in app-time, while AudioData stores samples from its
+        own `t_origin`; AudioData.truncate_end handles that conversion.
+        """
+        last_voiced_idx = self._last_voiced_pitch_index()
         if last_voiced_idx is None:
-            return
+            return False
 
-        # 200ms buffer just in case
-        trim_time = self.pitch_data.data[last_voiced_idx].time + 0.2
-        #check against original time
-        maximum_time = len(self.audio_data.data) / self.audio_data.sr
-        trim_time = min(trim_time, maximum_time)
+        last_voiced = self.pitch_data.data[last_voiced_idx]
+        trim_time = last_voiced.time + max(0.0, pad_sec)
+        audio_changed = self.audio_data.truncate_end(trim_time)
 
-        with self.pitch_data.lock:
-            self.pitch_data.data = self.pitch_data.data[:last_voiced_idx + 1]
-        self.audio_data.end_index = int(trim_time * self.audio_data.sr)
+        keep_count = last_voiced_idx + 1
+        for i in range(last_voiced_idx + 1, len(self.pitch_data.data)):
+            pitch = self.pitch_data.data[i]
+            if pitch is None:
+                continue
+            if pitch.time > trim_time:
+                break
+            keep_count = i + 1
+
+        pitch_changed = keep_count < len(self.pitch_data.data)
+        if pitch_changed:
+            with self.pitch_data.lock:
+                self.pitch_data.data = self.pitch_data.data[:keep_count]
+
+        if audio_changed and mark_unsaved:
+            self.unsaved_changes = True
+        return audio_changed or pitch_changed
+
+    def trim_end(self, *args, **kwargs):
+        """Compatibility alias for older callers."""
+        return self.truncate_end(*args, **kwargs)

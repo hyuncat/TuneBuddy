@@ -17,9 +17,6 @@ class AudioData:
         # based on the supplied length (sec)
         self.capacity = int(length * self.sr)
         self.data = np.zeros(self.capacity, dtype=np.float32)
-            
-        if audio_filepath is not None:
-            self.load_data(audio_filepath) # (also sets capacity + sr)
 
         # ensure thread-safe access to the buffer
         # as AudioRecorder and AudioPlayer will be accessing it
@@ -32,6 +29,9 @@ class AudioData:
         # 0-indexed while reads/writes still address samples by their app-time.
         # Shifting the whole recording (see Recording.shift) is just += on this.
         self.t_origin = 0.0
+
+        if audio_filepath is not None:
+            self.load_data(audio_filepath) # (also sets capacity + sr)
 
     def load_data(self, audio_filepath: str, sr: float=44100):
         """
@@ -58,6 +58,29 @@ class AudioData:
         """Return a copy of the recorded/loaded portion of the audio buffer."""
         with self.lock:
             return np.array(self.data[:self.end_index], copy=True)
+
+    def get_end_time(self) -> float:
+        """Return the app-time represented by the logical end of the buffer."""
+        return self.t_origin + self.get_length()
+
+    def get_bounds(self) -> tuple[float, float]:
+        """Return the app-time bounds of the recorded/loaded buffer."""
+        return (self.t_origin, self.get_end_time())
+
+    def truncate_end(self, end_time: float) -> bool:
+        """Move the logical end of the buffer to app-time `end_time`.
+
+        The underlying array can keep its capacity for future writes; readers and
+        saves use `end_index`, so trimming the logical end is enough to remove
+        trailing audio.
+        """
+        target_index = int(np.ceil((end_time - self.t_origin) * self.sr))
+        target_index = max(0, min(self.end_index, target_index))
+        if target_index >= self.end_index:
+            return False
+        with self.lock:
+            self.end_index = target_index
+        return True
 
     def save_data(self, audio_filepath: str):
         """Write the recorded/loaded portion of the buffer to disk."""
@@ -100,9 +123,11 @@ class AudioData:
         end_index = int((end_time - self.t_origin) * self.sr)
 
         with self.lock:
+            start_index = min(start_index, self.end_index)
+            end_index = max(start_index, min(end_index, self.end_index))
             return self.data[start_index:end_index]
 
-    def get_length(self) -> int:
+    def get_length(self) -> float:
         """
         get the length of the audio data in seconds
         """
