@@ -19,6 +19,8 @@ class Toolbar(QToolBar):
     """
     score_uploaded = pyqtSignal(str)
     audio_uploaded = pyqtSignal(str)
+    folder_uploaded = pyqtSignal(str)
+    save_recording_requested = pyqtSignal()
     show_settings = pyqtSignal(bool)
     clip_requested = pyqtSignal() # apply the clip to the selected measure range
     clip_reset = pyqtSignal()     # restore the full score
@@ -50,8 +52,13 @@ class Toolbar(QToolBar):
         upload_recording_action.setStatusTip("Upload an audio file")
         upload_recording_action.triggered.connect(self.upload_audio)
 
+        upload_folder_action = QAction("Folder", self)
+        upload_folder_action.setStatusTip("Upload an Attune folder")
+        upload_folder_action.triggered.connect(self.upload_folder)
+
         upload_menu.addAction(upload_score_action)
         upload_menu.addAction(upload_recording_action)
+        upload_menu.addAction(upload_folder_action)
 
         upload_button.setMenu(upload_menu)
         upload_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -148,6 +155,11 @@ class Toolbar(QToolBar):
         settings.triggered.connect(self.trigger_settings)
         self.addAction(settings)
 
+        save_recording = QAction("Save", self)
+        save_recording.setStatusTip("Save the active recording to the score folder")
+        save_recording.triggered.connect(self.save_recording_requested.emit)
+        self.addAction(save_recording)
+
         self.init_clip_widget()
 
         self.addSeparator()
@@ -206,6 +218,16 @@ class Toolbar(QToolBar):
         if file_path:
             print(f"Selected audio file: {file_path}")
             self.audio_uploaded.emit(file_path)
+
+    def upload_folder(self):
+        """Open a folder dialog and emit the selected Attune folder path."""
+        print("Uploading folder...")
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "Select Attune Folder", ""
+        )
+        if folder_path:
+            print(f"Selected folder: {folder_path}")
+            self.folder_uploaded.emit(folder_path)
     
     def trigger_settings(self):
         """Open the settings dialog."""

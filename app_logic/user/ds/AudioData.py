@@ -32,7 +32,7 @@ class AudioData:
         Args:
             audio_filepath (str): A correct file path pointing to audio data to load
         """
-        if audio_filepath.endswith(".m4a"):
+        if audio_filepath.lower().endswith(".m4a"):
             seg = AudioSegment.from_file(audio_filepath, format="m4a")
             sr = seg.frame_rate
             samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
@@ -46,6 +46,18 @@ class AudioData:
         self.sr = sr
         self.capacity = len(data)
         self.end_index = len(data)
+
+    def read_all(self) -> np.ndarray:
+        """Return a copy of the recorded/loaded portion of the audio buffer."""
+        with self.lock:
+            return np.array(self.data[:self.end_index], copy=True)
+
+    def save_data(self, audio_filepath: str):
+        """Write the recorded/loaded portion of the buffer to disk."""
+        data = self.read_all()
+        if len(data) == 0:
+            raise ValueError("No audio data available to save.")
+        sf.write(audio_filepath, data, int(self.sr))
 
     def write_data(self, indata: np.ndarray, start_time: float=0):
         """
@@ -89,4 +101,3 @@ class AudioData:
         """
         return self.end_index / self.sr
     
-

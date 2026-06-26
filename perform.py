@@ -231,8 +231,19 @@ class PerformTab(QWidget):
     def _on_detection_finished(self):
         """Offline pitch detection finished (queued onto the main thread): clear
         the status and load the now-ready pitch data into view."""
+        sender = self.sender()
+        if (self.recording is None
+                or (sender is not None and sender is not self.recording.pitch_detector)):
+            return
         self.status_bar.update_status("")
         self.guitar_hero.load_user(self.recording)
+        self._refresh_guitar_hero_now()
+
+    def _refresh_guitar_hero_now(self):
+        """Rebuild visible GuitarHero items and ask Qt to repaint immediately."""
+        self.guitar_hero.update_view_items()
+        self.guitar_hero.plot.viewport().update()
+        self.guitar_hero.update()
 
     # --- PLAYBACK / RECORDING (called by the host when this tab is active) ---
     def toggle_playback(self) -> bool:

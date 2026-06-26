@@ -1,4 +1,5 @@
 import numpy as np
+from pathlib import Path
 
 from app_logic.user.ds.AudioData import AudioData
 from app_logic.user.ds.PitchData import PitchData, Pitch
@@ -38,6 +39,12 @@ class Recording:
         self.alignment: Alignment = Alignment(config=self.config) # filled in later
         self.overridden_mistake_indices = set()
 
+        # Persistence metadata. Folder/library entries point at files until their
+        # parent score is active; live takes become dirty as soon as audio is
+        # written and are clean again after save_audio().
+        self.audio_filepath: Path | None = None
+        self.unsaved_changes = False
+
         # queue data structures for real time pitch + note detection + correction
         self.a2p_queue = Buffer(self.config.sr) #audio-to-pitches
         self.p2n_queue = Buffer(sr=self.config.sr/self.config.h1) #pitches-to-notes
@@ -67,7 +74,22 @@ class Recording:
         """load in a pre-recorded audio file from a filepath into audio_data.
         Pitch detection is kicked off separately by the caller (app.py runs the
         cleanup + detection together so the views reset as one)."""
-        self.audio_data.load_data(audio_filepath)
+        path = Path(audio_filepath)
+        self.audio_data.load_data(str(path))
+        self.audio_filepath = path
+        self.unsaved_changes = False
+
+    def save_audio(self, audio_filepath: str | Path):
+        """Persist this recording's current audio buffer to disk."""
+        path = Path(audio_filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.audio_data.save_data(str(path))
+        self.audio_filepath = path
+        self.unsaved_changes = False
+
+    def needs_save(self) -> bool:
+        """True when this recording contains live edits/takes not written to disk."""
+        return self.audio_data.end_index > 0 and self.unsaved_changes
 
     def cleanup(self):
         """Re-init essential data structures. Called before load_score() in app."""
@@ -134,6 +156,7 @@ class Recording:
         and append to our queue for pitch processing
         """
         self.audio_data.write_data(indata, start_time)
+        self.unsaved_changes = True
         self.a2p_queue.push(indata)
 
     def write_pitch_data(self, indata: list[Pitch], start_time: float):

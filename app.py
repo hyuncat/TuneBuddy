@@ -8,9 +8,10 @@ os.environ.setdefault(
 
 from pathlib import Path
 import sys
+import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QPushButton, QLabel, QSplitter, QMessageBox, QTabWidget
+    QPushButton, QLabel, QSplitter, QMessageBox, QTabWidget, QFileDialog
 )
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QIcon
@@ -53,6 +54,13 @@ class Attune(QMainWindow):
         self.score_data = ScoreData()
         self.recordings: dict[str, Recording] = {}  # name -> Recording
         self.active_recording: Recording | None = None
+        self.active_recording_name: str | None = None
+        self.current_score_path: Path | None = None
+        self._suppress_tab_change = False
+        self._current_tab_index = 0
+        # Folder imports can contain many recordings; keep offline pitch work
+        # bounded so a score switch does not spawn one worker per file.
+        self._pitch_detection_semaphore = threading.BoundedSemaphore(2)
 
         self.DEMO_SCORE_PATH = str(Path(__file__).resolve().parent / "resources" / "scores" / "c_major_scale.mxl")
 
@@ -234,6 +242,8 @@ class Attune(QMainWindow):
         # score/audio uploaded
         self.toolbar.score_uploaded.connect(self.load_score)
         self.toolbar.audio_uploaded.connect(self.load_audio)
+        self.toolbar.folder_uploaded.connect(self.load_folder)
+        self.toolbar.save_recording_requested.connect(self.save_active_recording)
         # show settings
         self.toolbar.show_settings.connect(self.settings_dialog.show)
         # clip stuff
@@ -267,6 +277,7 @@ class Attune(QMainWindow):
         # recordings tree
         self.recordings_tree.selected.connect(self.on_recording_selected)
         self.recordings_tree.score_renamed.connect(self.on_score_renamed)
+        self.recordings_tree.score_file_selected.connect(self.on_score_file_selected)
         # settings panel (instrument / range / tuning / transpose)
         self.settings_widget.instrument_applied.connect(self.on_instrument_applied)
         self.settings_widget.range_applied.connect(self.on_range_applied)
@@ -294,47 +305,286 @@ class Attune(QMainWindow):
             return False
         return True
 
-    # --- LOAD SCORE / AUDIO ---
+    # --- LOAD SCORE / AUDIO / FOLDER ---
     def load_score(self, filepath: str):
-        """Load the score into the app.
-        Also push into toolbar's playback menu, BPM display, instrument panel, update slider range,
-        and initialize recordings tree wrt. that score. Load into both performance and practice panels.
-        """
-        self.unalive()  # stop any running playback/recording and reset the clock
+        """Load one directly selected score file."""
+        if not self._confirm_unsaved_before_navigation():
+            return
+        self._load_score_file(filepath, reset_tree=True)
 
-        filepath = Path(filepath)
-        self.score_data.load(filepath)
-
-        # load into UTILITIES
-        self.toolbar.populate_instrument_menu()
-        self.toolbar.set_tempo(self.score_data.bpm)  # reflect the score's tempo
-        self.settings_widget.load_score(self.score_data)
-        self._sync_transpose_input()  # prefill the first-note pitch
-        self.slider.update_range(score_data=self.score_data)
-
-        # load into RECORDINGS TREE
-        self.recordings_tree.init_score(filepath=filepath, score_data=self.score_data)
-        # adding (and selecting) a recording fires on_recording_selected, which
-        # sets active_recording and hands it to the Perform tab.
-        self.recordings_tree._add_recording(name="untitled_recording")
-
-        # cleanup panels and load into both tabs
-        self.perform_tab.cleanup()
-        self.perform_tab.load_score(self.score_data)
-        self.practice_tab.cleanup()
-        self.practice_tab.load_score(filepath)
+    def load_folder(self, folderpath: str):
+        """Scan a folder into the RecordingTree and load its first score."""
+        folder = Path(folderpath)
+        if not self._folder_contains_score(folder):
+            QMessageBox.warning(
+                self,
+                "No scores found",
+                "No score folders were found. A score folder needs a same-named "
+                "score file, or a valid score file directly inside the folder.",
+            )
+            return
+        if not self._confirm_unsaved_before_navigation():
+            return
+        score_paths = self.recordings_tree.init_folder(folder)
+        self._load_score_file(score_paths[0], reset_tree=False)
 
     def load_audio(self, filepath: str):
         if not self._has_recording():
             return
+        if not self._maybe_save_recording(self.active_recording, self.active_recording_name):
+            return
         rec = self.active_recording
         rec.load_audio(filepath)  # loads the raw waveform only
         # default the recording's name to the uploaded audio file's name
-        self.recordings_tree.set_recording_name(Path(filepath).stem)
+        new_name = self.recordings_tree.set_recording_name(Path(filepath).stem)
+        if new_name:
+            self.active_recording_name = new_name
+            self.status_bar.update_name(new_name)
+            self.recordings_tree.update_recording_file(new_name, filepath)
         self.sync_slider()
         # make it playable + (re-)detect pitches in the background (the Perform
         # tab owns the audio player + detection pipeline)
         self.perform_tab.refresh_audio()
+
+    def _load_score_file(
+        self,
+        filepath: str | Path,
+        reset_tree: bool,
+        select_recording_path: str | Path | None = None,
+    ):
+        """Internal score swap. Does not prompt; callers handle unsaved state."""
+        self.unalive()
+        self.perform_tab.cleanup()
+        self.practice_tab.cleanup()
+
+        filepath = Path(filepath)
+        self.current_score_path = Path(self._path_key(filepath))
+        self.active_recording = None
+        self.active_recording_name = None
+        self.recordings.clear()
+
+        self.score_data.load(filepath)
+        tree_title = self.recordings_tree.score_title(filepath)
+        if tree_title:
+            self.score_data.set_title(tree_title)
+
+        self.toolbar.populate_instrument_menu()
+        self.toolbar.set_tempo(self.score_data.bpm)
+        self.settings_widget.load_score(self.score_data)
+        self._sync_transpose_input()
+        self.slider.update_range(score_data=self.score_data)
+
+        if reset_tree:
+            self.recordings_tree.init_score(filepath=filepath, score_data=self.score_data)
+        else:
+            self.recordings_tree.set_active_score(filepath, score_data=self.score_data)
+
+        self.perform_tab.load_score(self.score_data)
+        self.practice_tab.load_score(filepath)
+
+        recording_entries = self.recordings_tree.recording_entries_for_score(filepath)
+        if recording_entries:
+            self._hydrate_recordings(recording_entries)
+            target_name = None
+            if select_recording_path is not None:
+                target_name = self.recordings_tree.recording_name_for_path(filepath, select_recording_path)
+            target_name = target_name or recording_entries[0][0]
+            self.recordings_tree.select_recording_name(target_name, score_path=filepath)
+            self._detect_imported_recordings()
+        else:
+            self.recordings_tree._add_recording(name="untitled_recording")
+        self._reset_transport_position()
+
+    def _hydrate_recordings(self, recording_entries: list[tuple[str, Path]]):
+        """Load every recording file for the currently active score."""
+        for name, audio_path in recording_entries:
+            rec = Recording(score_data=self.score_data)
+            try:
+                rec.load_audio(str(audio_path))
+            except Exception as e:
+                print(f"Could not load recording '{audio_path}': {e}")
+                continue
+            self.recordings[name] = rec
+
+    def _detect_imported_recordings(self):
+        """Run bounded background pitch detection for loaded file-backed takes."""
+        for rec in list(self.recordings.values()):
+            if rec.audio_data.end_index <= 0:
+                continue
+            thread = getattr(rec.pitch_detector, "offline_thread", None)
+            if thread and thread.is_alive():
+                continue
+            self._detect_recording_with_limit(rec)
+
+    def _detect_recording_with_limit(self, rec: Recording):
+        def worker():
+            with self._pitch_detection_semaphore:
+                try:
+                    rec.detect_pitches(on_phase=rec.pitch_detector.status_changed.emit)
+                except Exception as e:
+                    print(f"[PitchDetector] imported recording detection failed: {e}")
+                finally:
+                    rec.pitch_detector.detection_finished.emit()
+
+        rec.pitch_detector.offline_thread = threading.Thread(target=worker, daemon=True)
+        rec.pitch_detector.offline_thread.start()
+
+    def _folder_contains_score(self, folder: Path) -> bool:
+        try:
+            return any(
+                path.is_file() and path.suffix.lower() in self.recordings_tree.SCORE_EXTENSIONS
+                for path in folder.rglob("*")
+            )
+        except OSError as e:
+            print(f"Could not scan folder '{folder}': {e}")
+            return False
+
+    def _reset_transport_position(self):
+        """Start a freshly loaded score from its own beginning, not the previous score's playhead."""
+        self.wall_clock.stop()
+        self.slider.set_time(0.0)
+        self.update_time_label(self.slider.get_time())
+        self._active_tab().render_at(self.slider.get_time())
+
+    # --- SAVE / UNSAVED RECORDINGS ---
+    def save_active_recording(self) -> bool:
+        """Toolbar action: save the active tab's recording."""
+        if self._practice_active():
+            return self._save_practice_recording()
+        if not self._has_recording(warn=True):
+            return False
+        return bool(self._save_recording(self.active_recording, self.active_recording_name))
+
+    def _save_practice_recording(self) -> bool:
+        rec = self.practice_tab.recording
+        score_title = self.recordings_tree.score_title(self.current_score_path) or self.score_data.title
+        default_name = f"{score_title}_practice"
+        saved_path = self._save_recording(rec, default_name)
+        if not saved_path:
+            return False
+
+        # Practice owns an independent ScoreData copy. Add a fresh Perform
+        # Recording pointing at the saved file so later selection uses the app's
+        # active score object.
+        name = self._unique_recording_name(saved_path.stem)
+        item = self.recordings_tree.ensure_recording_item(
+            name,
+            filepath=saved_path,
+            score_path=self.current_score_path,
+            select=False,
+        )
+        if item is not None:
+            name = item.data(0, self.recordings_tree.NAME_ROLE) or name
+        loaded = Recording(score_data=self.score_data)
+        loaded.load_audio(str(saved_path))
+        self.recordings[name] = loaded
+        self._detect_recording_with_limit(loaded)
+        return True
+
+    def _save_recording(self, rec: Recording | None, default_name: str | None):
+        if rec is None:
+            return False
+        if rec.audio_data.end_index <= 0:
+            QMessageBox.warning(self, "No audio available", "There is no audio to save.")
+            return False
+
+        score_dir = self._current_score_folder()
+        if score_dir is None:
+            QMessageBox.warning(self, "No score folder", "Load a score before saving a recording.")
+            return False
+
+        default_name = self._safe_filename(default_name or "recording")
+        writable_suffixes = {".wav", ".wave", ".flac", ".ogg", ".aif", ".aiff"}
+        current_suffix = rec.audio_filepath.suffix.lower() if rec.audio_filepath else ""
+        default_suffix = current_suffix if current_suffix in writable_suffixes else ".wav"
+        default_path = score_dir / f"{default_name}{default_suffix or '.wav'}"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Recording",
+            str(default_path),
+            "WAV (*.wav);;FLAC (*.flac);;AIFF (*.aiff *.aif);;OGG (*.ogg);;All Files (*)",
+        )
+        if not file_path:
+            return False
+
+        chosen = Path(file_path)
+        if not chosen.suffix:
+            chosen = chosen.with_suffix(".wav")
+        save_path = score_dir / chosen.name
+
+        try:
+            rec.save_audio(save_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Save failed", f"Could not save recording:\n{e}")
+            return False
+
+        if rec is self.active_recording:
+            new_name = self.recordings_tree.set_recording_name(save_path.stem, old_name=self.active_recording_name)
+            if new_name:
+                self.active_recording_name = new_name
+                self.status_bar.update_name(new_name)
+                self.recordings_tree.update_recording_file(new_name, save_path)
+        return save_path
+
+    def _confirm_unsaved_before_navigation(self) -> bool:
+        if not self._maybe_save_recording(self.active_recording, self.active_recording_name):
+            return False
+        practice_rec = getattr(self.practice_tab, "recording", None)
+        if practice_rec is not None and practice_rec.needs_save():
+            return self._maybe_save_recording(practice_rec, "practice recording", practice=True)
+        return True
+
+    def _maybe_save_recording(
+        self,
+        rec: Recording | None,
+        name: str | None,
+        practice: bool = False,
+    ) -> bool:
+        if rec is None or not rec.needs_save():
+            return True
+        display_name = name or "recording"
+        choice = QMessageBox.warning(
+            self,
+            "Unsaved recording",
+            f"Save changes to {display_name}?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if choice == QMessageBox.StandardButton.Save:
+            if practice:
+                return self._save_practice_recording()
+            return bool(self._save_recording(rec, name))
+        if choice == QMessageBox.StandardButton.Discard:
+            rec.unsaved_changes = False
+            return True
+        return False
+
+    def _current_score_folder(self) -> Path | None:
+        if self.current_score_path is None:
+            return None
+        return Path(self.current_score_path).parent
+
+    def _unique_recording_name(self, base: str) -> str:
+        base = (base or "recording").strip()
+        if base not in self.recordings:
+            return base
+        n = 2
+        while f"{base} ({n})" in self.recordings:
+            n += 1
+        return f"{base} ({n})"
+
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        cleaned = "".join(c if c.isalnum() or c in "._- " else "_" for c in name).strip()
+        return cleaned or "recording"
+
+    @staticmethod
+    def _path_key(path: str | Path | None) -> str | None:
+        if path is None:
+            return None
+        return str(Path(path).expanduser().resolve())
 
     # --- SHARED TRANSPORT DISPATCH ---
     def toggle_playback(self):
@@ -422,12 +672,27 @@ class Attune(QMainWindow):
         Updates it as the active_recording, pushes its config into side panels,
         and updates Performance Tab with it.
         """
+        if recording_name is None:
+            self.active_recording = None
+            self.active_recording_name = None
+            self.status_bar.update_name("untitled_recording")
+            self.sync_slider()
+            return
         if recording_name not in self.recordings.keys():
             print(f"No recording named '{recording_name}' was found.")
             return
+
+        if (self.active_recording is not None
+                and self.active_recording is not self.recordings[recording_name]):
+            old_name = self.active_recording_name
+            if not self._maybe_save_recording(self.active_recording, old_name):
+                if old_name:
+                    self.recordings_tree.select_recording_name(old_name, emit=False)
+                return
         
         # set the active recording here!
         self.active_recording = self.recordings[recording_name]
+        self.active_recording_name = recording_name
         rec = self.active_recording
 
         # push config into side panels
@@ -438,6 +703,33 @@ class Attune(QMainWindow):
         # also pass to Performance Tab
         self.perform_tab.set_active_recording(rec)
         self.sync_slider()
+
+    def on_score_file_selected(self, score_path: str, recording_path):
+        """A folder-library score or recording pointer was selected."""
+        if not score_path:
+            return
+        current = self._path_key(self.current_score_path)
+        requested = self._path_key(score_path)
+
+        if requested == current:
+            if recording_path:
+                name = self.recordings_tree.recording_name_for_path(score_path, recording_path)
+                if name:
+                    self.recordings_tree.select_recording_name(name, score_path=score_path)
+            return
+
+        old_name = self.active_recording_name
+        if not self._confirm_unsaved_before_navigation():
+            if old_name:
+                self.recordings_tree.select_recording_name(old_name, emit=False)
+            else:
+                self.recordings_tree.select_score(current, emit=False)
+            return
+        self._load_score_file(
+            score_path,
+            reset_tree=False,
+            select_recording_path=recording_path,
+        )
     
     def on_score_renamed(self, title: str):
         """The Score Title was edited in the RecordingTree (the source of truth).
@@ -593,7 +885,19 @@ class Attune(QMainWindow):
         transport buttons, then re-range the shared slider to the new tab and line
         its views up with the current time (the two tabs can have different total
         lengths, so the slider position is clamped/re-rendered to stay consistent)."""
+        if self._suppress_tab_change:
+            return
+        old_practice = self.center_tabs.widget(self._current_tab_index) is self.practice_tab
         practice = self.center_tabs.widget(index) is self.practice_tab
+        if old_practice and not practice:
+            practice_rec = getattr(self.practice_tab, "recording", None)
+            if practice_rec is not None and practice_rec.needs_save():
+                if not self._maybe_save_recording(practice_rec, "practice recording", practice=True):
+                    self._suppress_tab_change = True
+                    self.center_tabs.setCurrentIndex(self._current_tab_index)
+                    self._suppress_tab_change = False
+                    return
+        self._current_tab_index = index
         self.unalive()
 
         self.analyze_button.setVisible(not practice)
@@ -621,6 +925,13 @@ class Attune(QMainWindow):
     def on_clip_reset(self):
         """Clip menu 'Reset': restore the active tab's full score."""
         self._active_tab().reset_clip()
+
+    def closeEvent(self, event):
+        if self._confirm_unsaved_before_navigation():
+            self.unalive()
+            event.accept()
+        else:
+            event.ignore()
 
 
 if __name__ == "__main__":
