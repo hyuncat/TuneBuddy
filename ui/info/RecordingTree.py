@@ -21,6 +21,7 @@ class RecordingTree(QWidget):
     selected = pyqtSignal(object)           # active recording name, or None
     score_renamed = pyqtSignal(str)         # active score title changed
     score_file_selected = pyqtSignal(str, object)  # score path, optional recording path
+    recording_renamed = pyqtSignal(str, str) # old recording name, new recording name
 
     SCORE_EXTENSIONS = {".mid", ".midi", ".mxl", ".musicxml", ".xml", ".mei"}
     AUDIO_EXTENSIONS = {
@@ -391,9 +392,20 @@ class RecordingTree(QWidget):
         if name in self.recordings:
             print(f"Recording with name '{name}' already exists. Skipping creation.")
             return
-        rec = Recording(score_data=self.score_data)
+        rec = Recording(score_data=self._new_score_data_for_current_score())
         self.recordings[name] = rec
         self.ensure_recording_item(name, select=True)
+
+    def _new_score_data_for_current_score(self) -> ScoreData:
+        """Fresh score instance for a new recording under the active score."""
+        if not self.current_score_path:
+            return self.score_data
+        score_data = ScoreData()
+        score_data.load(self.current_score_path)
+        title = self.score_title(self.current_score_path)
+        if title:
+            score_data.set_title(title)
+        return score_data
 
     def _find_item(self, name: str) -> QTreeWidgetItem | None:
         return self._find_recording_item(self.current_score_path, name)
@@ -468,6 +480,7 @@ class RecordingTree(QWidget):
     def _delete_recording_file(self, recording_path: str | Path) -> bool:
         path = Path(recording_path)
         if not path.exists():
+            Recording.delete_cache_for(path)
             return True
         if not path.is_file():
             QMessageBox.warning(
@@ -478,6 +491,7 @@ class RecordingTree(QWidget):
             return False
         try:
             path.unlink()
+            Recording.delete_cache_for(path)
         except OSError as e:
             QMessageBox.warning(
                 self,
@@ -540,10 +554,33 @@ class RecordingTree(QWidget):
         if not new_name:
             self._revert_item(item, old_name)
             return
+        if Path(new_name).name != new_name:
+            QMessageBox.warning(self, "Invalid name", "Recording names cannot contain path separators.")
+            self._revert_item(item, old_name)
+            return
         if new_name in self.recordings:
             QMessageBox.warning(self, "Name already exists", f"A recording named '{new_name}' already exists.")
             self._revert_item(item, old_name)
             return
+
+        rec = self.recordings.get(old_name)
+        new_audio_path = None
+        if rec is not None:
+            try:
+                new_audio_path = rec.rename_files(new_name)
+            except FileExistsError as e:
+                target = e.filename or (e.args[0] if e.args else "")
+                QMessageBox.warning(
+                    self,
+                    "Rename failed",
+                    f"Could not rename recording:\n{Path(target).name} already exists.",
+                )
+                self._revert_item(item, old_name)
+                return
+            except OSError as e:
+                QMessageBox.warning(self, "Rename failed", f"Could not rename recording:\n{e}")
+                self._revert_item(item, old_name)
+                return
 
         if old_name in self.recordings:
             rec = self.recordings.pop(old_name)
@@ -551,11 +588,14 @@ class RecordingTree(QWidget):
 
         self._suppress_item_changed = True
         item.setData(col, self.NAME_ROLE, new_name)
+        if new_audio_path is not None:
+            item.setData(col, self.RECORDING_PATH_ROLE, self._path_key(new_audio_path))
         self._suppress_item_changed = False
 
         if self.active_recording == old_name:
             self.active_recording = new_name
             self.selected.emit(new_name)
+        self.recording_renamed.emit(old_name, new_name)
 
     def _handle_score_rename(self, item: QTreeWidgetItem, col: int):
         old_title = item.data(0, self.NAME_ROLE) or ""

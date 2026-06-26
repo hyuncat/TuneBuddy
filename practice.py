@@ -346,16 +346,9 @@ class PracticeTab(QWidget):
         bpm_og = self.score_data.bpm_og or self.score_data.bpm
         if not bpm_og:
             return t
-        og_t = t * self.score_data.bpm / bpm_og
+        # undo the transpose offset then the tempo change (mirrors PerformTab)
+        og_t = (t - self.score_data.transpose_offset) * self.score_data.bpm / bpm_og
         return self._time_map.to_viewer(og_t)
-
-    def _app_time_from_viewer(self, sec: float) -> float:
-        """Inverse of _score_viewer_time: a Verovio-timeframe second (e.g. a
-        measure-selection bound) back to wall-clock (current-tempo) app time."""
-        bpm = self.score_data.bpm
-        bpm_og = self.score_data.bpm_og or bpm
-        og_t = self._time_map.from_viewer(sec)
-        return og_t * (bpm_og / bpm) if bpm else og_t
 
     def refresh_score_viewer(self, *_):
         """Re-render the score viewer to match the active instrument's part.
@@ -408,13 +401,13 @@ class PracticeTab(QWidget):
         self.score_viewer.get_clip_selection(self._on_clip_selection)
 
     def _on_clip_selection(self, sel: dict | None):
-        """Turn a pulled measure selection into a note-index clip (viewer seconds
-        -> app time through the barline map -> note indices)."""
+        """Turn a pulled measure selection into a note-index clip. `sel` holds
+        inclusive measure INDICES; ScoreData resolves them to notes off its own
+        MIDI timeline (drift-free). Mirrors PerformTab._on_clip_selection."""
         if not sel:
             return  # nothing selected -> leave the current clip as-is
-        b0 = max(0.0, self._app_time_from_viewer(sel["startSec"]))
-        b1 = self._app_time_from_viewer(sel["endSec"])
-        clip = self.score_data.note_index_range(b0, b1)
+        clip = self.score_data.note_index_range_for_measures(
+            sel["startIdx"], sel["endIdx"])
         if clip is None:
             return
         self.set_clip(clip, seek=True)
@@ -453,10 +446,11 @@ class PracticeTab(QWidget):
         self.guitar_hero.update_view_items()
 
     def _refresh_clip_focus(self):
-        """(Re)assert (or clear) the score-viewer grey-out from the clip window."""
-        b = self.score_data.clip_bounds()
-        if b is not None:
-            self.score_viewer.set_clip_range(
-                self._score_viewer_time(b[0]), self._score_viewer_time(b[1]))
+        """(Re)assert (or clear) the score-viewer grey-out from the clip, keyed on
+        the clip's measure indices (derived from its notes) so it greys exactly
+        the clipped measures regardless of Verovio drift."""
+        mr = self.score_data.clip_measure_range()
+        if mr is not None:
+            self.score_viewer.set_clip_range(mr[0], mr[1])
         else:
             self.score_viewer.clear_clip_range()

@@ -11,10 +11,17 @@ let currentPage = 1; // verovio pages start at 1
 //      `.selected`, and
 //   2. the active CLIP RANGE (clipRange, set by Python via window.setClipRange)
 //      drawn by greying everything OUTSIDE it with `.clipped-out`.
-// Both are stored as time intervals in SECONDS (Verovio's original-tempo
-// timeframe) and re-applied on every renderPage so they survive page flips
-// (the viewer lays out one system per page, so off-page measures aren't in DOM).
+// What CROSSES to Python is MEASURE INDICES, not seconds: Verovio's rendered
+// timeline drifts ahead of the app's MIDI timeline (lossy MIDI->MusicXML round
+// trip), so a clip resolved from Verovio seconds lands on the wrong notes. The
+// measure index is the one landmark that's unambiguously 1:1 between the two, so
+// Python resolves measures->notes off its own timeline (see
+// ScoreData.note_index_range_for_measures). Seconds are kept only for the
+// in-progress `.selected` highlight, which lives entirely in Verovio's frame.
+// All of this is re-applied on every renderPage so it survives page flips (the
+// viewer lays out one system per page, so off-page measures aren't in DOM).
 let measureOnsets = new Map(); // measureId -> onset (sec)
+let measureIndex = new Map();  // measureId -> index into measureOrder (score order)
 let measureOrder = [];         // [{id, onset}] sorted by onset, whole score
 let scoreEndSec = 0;           // largest onset seen (approx score end)
 const TO_END = 1e9;            // sentinel end for "clip runs to the score end"
@@ -22,8 +29,8 @@ const TO_END = 1e9;            // sentinel end for "clip runs to the score end"
 let selStartId = null;
 let selEndId = null;
 let selStage = 0;              // 0 none, 1 start placed, 2 range complete
-let selInterval = null;        // {startSec, endSec} | null
-let clipRange = null;          // {startSec, endSec} | null (grey-out focus)
+let selInterval = null;        // {startSec, endSec, startIdx, endIdx} | null
+let clipRange = null;          // {startIdx, endIdx} inclusive | null (grey-out focus)
 
 // --- HELPERS ---
 function setStatus(msg) {
@@ -111,6 +118,7 @@ function addMeasureHitAreas() {
 // each measure's start time (and ordering) regardless of which page is rendered.
 function buildMeasureMap() {
     measureOnsets = new Map();
+    measureIndex = new Map();
     measureOrder = [];
     scoreEndSec = 0;
 
@@ -135,6 +143,14 @@ function buildMeasureMap() {
         }
     }
     measureOrder.sort((a, b) => a.onset - b.onset);
+    // index each measure by its position in score order, so a clicked measure id
+    // maps straight to the index Python pairs with its own measure onsets.
+    measureOrder.forEach((m, i) => measureIndex.set(m.id, i));
+}
+
+// Index of a measure id in score order, or -1 if unknown (off-map measure).
+function measureIndexFor(id) {
+    return measureIndex.has(id) ? measureIndex.get(id) : -1;
 }
 
 // Ordered measure-onset times (sec, Verovio's original-tempo timeframe) for the
@@ -180,9 +196,15 @@ function recomputeSelInterval() {
     if (a === null || b === null) { selInterval = null; return; }
     const startSec = Math.min(a, b);
     // the later-onset measure ends the range; include its full bar
+    const firstId = (a <= b) ? selStartId : (selEndId || selStartId);
     const lastId = (a <= b) ? (selEndId || selStartId) : selStartId;
     const endSec = onsetAfter(lastId);
-    selInterval = { startSec, endSec };
+    // measure indices (what Python clips on) + seconds (the in-progress highlight)
+    selInterval = {
+        startSec, endSec,
+        startIdx: measureIndexFor(firstId),
+        endIdx: measureIndexFor(lastId),
+    };
 }
 
 // Paint `.selected` (in-progress pick) and `.clipped-out` (focus grey-out) on
@@ -191,14 +213,17 @@ function recomputeSelInterval() {
 function applyOverlays() {
     const measures = document.querySelectorAll("#notation g.measure");
     for (const m of measures) {
+        // the in-progress pick is highlighted in Verovio's own (self-consistent)
+        // seconds; the active clip grey-out is keyed on measure index.
         const onset = measureOnsetFor(m.id);
         const inSel = selInterval && onset !== null
             && onset >= selInterval.startSec - 1e-6
             && onset < selInterval.endSec - 1e-6;
         m.classList.toggle("selected", !!inSel);
 
-        const outOfClip = clipRange && onset !== null
-            && (onset < clipRange.startSec - 1e-6 || onset >= clipRange.endSec - 1e-6);
+        const idx = measureIndexFor(m.id);
+        const outOfClip = clipRange && idx >= 0
+            && (idx < clipRange.startIdx || idx > clipRange.endIdx);
         m.classList.toggle("clipped-out", !!outOfClip);
     }
 }
@@ -306,11 +331,14 @@ window.timeChanged = function(sec) {
 }
 
 // --- CLIP API (called from python) ---
-// The in-progress measure selection, in SECONDS (original-tempo timeframe), or
-// null if nothing is selected. Python pulls this when the user presses Clip.
+// The in-progress measure selection as inclusive measure INDICES (score order),
+// or null if nothing is selected. Python pulls this when the user presses Clip
+// and resolves the indices to notes off its own (drift-free) timeline. Returns
+// null if either endpoint isn't on the measure map.
 window.getClipSelection = function() {
     if (!selInterval) return null;
-    return { startSec: selInterval.startSec, endSec: selInterval.endSec };
+    if (selInterval.startIdx < 0 || selInterval.endIdx < 0) return null;
+    return { startIdx: selInterval.startIdx, endIdx: selInterval.endIdx };
 }
 
 // Clear the in-progress selection + its `.selected` highlight.
@@ -321,10 +349,11 @@ window.clearClipSelection = function() {
     applyOverlays();
 }
 
-// Set the active clip range (grey out everything outside it). startSec/endSec in
-// the viewer's original-tempo timeframe.
-window.setClipRange = function(startSec, endSec) {
-    clipRange = { startSec: startSec, endSec: endSec };
+// Set the active clip range (grey out everything outside it). startIdx/endIdx are
+// inclusive measure indices in score order (Python derives them from the clip's
+// notes), so the grey-out tracks the same measures the clip actually holds.
+window.setClipRange = function(startIdx, endIdx) {
+    clipRange = { startIdx: startIdx, endIdx: endIdx };
     applyOverlays();
 }
 

@@ -14,6 +14,7 @@ from app_logic.user.AudioPlayer import AudioPlayer
 from app_logic.user.AudioRecorder import AudioRecorder
 from app_logic.Alignment import Alignment
 from app_logic.NoteData import NoteData
+from app_logic.user.ds.PitchData import PitchData
 
 from ui.ScoreViewer import ScoreViewer
 from ui.GuitarHero import GuitarHero
@@ -116,6 +117,8 @@ class PerformTab(QWidget):
         """Make `rec` the active take. Wires its pitch detector once, then loads
         its analysis/audio into the views, audio engines and mistake list."""
         self.recording = rec
+        if rec.score_data is not self.score_data:
+            self.load_score(rec.score_data)
         self._wire_detector(rec)
         self.guitar_hero.load_user(rec)
         self.audio_player.load_audio(rec.audio_data)
@@ -178,9 +181,10 @@ class PerformTab(QWidget):
         the algorithms from the (unchanged) Config, and re-render the views."""
         if not self._has_recording():
             return
+        self.score_data = self.recording.score_data
         self.score_data.active_instrument = channel
         self.recording.active_instrument = channel
-        self.cleanup()
+        self._clear_analysis()
         self.recording.update_config(self.recording.config)
         self.refresh_score_viewer()
 
@@ -207,6 +211,11 @@ class PerformTab(QWidget):
         if not self._has_recording():
             return
         self.audio_player.load_audio(self.recording.audio_data)
+        if self.recording.has_pitch_data():
+            self.guitar_hero.load_user(self.recording)
+            self.mistake_widget.load_mistakes(self.recording.alignment.mistakes)
+            self._refresh_guitar_hero_now()
+            return
         self.detect_pitches()
 
     def detect_pitches(self):
@@ -217,6 +226,9 @@ class PerformTab(QWidget):
         if rec is None or rec.audio_data.end_index <= 0:
             return
         self._clear_analysis()  # clear stale analysis but KEEP the loaded audio
+        rec.pitch_data = PitchData(config=rec.config)
+        self.guitar_hero.load_user(rec)
+        rec.save_cache()
         self._wire_detector(rec)  # just in case
         rec.pitch_detector.detect_pitches_async()
 
@@ -238,6 +250,7 @@ class PerformTab(QWidget):
         self.status_bar.update_status("")
         self.guitar_hero.load_user(self.recording)
         self._refresh_guitar_hero_now()
+        self.recording.save_cache()
 
     def _refresh_guitar_hero_now(self):
         """Rebuild visible GuitarHero items and ask Qt to repaint immediately."""
@@ -383,7 +396,14 @@ class PerformTab(QWidget):
         self.guitar_hero.load_user(rec)
         self.guitar_hero.update_view_items()
         self.slider.update_range(score_data=self.score_data, recording=rec)
+        # a clip-resize re-anchors the clip (and the take) at t=0 — line the view up
+        # at the clip start and redraw the dim bands at the new absolute positions.
+        b = self.score_data.clip_bounds()
+        if b is not None:
+            self.slider.set_time(b[0])
+        self.guitar_hero.update_clip_overlay()
         self.mistake_widget.load_mistakes(rec.alignment.mistakes)
+        rec.save_cache()
 
         # the resize stretched the score to match the take => its BPM/length
         # changed; let the host reflect that in the tempo display.
@@ -417,6 +437,7 @@ class PerformTab(QWidget):
         self.mistake_widget.refresh_override(idx)
         self.guitar_hero.update_highlight_override(mistake.is_overridden())
         self.guitar_hero.update_view_items()
+        self.recording.save_cache()
 
     # --- SCORE VIEWER ---
     def _score_viewer_time(self, t: float) -> float:
@@ -429,16 +450,11 @@ class PerformTab(QWidget):
         bpm_og = self.score_data.bpm_og or self.score_data.bpm
         if not bpm_og:
             return t
-        og_t = t * self.score_data.bpm / bpm_og
+        # undo the transpose offset (a clip-resize shifts the notes so the clip
+        # starts at t=0) THEN the tempo change -> original-tempo app time, the
+        # frame measure_onsets_og / the barline map are anchored in.
+        og_t = (t - self.score_data.transpose_offset) * self.score_data.bpm / bpm_og
         return self._time_map.to_viewer(og_t)
-
-    def _app_time_from_viewer(self, sec: float) -> float:
-        """Inverse of _score_viewer_time: a Verovio-timeframe second (e.g. a
-        measure-selection bound) back to wall-clock (current-tempo) app time."""
-        bpm = self.score_data.bpm
-        bpm_og = self.score_data.bpm_og or bpm
-        og_t = self._time_map.from_viewer(sec)
-        return og_t * (bpm_og / bpm) if bpm else og_t
 
     def refresh_score_viewer(self):
         """Re-render the Verovio score viewer.
@@ -484,14 +500,13 @@ class PerformTab(QWidget):
 
     def _on_clip_selection(self, sel: dict | None):
         """Turn a pulled measure selection into a note-index clip. `sel` holds
-        startSec/endSec in the viewer's timeframe; map back to app time (inverse
-        of _score_viewer_time, through the barline map), then resolve to note
-        indices (which capture EXACTLY the notes in the selected measures)."""
+        inclusive measure INDICES (startIdx/endIdx); ScoreData resolves them to
+        the exact notes in those measures off its own MIDI timeline, so the clip
+        can't drift even where Verovio's rendered timeline runs ahead."""
         if not sel:
             return  # nothing selected -> leave the current clip as-is
-        b0 = max(0.0, self._app_time_from_viewer(sel["startSec"]))
-        b1 = self._app_time_from_viewer(sel["endSec"])
-        clip = self.score_data.note_index_range(b0, b1)
+        clip = self.score_data.note_index_range_for_measures(
+            sel["startIdx"], sel["endIdx"])
         if clip is None:
             return
         self.set_clip(clip, seek=True)
@@ -518,6 +533,8 @@ class PerformTab(QWidget):
                 self.slider.set_time(b[0])  # jump the cursor to the clip start
         self._refresh_clip_focus()
         self.move_views(self.slider.get_time())
+        if self.recording is not None:
+            self.recording.save_cache()
 
     def sync_clip(self, clip):
         """Mirror a clip made in the OTHER tab onto this score (the clip is global).
@@ -529,15 +546,16 @@ class PerformTab(QWidget):
             self.score_data.set_clip(*clip)
         self._refresh_clip_focus()
         self.guitar_hero.update_view_items()
+        if self.recording is not None:
+            self.recording.save_cache()
 
     def _refresh_clip_focus(self):
-        """(Re)assert (or clear) the score-viewer grey-out from the clip window.
-        The grey-out is in the viewer's original-tempo frame, so map the clip's
-        (app-time) bounds through _score_viewer_time."""
-        b = self.score_data.clip_bounds()
-        if b is not None:
-            self.score_viewer.set_clip_range(
-                self._score_viewer_time(b[0]), self._score_viewer_time(b[1]))
+        """(Re)assert (or clear) the score-viewer grey-out from the clip. Keyed on
+        the clip's measure indices (derived from its notes) so it greys exactly
+        the clipped measures regardless of Verovio's timeline drift."""
+        mr = self.score_data.clip_measure_range()
+        if mr is not None:
+            self.score_viewer.set_clip_range(mr[0], mr[1])
         else:
             self.score_viewer.clear_clip_range()
 

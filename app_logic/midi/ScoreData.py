@@ -1,6 +1,7 @@
 from pathlib import Path
 from music21 import converter, tempo, meter
 from music21 import interval as m21interval, pitch as m21pitch
+import bisect
 import tempfile
 
 from app_logic.midi.MidiData import MidiData
@@ -17,6 +18,7 @@ class ScoreData:
 
         # --- META ---
         # score metadata
+        self.filepath: Path | None = None
         self.length = 0.0 # sec
         self.bpm, self.bpm_og = 120, 120
         self.title: str = "" # display title written to verovio
@@ -82,6 +84,13 @@ class ScoreData:
             return note_data.read_note(i=self.i)
         return None
 
+    @property
+    def transpose_offset(self) -> float:
+        """The app-time shift currently applied to the notes by transpose_notes
+        (e.g. a clip-resize lands the clip's first note at t=0). The score-viewer
+        time mapping must undo this so the cursor/grey-out stay aligned."""
+        return self._beat_offset
+
     # --- CLIPPING API (the single source of truth; see self.clip) ---
     def is_clipped(self) -> bool:
         return self.clip is not None
@@ -111,6 +120,29 @@ class ScoreData:
             return None
         return (idxs[0], idxs[-1])
 
+    def note_index_range_for_measures(self, m0: int, m1: int,
+                                      channel: int | None = None
+                                      ) -> tuple[int, int] | None:
+        """Note-index clip (i0, i1) for the INCLUSIVE measure-index span [m0, m1].
+        The measure boundaries come from measure_onsets (the MIDI/music21 timeline)
+        — NOT Verovio's timemap — so the clip can't drift from what's sounding even
+        when Verovio's rendered timeline runs ahead of the MIDI. None if no notes
+        fall in the span."""
+        channel = self.active_instrument if channel is None else channel
+        onsets = self.measure_onsets(channel)
+        if not onsets:
+            return None
+        n = len(onsets)
+        if m0 > m1:
+            m0, m1 = m1, m0
+        m0 = max(0, min(m0, n - 1))
+        m1 = max(0, min(m1, n - 1))
+        t0 = onsets[m0]
+        # end of the last selected bar = the next bar's onset (the score end for
+        # the final bar); note_index_range's half-open span then excludes it.
+        t1 = onsets[m1 + 1] if (m1 + 1) < n else float("inf")
+        return self.note_index_range(t0, t1, channel)
+
     def clip_bounds(self, channel: int | None = None) -> tuple[float, float] | None:
         """The clip's [start, end] time window in CURRENT app-time, DERIVED from
         the live note positions (so it auto-tracks tempo/resize). None = no clip.
@@ -125,6 +157,28 @@ class ScoreData:
         if not (0 <= i0 <= i1 < len(nd.times)):
             return None
         return (nd.read_note(i=i0).start_time, nd.read_note(i=i1).end_time)
+
+    def clip_measure_range(self, channel: int | None = None
+                           ) -> tuple[int, int] | None:
+        """The INCLUSIVE measure-index span [m0, m1] the current clip covers,
+        derived from the clipped notes' positions against measure_onsets (the
+        MIDI timeline). Used to grey out the score viewer by measure index — the
+        drift-free counterpart to note_index_range_for_measures. None = no clip."""
+        if self.clip is None:
+            return None
+        channel = self.active_instrument if channel is None else channel
+        nd = self.note_datas.get(channel)
+        onsets = self.measure_onsets(channel)
+        if not nd or not nd.times or not onsets:
+            return None
+        i0, i1 = self.clip
+        if not (0 <= i0 <= i1 < len(nd.times)):
+            return None
+        s0 = nd.read_note(i=i0).start_time
+        s1 = nd.read_note(i=i1).start_time
+        m0 = max(0, bisect.bisect_right(onsets, s0 + 1e-6) - 1)
+        m1 = max(0, bisect.bisect_right(onsets, s1 + 1e-6) - 1)
+        return (m0, m1)
 
     def clipped_note_data(self, channel: int | None = None) -> NoteData:
         """The active instrument's notes WITHIN the clip (exactly indices i0..i1),
@@ -151,6 +205,7 @@ class ScoreData:
         p = Path(filepath)
         ext = p.suffix.lower()
         print(f"Loading score file: {filepath}")
+        self.filepath = p
         # default the score title to the filename; the RecordingTree shows the
         # same value and is the source of truth from here on (set_title).
         self.title = p.stem
@@ -220,6 +275,22 @@ class ScoreData:
         bpm_og = self.bpm_og or self.bpm or 120
         sec_per_ql = 60.0 / bpm_og
         return [round(float(m.offset) * sec_per_ql, 9) for m in measures]
+
+    def measure_onsets(self, channel: int | None = None) -> list[float]:
+        """Barline onsets in CURRENT app-time — the same timeline the notes /
+        GuitarHero / slider run off. Just measure_onsets_og scaled back from
+        bpm_og into the live tempo and shifted by any transpose offset (the
+        inverse of _score_viewer_time's tempo step). No Verovio timemap is
+        involved, so these never drift from what's actually sounding; clip
+        resolution and the grey-out are derived from them."""
+        og = self.measure_onsets_og(channel)
+        if not og:
+            return []
+        bpm = self.bpm
+        bpm_og = self.bpm_og or bpm
+        scale = (bpm_og / bpm) if bpm else 1.0
+        off = self.transpose_offset
+        return [o * scale + off for o in og]
 
     def get_default_instrument(self) -> int:
         """Called at the beginning to set a default first instrument (non-metronome)"""
@@ -306,6 +377,11 @@ class ScoreData:
         # 3. update metadata
         self.bpm = new_bpm
         self.length = self.midi_data.length_og * factor
+        # make_notedatas (step 5) rebuilds notes from the og baseline with NO
+        # transpose, so any previous transpose offset is gone — drop it here so the
+        # beat grid + the score-viewer time map stay in sync with the rebuilt notes.
+        # (A clip-resize re-applies its own offset via transpose_notes right after.)
+        self._beat_offset = 0.0
         # 4. rebuild the beat grid + re-overlay the metronome clicks at the new
         # tempo BEFORE remaking notedatas, so the metronome map / GuitarHero
         # gridlines follow the new tempo (the notes were just rescaled too).

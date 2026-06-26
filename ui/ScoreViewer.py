@@ -111,8 +111,9 @@ class ScoreViewer(QWidget):
     # load_score / re-lays-out the score — only CSS classes change in the page.
     def get_clip_selection(self, callback) -> None:
         """Pull the in-progress measure selection from the JS. `callback` is
-        invoked (async) with a dict {'startSec', 'endSec'} in the score's
-        original-tempo timeframe, or None if nothing is selected."""
+        invoked (async) with a dict {'startIdx', 'endIdx'} of inclusive measure
+        indices (score order), or None if nothing is selected. Indices, not
+        seconds, so the clip can't drift from Verovio's rendered timeline."""
         if not self.js_ready:
             callback(None)
             return
@@ -124,13 +125,14 @@ class ScoreViewer(QWidget):
             return
         self._view.page().runJavaScript('window.clearClipSelection();')
 
-    def set_clip_range(self, start_sec: float, end_sec: float) -> None:
-        """Grey out every measure OUTSIDE [start_sec, end_sec) (the clip focus).
-        Times are in the viewer's original-tempo timeframe."""
+    def set_clip_range(self, start_idx: int, end_idx: int) -> None:
+        """Grey out every measure OUTSIDE the inclusive measure-index span
+        [start_idx, end_idx] (the clip focus). Indices in score order, derived by
+        Python from the clip's notes (ScoreData.clip_measure_range)."""
         if not self.js_ready:
             return
         self._view.page().runJavaScript(
-            f'window.setClipRange({start_sec:.6f}, {end_sec:.6f});'
+            f'window.setClipRange({int(start_idx)}, {int(end_idx)});'
         )
 
     def clear_clip_range(self) -> None:
