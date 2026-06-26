@@ -17,6 +17,7 @@ from app_logic.NoteData import NoteData
 
 from ui.ScoreViewer import ScoreViewer
 from ui.GuitarHero import GuitarHero
+from ui.time.ScoreTimeMap import ScoreTimeMap
 
 
 class PerformTab(QWidget):
@@ -47,6 +48,11 @@ class PerformTab(QWidget):
         # full score. The host (app.py) owns the toggle and pushes it in via
         # set_show_full; this is the panel's render-time cache of it.
         self.viewer_show_full = False
+
+        # barline-anchored app<->Verovio time correspondence: keeps the score
+        # cursor on the MIDI/NoteData timeline (the source of truth) instead of
+        # Verovio's independently-drifting timemap. Rebuilt on every re-render.
+        self._time_map = ScoreTimeMap()
 
         # injected via attach_timekeeping()
         self.wall_clock = None
@@ -182,6 +188,16 @@ class PerformTab(QWidget):
         """Host-driven (app.py owns the toggle): show the full score (True) or just
         the active instrument's part (False), then re-render the viewer."""
         self.viewer_show_full = show_full
+        self.refresh_score_viewer()
+
+    def transpose(self, semitones: int):
+        """Transpose this tab's score by `semitones` half steps, then re-render
+        the piano-roll + sheet-music views (playback reads the shifted MIDI
+        live). Pitch-only: timing and the clip are untouched."""
+        if self.score_data is None or self.score_data.score is None:
+            return
+        self.score_data.transpose(semitones)
+        self.guitar_hero.update_view_items()
         self.refresh_score_viewer()
 
     # --- AUDIO / DETECTION ---
@@ -377,13 +393,25 @@ class PerformTab(QWidget):
 
     # --- SCORE VIEWER ---
     def _score_viewer_time(self, t: float) -> float:
-        """Map a wall-clock time `t` (current tempo) back into the *original*
-        score-tempo timeframe Verovio's timemap uses, so the cursor stays aligned
-        after a tempo change."""
+        """Map a wall-clock time `t` (current tempo) into the Verovio cursor's
+        timeframe. First undo any tempo change (-> original-tempo app time), then
+        run that through the barline-anchored map so the cursor lands on whatever
+        note is actually SOUNDING (the MIDI/NoteData timeline), not on Verovio's
+        independently-drifting timemap. Falls back to the plain scalar until the
+        map's anchors have been pulled."""
         bpm_og = self.score_data.bpm_og or self.score_data.bpm
         if not bpm_og:
             return t
-        return t * self.score_data.bpm / bpm_og
+        og_t = t * self.score_data.bpm / bpm_og
+        return self._time_map.to_viewer(og_t)
+
+    def _app_time_from_viewer(self, sec: float) -> float:
+        """Inverse of _score_viewer_time: a Verovio-timeframe second (e.g. a
+        measure-selection bound) back to wall-clock (current-tempo) app time."""
+        bpm = self.score_data.bpm
+        bpm_og = self.score_data.bpm_og or bpm
+        og_t = self._time_map.from_viewer(sec)
+        return og_t * (bpm_og / bpm) if bpm else og_t
 
     def refresh_score_viewer(self):
         """Re-render the Verovio score viewer.
@@ -392,9 +420,28 @@ class PerformTab(QWidget):
             return
         channel = None if self.viewer_show_full else self.score_data.active_instrument
         self.score_viewer.load_score(self.score_data, channel=channel)
-        # re-assert the clip grey-out so it survives the re-layout (and clears
-        # itself when the score isn't clipped, e.g. on a freshly loaded score).
+        # rebuild the barline time map for the freshly laid-out score (async pull
+        # of Verovio's measure onsets), then re-assert the clip grey-out so it
+        # survives the re-layout (and clears itself when the score isn't clipped).
+        self._rebuild_time_map(channel)
         self._refresh_clip_focus()
+
+    def _rebuild_time_map(self, channel):
+        """Re-anchor the app<->Verovio time map to the freshly rendered score, so
+        the cursor tracks the MIDI/NoteData timeline (see ScoreTimeMap). Pairs the
+        score's own measure onsets with Verovio's measure timemap, pulled async."""
+        app_onsets = self.score_data.measure_onsets_og(channel)
+
+        def _store(vero_onsets):
+            if not vero_onsets or not app_onsets:
+                self._time_map.clear()  # fall back to the plain bpm/bpm_og scalar
+            else:
+                self._time_map.set_anchors(app_onsets, vero_onsets)
+            # the clip grey-out is placed through the map; the first
+            # _refresh_clip_focus ran before the anchors landed, so re-assert it.
+            self._refresh_clip_focus()
+
+        self.score_viewer.get_measure_timemap(_store)
 
     def on_score_viewer_loaded(self, ok: bool = True):
         """The ScoreViewer's JS API is ready: render whatever score is loaded, and
@@ -410,16 +457,13 @@ class PerformTab(QWidget):
 
     def _on_clip_selection(self, sel: dict | None):
         """Turn a pulled measure selection into a note-index clip. `sel` holds
-        startSec/endSec in the viewer's ORIGINAL-tempo timeframe; map back to app
-        time (inverse of _score_viewer_time), then resolve to note indices (which
-        capture EXACTLY the notes in the selected measures)."""
+        startSec/endSec in the viewer's timeframe; map back to app time (inverse
+        of _score_viewer_time, through the barline map), then resolve to note
+        indices (which capture EXACTLY the notes in the selected measures)."""
         if not sel:
             return  # nothing selected -> leave the current clip as-is
-        bpm = self.score_data.bpm
-        bpm_og = self.score_data.bpm_og or bpm
-        factor = (bpm_og / bpm) if bpm else 1.0
-        b0 = max(0.0, sel["startSec"] * factor)
-        b1 = sel["endSec"] * factor
+        b0 = max(0.0, self._app_time_from_viewer(sel["startSec"]))
+        b1 = self._app_time_from_viewer(sel["endSec"])
         clip = self.score_data.note_index_range(b0, b1)
         if clip is None:
             return

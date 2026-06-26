@@ -137,6 +137,15 @@ function buildMeasureMap() {
     measureOrder.sort((a, b) => a.onset - b.onset);
 }
 
+// Ordered measure-onset times (sec, Verovio's original-tempo timeframe) for the
+// whole score, pulled by Python to anchor the playback cursor to the MIDI /
+// NoteData timeline barline-by-barline (see ui.time.ScoreTimeMap). Returns null
+// if the map isn't built yet so the host can fall back to the plain tempo scalar.
+window.getMeasureTimemap = function() {
+    if (!measureOrder || !measureOrder.length) return null;
+    return measureOrder.map(m => m.onset);
+}
+
 // Onset (sec) for a measure id: prefer the prebuilt map, else ask Verovio
 // directly (covers builds whose timemap lacks measure entries). Returns null
 // if it can't be resolved.

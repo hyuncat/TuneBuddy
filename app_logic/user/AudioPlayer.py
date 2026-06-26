@@ -37,9 +37,12 @@ class AudioPlayer:
         Args:
             start_time: time (sec) to start playing from
         """
-        if self.audio_data is None:
+        # No buffer at all, or a buffer with nothing recorded into it yet
+        # (end_index == 0). The latter is normal when the user plays back before
+        # recording, so treat it the same as "no audio" rather than letting _play
+        # log a spurious error on the empty slice.
+        if self.audio_data is None or self.audio_data.get_length() <= 0:
             print("ignoring audio playback, no audio data loaded.")
-            # logging.error("no audio data loaded. exiting")
             return
 
         # if playback thread already exists

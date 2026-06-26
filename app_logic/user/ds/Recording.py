@@ -1,5 +1,4 @@
 import numpy as np
-from numpy import rec
 
 from app_logic.user.ds.AudioData import AudioData
 from app_logic.user.ds.PitchData import PitchData, Pitch
@@ -86,9 +85,11 @@ class Recording:
         """run pitch detection, then smoothing, on the current audio data.
         `on_phase(text)`, if given, is called at the start of each stage so a
         caller can surface progress (e.g. a status-bar message)."""
-        if on_phase: on_phase("Detecting pitches...")
+        if on_phase:
+            on_phase("Detecting pitches...")
         self.pitch_data.data = self.pitch_detector.detect_pitches(self.audio_data.data)
-        if on_phase: on_phase("Smoothing pitches...")
+        if on_phase: 
+            on_phase("Smoothing pitches...")
         self.pitch_data.data = self.pitch_smoother.smooth(self.pitch_data.data)
 
     def detect_notes(self):

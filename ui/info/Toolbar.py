@@ -239,6 +239,13 @@ class Toolbar(QToolBar):
             # print("oops no instruments")
             return # no score loaded, or score has no instruments
 
+        # a freshly loaded score resets playing_instruments to ALL channels
+        # (metronome included); re-apply the switch so the toolbar toggle —
+        # not the load default — decides whether the metronome plays. (Guarded
+        # because this also runs during init, before the switch is built.)
+        if hasattr(self, "metronome_switch"):
+            self.metronome_toggled(self.metronome_switch.isChecked())
+
         for channel, program in self.score_data.instruments.items():
             instr_name = f"{program_to_name(program)}"
             if channel == self.score_data.metronome_channel:
@@ -273,9 +280,15 @@ class Toolbar(QToolBar):
         print(f"playing instruments: {self.score_data.playing_instruments}")
 
     def metronome_toggled(self, checked: bool):
-        """Handle metronome toggling."""
+        """Handle metronome toggling. The switch is the source of truth for
+        whether the metronome plays — re-applied on every score load (see
+        populate_instrument_menu) so a freshly imported score respects the
+        toggle instead of defaulting on."""
+        channel = self.score_data.metronome_channel
+        if channel is None:
+            return  # no metronome track on this score (no free MIDI channel)
         if checked:
-            self.score_data.playing_instruments.add(self.score_data.metronome_channel)
+            self.score_data.playing_instruments.add(channel)
         else:
-            self.score_data.playing_instruments.discard(self.score_data.metronome_channel)
+            self.score_data.playing_instruments.discard(channel)
         print(f"Metronome toggled: {'ON' if checked else 'OFF'}")

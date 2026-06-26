@@ -621,33 +621,37 @@ class GuitarHero(QWidget):
         note_data = self.score_data.note_datas.get(self.score_data.active_instrument, None)
         midi_notes = note_data.read(x_range[0], x_range[1]) if note_data else []
 
-        # get the note parameters for the BarGraphItem
-        starts = np.array([n.start_time for n in midi_notes], dtype=np.float32)
-        ends = np.array([n.end_time for n in midi_notes], dtype=np.float32)
-        midis = np.array([n.midi_num[0] for n in midi_notes], dtype=np.float32)
+        # Score notes can be CHORDS: NoteData stores one Note per onset with EVERY
+        # simultaneous pitch in Note.midi_num (see MidiData.make_notedatas), so draw
+        # a bar for each pitch — otherwise only the first note of each chord shows.
+        # When clipped, score notes OUTSIDE the clip are drawn dimmer grey (a note
+        # is "in the clip" iff its START is in [b0, b1), matching the alignment).
+        clip = self._clip_bounds()
+        starts, ends, midis, brushes = [], [], [], []
+        for n in midi_notes:
+            in_clip = clip is None or (clip[0] - 1e-6 <= n.start_time < clip[1] - 1e-6)
+            brush = self.colors['midi'] if in_clip else self.colors['midi_dim']
+            for m in n.midi_num:
+                if m == -1:  # rest / unvoiced placeholder, nothing to draw
+                    continue
+                starts.append(n.start_time)
+                ends.append(n.end_time)
+                midis.append(m)
+                brushes.append(brush)
 
-        # print(f"   plotting {len(midi_notes)} MIDI notes...")
+        starts = np.array(starts, dtype=np.float32)
+        ends = np.array(ends, dtype=np.float32)
+        midis = np.array(midis, dtype=np.float32)
 
         x = 0.5 * (starts + ends)
         width = (ends - starts)
         y0 = (midis - 0.5*self.NOTE_HEIGHT)
         height = np.full_like(midis, self.NOTE_HEIGHT)
 
-        # when clipped, score notes OUTSIDE the clip are drawn dimmer grey so the
-        # focus stays on the clipped span. A note is "in the clip" iff its START is
-        # in [b0, b1) — exactly the notes the alignment uses (no neighbour bleed).
-        # (brushes=None => every bar uses the default white brush.)
-        clip = self._clip_bounds()
-        brushes = None
-        if clip is not None:
-            b0, b1 = clip
-            brushes = [
-                self.colors['midi'] if (b0 - 1e-6 <= n.start_time < b1 - 1e-6)
-                else self.colors['midi_dim']
-                for n in midi_notes
-            ]
+        # brushes only needed when clipped (else every bar uses the default white).
         self.midi_notes.setOpts(x=x, width=width, y0=y0, height=height,
-                                brush=self.colors['midi'], brushes=brushes)
+                                brush=self.colors['midi'],
+                                brushes=(brushes if clip is not None else None))
 
     def _get_gridline(self, idx: int) -> pg.InfiniteLine:
         """Return the idx-th pooled gridline, lazily creating (and adding) it."""

@@ -82,6 +82,15 @@ class MidiPlayer(QObject):
         # find index to start from based on start_time
         _, start_idx = MidiPlayer.binary_search(msg_times, start_time)
 
+        # Pace playback off a high-resolution monotonic clock, NOT WallClock.now().
+        # WallClock ticks at 10 Hz, so now() is quantized to 0.1 s; that snaps every
+        # MIDI message onto a 0.1 s grid. With 16th notes at 80 BPM (0.1875 s apart)
+        # the grids beat against each other and every ~8th note's onset lands exactly
+        # on a tick, cutting the previous note a tick short. The WallClock still drives
+        # the UI cursor; only audio timing needs sub-tick precision.
+        speed = self.playback_speed or 1.0
+        # anchor perf_counter so that "now" reads start_time in score-time
+        play_anchor = time.perf_counter() - start_time / speed
 
         for i in range(start_idx, len(msg_times)):
             # stop handling : if stop event is set, break look and exit playback
@@ -109,12 +118,12 @@ class MidiPlayer(QObject):
             if i+1 <= len(msg_times)-1:
                 next_time = msg_times[i+1]
 
-                while not self.thread_stop_event.is_set() and self.wall_clock.now() < next_time:
+                while not self.thread_stop_event.is_set():
+                    now = (time.perf_counter() - play_anchor) * speed
+                    if now >= next_time:
+                        break
                     time.sleep(0.001)
 
-                # sleep_time = next_time - current_time
-                # time.sleep(sleep_time)
-                
             elif i == len(msg_times)-1:
                 self.stop()
 

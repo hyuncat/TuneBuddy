@@ -23,7 +23,7 @@ from ui.time.CountdownTimer import CountdownTimer
 from ui.info.Toolbar import Toolbar
 from ui.info.StatusBar import StatusBar
 from ui.info.RecordingTree import RecordingTree
-from ui.info.InstrumentWidget import InstrumentWidget
+from ui.info.SettingsWidget import SettingsWidget
 from ui.info.MistakeWidget import MistakeWidget
 from ui.info.ToleranceWidget import ToleranceWidget
 from ui.info.Settings import SettingsDialog
@@ -72,7 +72,7 @@ class Attune(QMainWindow):
         # IMPORTANT COMPONENTS
         # left column
         self.recordings_tree = RecordingTree(self.recordings)
-        self.instrument_widget = InstrumentWidget()
+        self.settings_widget = SettingsWidget()
         # center tabs
         self.perform_tab = PerformTab(self.score_data)
         self.practice_tab = PracticeTab()  # owns its own independent score
@@ -108,12 +108,13 @@ class Attune(QMainWindow):
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # ------> LEFT COLUMN
-        # recordings tree <-splitter-> instrument/range panel
+        # recordings tree <-splitter-> settings panel (instrument/range/tuning/
+        # transpose, internally scrollable).
         self.left_column = QSplitter(Qt.Orientation.Vertical)
         self.left_column.addWidget(self.recordings_tree)
-        self.left_column.addWidget(self.instrument_widget)
+        self.left_column.addWidget(self.settings_widget)
         self.left_column.setStretchFactor(0, 1)  # tree takes the slack
-        self.left_column.setStretchFactor(1, 0)  # instrument panel fixed-ish
+        self.left_column.setStretchFactor(1, 0)  # settings panel fixed-ish
         self.left_column.setMinimumWidth(180)
         self.left_column.setMaximumWidth(320)
 
@@ -266,11 +267,12 @@ class Attune(QMainWindow):
         # recordings tree
         self.recordings_tree.selected.connect(self.on_recording_selected)
         self.recordings_tree.score_renamed.connect(self.on_score_renamed)
-        # instrument panel
-        self.instrument_widget.instrument_applied.connect(self.on_instrument_applied)
-        self.instrument_widget.range_applied.connect(self.on_range_applied)
-        self.instrument_widget.tuning_applied.connect(self.on_tuning_applied)
-        self.instrument_widget.full_score_toggled.connect(self.on_full_score_toggled)
+        # settings panel (instrument / range / tuning / transpose)
+        self.settings_widget.instrument_applied.connect(self.on_instrument_applied)
+        self.settings_widget.range_applied.connect(self.on_range_applied)
+        self.settings_widget.tuning_applied.connect(self.on_tuning_applied)
+        self.settings_widget.full_score_toggled.connect(self.on_full_score_toggled)
+        self.settings_widget.transpose_applied.connect(self.on_transpose_applied)
         # tolerance panel
         self.tolerance_widget.tolerance_applied.connect(self.on_tolerance_applied)
 
@@ -306,7 +308,8 @@ class Attune(QMainWindow):
         # load into UTILITIES
         self.toolbar.populate_instrument_menu()
         self.toolbar.set_tempo(self.score_data.bpm)  # reflect the score's tempo
-        self.instrument_widget.load_score(self.score_data)
+        self.settings_widget.load_score(self.score_data)
+        self._sync_transpose_input()  # prefill the first-note pitch
         self.slider.update_range(score_data=self.score_data)
 
         # load into RECORDINGS TREE
@@ -428,8 +431,8 @@ class Attune(QMainWindow):
         rec = self.active_recording
 
         # push config into side panels
-        self.instrument_widget.set_active_instrument(rec.active_instrument)
-        self.instrument_widget.set_tuning(rec.config.tuning)
+        self.settings_widget.set_active_instrument(rec.active_instrument)
+        self.settings_widget.set_tuning(rec.config.tuning)
         self.tolerance_widget.set_tolerance(rec.config.tolerance)
         self.status_bar.update_name(recording_name)
         # also pass to Performance Tab
@@ -451,10 +454,36 @@ class Attune(QMainWindow):
         if not self._has_recording():
             return
         # the range defaults follow the newly selected instrument's note range
-        self.instrument_widget.populate_range_from_score(self.score_data, channel)
+        self.settings_widget.populate_range_from_score(self.score_data, channel)
         # update the panels
         self.perform_tab.set_active_instrument(channel)
         self.practice_tab.set_active_instrument(channel)
+        # the transpose anchor (first note) follows the newly selected instrument
+        self._sync_transpose_input()
+
+    def on_transpose_applied(self, target_midi: int):
+        """Transpose BOTH tabs' scores so the active instrument's first note lands
+        on `target_midi`. Pitch-only, so it's mirrored across tabs (like the clip)
+        — each tab keeps its own tempo. Refreshes playback + both viewers, then
+        re-syncs the widget to the new first-note pitch."""
+        sd = self._active_score_data()
+        if sd is None or sd.score is None:
+            return
+        first = sd.first_note_midi()
+        if first is None:
+            return
+        delta = int(target_midi) - first
+        if delta == 0:
+            return
+        self.perform_tab.transpose(delta)
+        self.practice_tab.transpose(delta)
+        self._sync_transpose_input()
+
+    def _sync_transpose_input(self):
+        """Reflect the active tab's current first-note pitch in the settings
+        panel's transpose input (no emit). Call whenever the score / active
+        instrument changes."""
+        self.settings_widget.set_first_note(self._active_score_data().first_note_midi())
 
     def on_full_score_toggled(self, show_full: bool):
         """Toggle BOTH tabs' score viewers between the full score and the active
@@ -574,6 +603,8 @@ class Attune(QMainWindow):
         self.status_bar.update_status("")
         # the tempo display reflects the active tab's (independent) score tempo
         self.toolbar.set_tempo(self._active_score_data().bpm)
+        # ...and the transpose anchor reflects that tab's score's first note
+        self._sync_transpose_input()
 
         # preserve the current time, re-range for the new tab, clamp, and render.
         t = self.slider.get_time()

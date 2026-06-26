@@ -37,6 +37,11 @@ class ScoreData:
         # from this via clip_bounds() / clipped_note_data(). See those + is_clipped.
         self.clip: tuple[int, int] | None = None
 
+        # cumulative transpose applied to the score, in half steps (signed). Reset
+        # to 0 on load; transpose() shifts the score (MIDI + music21 + NoteData)
+        # incrementally and accumulates here. Pitch-only, independent of the clip.
+        self.transpose_semitones: int = 0
+
         # metronome beat grid: (time_sec, is_downbeat) tuples, also drives the
         # GuitarHero vertical gridlines. `beats_og` is the baseline at the
         # original tempo with no resize offset; `beats` is the live grid, rebuilt
@@ -169,6 +174,7 @@ class ScoreData:
         # resize compute their factors against the true original tempo).
         self.bpm_og = self.bpm
         self.clip = None  # a freshly loaded score is unclipped
+        self.transpose_semitones = 0  # a freshly loaded score is at concert pitch
 
         # initialize metronome beats from the score; keep an untransformed
         # baseline so tempo/resize changes can rebuild the live grid (and the
@@ -185,8 +191,34 @@ class ScoreData:
         # reset other shit
         self.displayed_instruments = set(self.instruments.keys())
         self.playing_instruments = set(self.instruments.keys())
-        self.metronome_channel = len(self.instruments.keys()) - 1 # last channel
+        # take the channel MidiData actually assigned (None if no free channel)
+        self.metronome_channel = self.midi_data.metronome_channel
         self.active_instrument = self.get_default_instrument()
+
+    def measure_onsets_og(self, channel: int | None = None) -> list[float]:
+        """Barline onset times (sec) in the ORIGINAL-tempo timeframe, read off the
+        same part Verovio renders. These pair 1:1 (by measure index) with
+        Verovio's own measure timemap to anchor the score cursor to the MIDI /
+        NoteData timeline (see ui.time.ScoreTimeMap) instead of letting Verovio
+        re-derive a drifting timeline of its own.
+
+        Faithful to the MIDI: music21's measure offsets (quarter-lengths) preserve
+        the note positions the player + GuitarHero run off; converting at bpm_og
+        keeps them in the same frame as the Verovio export (which is pinned to
+        bpm_og — see to_musicxml_bytes)."""
+        if self.score is None:
+            return []
+        from music21 import stream
+        part = self._part_for_channel(channel) if channel is not None else None
+        if part is None:
+            parts = list(self.score.parts)
+            part = parts[0] if parts else self.score
+        measures = list(part.getElementsByClass(stream.Measure))
+        if not measures:  # part-less score (rare): recurse to find its measures
+            measures = list(part.recurse().getElementsByClass(stream.Measure))
+        bpm_og = self.bpm_og or self.bpm or 120
+        sec_per_ql = 60.0 / bpm_og
+        return [round(float(m.offset) * sec_per_ql, 9) for m in measures]
 
     def get_default_instrument(self) -> int:
         """Called at the beginning to set a default first instrument (non-metronome)"""
@@ -338,7 +370,7 @@ class ScoreData:
         
         flat = self.score.flatten()
         total_ql = float(flat.highestTime) # total length of the piece in quarter lengths
-        sec_per_beat = 60.0 / self.get_bpm()
+        sec_per_ql = 60.0 / self.get_bpm()  # seconds per quarter-length (bpm is quarter-based)
 
         ts_events = [] # list of (time, time_signature) tuples
         for ts in flat.recurse().getElementsByClass(meter.TimeSignature):
@@ -349,11 +381,10 @@ class ScoreData:
             ts_events.insert(0, (0.0, ts_events[0][1]))
 
         eps = 1e-9
-        beat_events: list[tuple[float, bool]] = [] # in quarterlengths
-        elapsed_time = 0.0 # sec
+        beat_events: list[tuple[float, bool]] = []
         for i, (start_ql, ts) in enumerate(ts_events):
-            # quarter length at place where this time signature ends
-            # and the next one begins (or end of piece)
+            # quarter length where this time signature ends and the next begins
+            # (or the end of the piece)
             end_ql = ts_events[i+1][0] if i+1 < len(ts_events) else total_ql
             beat_ql = float(ts.beatDuration.quarterLength)
             measure_len_ql = float(ts.barDuration.quarterLength)
@@ -362,14 +393,16 @@ class ScoreData:
             length_ql = end_ql - start_ql
             n_beats = int((length_ql + eps) // beat_ql)
 
-            # place beats at start_ql, start_ql + beat_ql, ..., up to end_ql
+            # place a beat every beat_ql, converting the ABSOLUTE quarter-length
+            # position to seconds. start_ql is in quarter-lengths, NOT seconds —
+            # the old code added it straight to a seconds value, which flung every
+            # beat after a mid-piece time-signature change far past the end of the
+            # song (e.g. caprice24's 2/4->3/4 at ql 192 jumped the grid to ~192s),
+            # so the gridlines + metronome clicks vanished from there on.
             for k in range(n_beats):
-                beat_time = round(start_ql + k * sec_per_beat, 9)
+                beat_time = round((start_ql + k * beat_ql) * sec_per_ql, 9)
                 is_downbeat = (k % beats_per_measure == 0)
                 beat_events.append((beat_time, is_downbeat))
-
-            # if partial leftover region, don't add any beats beyond end_ql
-            elapsed_time += (length_ql / beat_ql) * sec_per_beat
 
         return beat_events
 
@@ -426,7 +459,53 @@ class ScoreData:
         self._beat_offset = offset_sec
         self._rebuild_beats()
 
-    
+    # --- PITCH TRANSPOSITION (NB: distinct from transpose_notes, which is TIME) ---
+    def transpose(self, semitones: int):
+        """Transpose the ENTIRE score up/down by `semitones` half steps, keeping
+        all three representations in sync so playback, the GuitarHero piano-roll,
+        and the Verovio sheet music all reflect the new pitches:
+            1. midi_data  — the messages that get played
+            2. score      — the music21 score the MusicXML view is exported from
+            3. note_datas — the per-instrument Note pitches (GuitarHero + editing)
+
+        This is a *pitch-only* shift: note timing, the metronome, and the clip
+        (stored as note INDICES) are all untouched. Applied incrementally and
+        accumulated in `transpose_semitones`, so callers can hand it a delta and
+        repeated calls compose correctly (a delta of 0 is a no-op)."""
+        if self.score is None or not semitones:
+            return
+
+        # 1. MIDI playback (shifts the shared note-message pitch baseline)
+        self.midi_data.transpose(semitones)
+        # 2. music21 score (drives the MusicXML pushed to Verovio); int == semitones
+        self.score.transpose(semitones, inPlace=True)
+        # 3. live NoteData pitches — shift in place so the current views update
+        #    without a full rebuild. Skip the metronome channel + unvoiced (-1).
+        for channel, nd in self.note_datas.items():
+            if channel == self.metronome_channel:
+                continue
+            for note in nd.data.values():
+                note.midi_num = [
+                    int(max(0, min(127, m + semitones))) if m != -1 else -1
+                    for m in note.midi_num
+                ]
+
+        self.transpose_semitones += semitones
+
+    def first_note_midi(self, channel: int | None = None) -> int | None:
+        """The MIDI number of the first VOICED note of the given instrument (the
+        active one by default) — the reference pitch the SettingsWidget's
+        transpose input anchors to. None if the instrument has no voiced notes."""
+        channel = self.active_instrument if channel is None else channel
+        nd = self.note_datas.get(channel)
+        if not nd or not nd.times:
+            return None
+        for t in nd.times:
+            midi = nd.data[t].midi_num
+            if midi and midi[0] != -1:
+                return int(round(midi[0]))
+        return None
+
     # --- score METADATA MANAGEMENT ---
     def set_title(self, title: str):
         """Update display title -> included in next render's metadata."""

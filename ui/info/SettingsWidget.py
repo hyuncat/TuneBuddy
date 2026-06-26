@@ -1,10 +1,10 @@
 import re
 
-from PyQt6.QtCore import Qt, QSize, pyqtSignal, QStringListModel
+from PyQt6.QtCore import Qt, QSize, QEvent, pyqtSignal, QStringListModel
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QLineEdit, QPushButton, QCompleter, QMessageBox, QCheckBox,
-    QSizePolicy,
+    QLineEdit, QPushButton, QCompleter, QMessageBox, QToolTip,
+    QSizePolicy, QScrollArea, QFrame,
 )
 
 from app_logic.midi.ScoreData import ScoreData
@@ -37,57 +37,74 @@ def name_to_midi(name: str) -> int | None:
     return (octave + 1) * 12 + pc
 
 
-class InstrumentWidget(QWidget):
+class SettingsWidget(QWidget):
     """
-    Left-column panel (below the RecordingTree) for picking the active
-    instrument and the expected pitch range of the active recording.
+    Left-column panel (below the RecordingTree) holding the per-recording /
+    per-score settings, stacked in a vertical scroll area so it can grow without
+    capping the column:
 
-    Two sections, each with its own "check" Apply button:
-      - "Instrument": a dropdown of every instrument detected in the score
-        (one per MIDI channel, minus the metronome). Applying it makes that
-        channel the active instrument (the analysis target).
-      - "Range": low/high note inputs that auto-complete to the discretized
-        note bins (MIDI 0..127, named like 'G3' / 'C#5'). Defaults are filled
-        in from the active instrument's note range in the score. Applying it
-        sets the Config's fmin/fmax (so pitch detection is re-run).
+      - "Instrument": a dropdown of every instrument detected in the score (one
+        per MIDI channel, minus the metronome). Applying it makes that channel
+        the active instrument (the analysis target).
+      - "Range": low/high note inputs that auto-complete to the discretized note
+        bins (MIDI 0..127, named like 'G3' / 'C#5'). Defaults are filled in from
+        the active instrument's note range. Applying it sets the Config's
+        fmin/fmax (so pitch detection is re-run).
+      - "Tuning": the A4 reference pitch (Hz) the pitch detector tunes to.
+      - "Transpose": a note-name input that transposes the WHOLE score so its
+        first note lands on the entered pitch (relative to the first note). Emits
+        the target MIDI; app.py shifts the score's MIDI / music21 / NoteData.
 
     The widget only collects/validates input and emits signals; app.py owns the
-    Recording/Config and performs the actual reset + re-analysis.
+    Recording / ScoreData and performs the actual reset + re-analysis.
     """
     instrument_applied = pyqtSignal(int)   # emits the active-instrument channel
     range_applied = pyqtSignal(int, int)   # emits (lowest_midi, highest_midi)
     tuning_applied = pyqtSignal(float)     # emits the A4 reference tuning in Hz
+    transpose_applied = pyqtSignal(int)    # emits the target MIDI for the first note
     full_score_toggled = pyqtSignal(bool)  # True = show full score, False = active instrument only
 
-    # the discretized note bins the range inputs auto-complete to (MIDI 0..127)
+    # the discretized note bins the range / transpose inputs auto-complete to
     _NOTE_BIN_NAMES = [midi_to_name(m) for m in range(128)]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.score_data: ScoreData | None = None
         self._check_icon = _svg_icon("check.svg")
+        self._first_note_midi: int | None = None
+        self._TRANSPOSE_HELP = "Transposes the score relative to the pitch of the first note."
 
-        self._layout = QVBoxLayout(self)
+        # the whole panel scrolls vertically: a fixed-frame scroll area wraps an
+        # inner content widget that all the rows live in (init_ui fills _layout).
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        content = QWidget()
+        self._layout = QVBoxLayout(content)
         self._layout.setContentsMargins(6, 6, 6, 6)
+        self._scroll.setWidget(content)
+        outer.addWidget(self._scroll)
 
         self.init_ui()
 
+        # keep the column narrow; height is left free so the vertical splitter
+        # can size it and the inner scroll area handles any overflow.
         self.setMinimumWidth(180)
         self.setMaximumWidth(320)
-        # cap the panel's height to its contents: it never grows taller than the
-        # instrument/range controls need, so the RecordingTree above takes the
-        # vertical slack in the left column's splitter.
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        self.setMaximumHeight(self.sizeHint().height())
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
     # --- UI ---
     def init_ui(self):
-        # --- ACTIVE INSTRUMENT SELECT ---
-        header = QLabel("Instrument")
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._layout.addWidget(header)
+        # a single shared model backs the range + transpose inputs' completion
+        self._note_bin_model = QStringListModel(self._NOTE_BIN_NAMES, self)
 
+        # --- ACTIVE INSTRUMENT SELECT ---
         row = QHBoxLayout()
+        row.addWidget(QLabel("Instrument:"))
         self.instrument_combo = QComboBox()
         row.addWidget(self.instrument_combo, 1)
 
@@ -97,9 +114,6 @@ class InstrumentWidget(QWidget):
         self._layout.addLayout(row)
 
         # --- RANGE UI ---
-        # a single shared model backs both inputs' auto-completion
-        self._note_bin_model = QStringListModel(self._NOTE_BIN_NAMES, self)
-
         row = QHBoxLayout()
         row.addWidget(QLabel("Range:"))
         self.low_input = self._make_note_input("G3")
@@ -129,11 +143,32 @@ class InstrumentWidget(QWidget):
         row.addWidget(self.tuning_apply)
         self._layout.addLayout(row)
 
-        # --- FULL SCORE toggle (vs just active) ---
-        # instrument's part. Off by default (single-instrument view).
-        # self.full_score_checkbox = QCheckBox("Show full score")
-        # self.full_score_checkbox.toggled.connect(self.full_score_toggled.emit)
-        # self._layout.addWidget(self.full_score_checkbox)
+        # --- TRANSPOSE UI ---
+        # transposes the WHOLE score so its first note lands on the entered pitch.
+        row = QHBoxLayout()
+        help_icon = _svg_icon("circle-help.svg", px=32)
+        self.transpose_help = QLabel()
+        self.transpose_help.setPixmap(help_icon.pixmap(QSize(14, 14)))
+        self.transpose_help.setToolTip(self._TRANSPOSE_HELP)
+        self.transpose_help.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        # hover tooltips can silently fail on macOS, so the icon is also clickable:
+        # a click forces the same text into a small popup (mirrors ToleranceWidget).
+        self.transpose_help.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.transpose_help.installEventFilter(self)
+        row.addWidget(self.transpose_help)
+
+        row.addWidget(QLabel("Transpose:"))
+        self.transpose_input = self._make_note_input("C4")
+        self.transpose_input.returnPressed.connect(self._on_transpose_apply)
+        row.addWidget(self.transpose_input, 1)
+
+        self.transpose_apply = self._make_apply_button("Apply transpose")
+        self.transpose_apply.clicked.connect(self._on_transpose_apply)
+        row.addWidget(self.transpose_apply)
+        self._layout.addLayout(row)
+
+        # keep the rows hugging the top; any extra column height is empty space.
+        self._layout.addStretch(1)
 
     def _make_apply_button(self, tooltip: str) -> QPushButton:
         button = QPushButton()
@@ -151,6 +186,18 @@ class InstrumentWidget(QWidget):
         completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         box.setCompleter(completer)
         return box
+
+    def eventFilter(self, obj, event):
+        """Clicking the transpose help icon shows its text in a small popup on top
+        of the icon — a reliable fallback for when hover tooltips don't fire."""
+        if obj is self.transpose_help and event.type() == QEvent.Type.MouseButtonPress:
+            QToolTip.showText(
+                self.transpose_help.mapToGlobal(self.transpose_help.rect().topLeft()),
+                self._TRANSPOSE_HELP,
+                self.transpose_help,
+            )
+            return True
+        return super().eventFilter(obj, event)
 
     # --- PUBLIC API ---
     def load_score(self, score_data: ScoreData):
@@ -191,6 +238,19 @@ class InstrumentWidget(QWidget):
         low, high = int(round(min(midis))), int(round(max(midis)))
         self.low_input.setText(midi_to_name(low))
         self.high_input.setText(midi_to_name(high))
+
+    def set_first_note(self, midi: int | None):
+        """Reflect the score's current first-note pitch in the transpose input (no
+        emit). Disables Apply when there's no note to anchor the transposition to."""
+        self._first_note_midi = midi
+        if midi is None:
+            self.transpose_input.clear()
+            self.transpose_input.setEnabled(False)
+            self.transpose_apply.setEnabled(False)
+            return
+        self.transpose_input.setEnabled(True)
+        self.transpose_apply.setEnabled(True)
+        self.transpose_input.setText(midi_to_name(int(midi)))
 
     # --- INTERNAL ---
     def _populate_instruments(self):
@@ -239,3 +299,16 @@ class InstrumentWidget(QWidget):
             )
             return
         self.tuning_applied.emit(tuning)
+
+    def _on_transpose_apply(self):
+        if self._first_note_midi is None:
+            return
+        target = name_to_midi(self.transpose_input.text())
+        if target is None:
+            QMessageBox.warning(
+                self, "Invalid note",
+                "Enter a valid note name like 'C4' or 'F#3' to transpose the "
+                "first note to.",
+            )
+            return
+        self.transpose_applied.emit(target)

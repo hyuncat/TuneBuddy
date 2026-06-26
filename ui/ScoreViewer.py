@@ -93,6 +93,17 @@ class ScoreViewer(QWidget):
 
         self._view.page().runJavaScript(f'window.timeChanged({sec:.6f});')
 
+    def get_measure_timemap(self, callback) -> None:
+        """Pull Verovio's per-measure onset times (sec, original-tempo timeframe)
+        as an ordered list — the barline anchors the host pairs with the score's
+        own measure onsets to keep the cursor on the MIDI/NoteData timeline (see
+        ui.time.ScoreTimeMap). `callback` is invoked (async) with the list, or
+        None if the map isn't available yet."""
+        if not self.js_ready:
+            callback(None)
+            return
+        self._view.page().runJavaScript('window.getMeasureTimemap();', callback)
+
     # --- CLIP SELECTION BRIDGE ---
     # Measure-range clipping is driven from the JS (the user clicks a start/end
     # measure there); these wrappers PULL the current selection on demand and

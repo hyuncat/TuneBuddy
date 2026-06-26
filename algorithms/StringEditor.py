@@ -141,8 +141,14 @@ class StringEditor:
     
     def get_distance(self, user_note: Note, midi_note: Note):
         """return the 'distance' between the user and midi note,
-        using some notion of tiger-mom-ishness"""
+        using some notion of tiger-mom-ishness.
+
+        A score note may be a CHORD (every simultaneous pitch lives in
+        midi_note.midi_num — see MidiData.make_notedatas); since pitch detection
+        is monophonic it can only ever verify one pitch, so the user matches the
+        NEAREST chord member. The user note's own midi_num holds detection
+        candidates, so we minimise over both lists."""
         if self.TIGER_LEVEL == 1:
-            return min(abs(u - midi_note.midi_num[0]) for u in user_note.midi_num)
-        return abs(user_note.midi_num[0] - midi_note.midi_num[0])
+            return min(abs(u - m) for u in user_note.midi_num for m in midi_note.midi_num)
+        return min(abs(user_note.midi_num[0] - m) for m in midi_note.midi_num)
         
