@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import fields
+import gzip
 import json
+import lzma
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,28 +26,53 @@ class JsonHandler:
     """
 
     CACHE_VERSION = 1
+    CACHE_SUFFIX = ".json.xz"
+    GZIP_CACHE_SUFFIX = ".json.gz"
+    LEGACY_CACHE_SUFFIX = ".json"
 
     def __init__(self, recording: Recording | None = None):
         self.recording = recording
 
-    @staticmethod
-    def cache_path_for(audio_filepath: str | Path) -> Path:
-        """Hidden JSON sidecar path for an audio file.
+    @classmethod
+    def cache_path_for(cls, audio_filepath: str | Path) -> Path:
+        """Preferred hidden compressed JSON sidecar path for an audio file.
 
-        `take.wav` -> `.take.json`, matching the `.filename.json` convention
-        while keeping the audio extension out of the cache name.
+        `take.wav` -> `.take.json.xz`, while keeping the audio extension out of
+        the cache name. Gzip `.take.json.gz` and plain `.take.json` files are
+        still accepted as legacy fallbacks.
         """
         path = Path(audio_filepath)
-        return path.with_name(f".{path.stem}.json")
+        return path.with_name(f".{path.stem}{cls.CACHE_SUFFIX}")
+
+    @classmethod
+    def legacy_cache_path_for(cls, audio_filepath: str | Path) -> Path:
+        path = Path(audio_filepath)
+        return path.with_name(f".{path.stem}{cls.LEGACY_CACHE_SUFFIX}")
+
+    @classmethod
+    def gzip_cache_path_for(cls, audio_filepath: str | Path) -> Path:
+        path = Path(audio_filepath)
+        return path.with_name(f".{path.stem}{cls.GZIP_CACHE_SUFFIX}")
+
+    @classmethod
+    def cache_paths_for(cls, audio_filepath: str | Path) -> tuple[Path, Path, Path]:
+        return (
+            cls.cache_path_for(audio_filepath),
+            cls.gzip_cache_path_for(audio_filepath),
+            cls.legacy_cache_path_for(audio_filepath),
+        )
+
+    @classmethod
+    def existing_cache_path_for(cls, audio_filepath: str | Path) -> Path | None:
+        for path in cls.cache_paths_for(audio_filepath):
+            if path.exists() and path.is_file():
+                return path
+        return None
 
     @classmethod
     def delete_cache_for(cls, audio_filepath: str | Path) -> None:
-        path = cls.cache_path_for(audio_filepath)
-        try:
-            if path.exists() and path.is_file():
-                path.unlink()
-        except OSError as e:
-            print(f"Could not delete recording cache '{path}': {e}")
+        for path in cls.cache_paths_for(audio_filepath):
+            cls._unlink_cache_file(path)
 
     @classmethod
     def rename_recording_files(cls, recording: Recording, new_stem: str) -> Path | None:
@@ -57,22 +84,28 @@ class JsonHandler:
             raise FileNotFoundError(old_audio)
 
         new_audio = old_audio.with_name(f"{new_stem}{old_audio.suffix}")
-        old_cache = cls.cache_path_for(old_audio)
+        old_cache = cls.existing_cache_path_for(old_audio)
         new_cache = cls.cache_path_for(new_audio)
-        cache_existed = old_cache.exists()
+        cache_existed = old_cache is not None
 
         if new_audio != old_audio and new_audio.exists():
             raise FileExistsError(new_audio)
-        if new_cache != old_cache and new_cache.exists():
-            raise FileExistsError(new_cache)
+        for candidate in cls.cache_paths_for(new_audio):
+            if old_cache is not None and candidate == old_cache:
+                continue
+            if candidate.exists():
+                raise FileExistsError(candidate)
 
         if new_audio != old_audio:
             old_audio.rename(new_audio)
             recording.audio_filepath = new_audio
-        if old_cache.exists() and new_cache != old_cache:
-            old_cache.rename(new_cache)
-        if cache_existed:
-            cls._update_cache_audio_metadata(new_cache, recording, new_stem)
+        if cache_existed and old_cache is not None:
+            payload = cls._read_json_payload(old_cache)
+            cls._update_payload_audio_metadata(payload, recording, new_stem)
+            cls._write_cache_payload(new_cache, payload)
+            for path in (*cls.cache_paths_for(old_audio), *cls.cache_paths_for(new_audio)):
+                if path != new_cache:
+                    cls._unlink_cache_file(path)
         return recording.audio_filepath
 
     @classmethod
@@ -85,19 +118,9 @@ class JsonHandler:
         if recording.audio_filepath is None or not cache_path.exists():
             return
         try:
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            audio_path = Path(recording.audio_filepath)
-            meta = payload.setdefault("recording", {})
-            meta["name"] = recording_name
-            meta["audio_file"] = audio_path.name
-            meta["audio_path"] = str(audio_path)
-            if audio_path.exists():
-                stat = audio_path.stat()
-                meta["audio_size"] = stat.st_size
-                meta["audio_mtime_ns"] = stat.st_mtime_ns
-            tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-            tmp.replace(cache_path)
+            payload = cls._read_json_payload(cache_path)
+            cls._update_payload_audio_metadata(payload, recording, recording_name)
+            cls._write_cache_payload(cache_path, payload)
         except Exception as e:
             print(f"Could not update recording cache metadata '{cache_path}': {e}")
 
@@ -114,9 +137,10 @@ class JsonHandler:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = self.to_cache_payload(rec, score_filepath, recording_name)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-            tmp.replace(path)
+            self._write_cache_payload(path, payload)
+            if rec.audio_filepath is not None:
+                self._unlink_cache_file(self.gzip_cache_path_for(rec.audio_filepath))
+                self._unlink_cache_file(self.legacy_cache_path_for(rec.audio_filepath))
             return True
         except Exception as e:
             print(f"Could not save recording cache '{path}': {e}")
@@ -129,11 +153,11 @@ class JsonHandler:
         recording_name: str | None = None,
     ) -> bool:
         rec = self._recording(recording)
-        path = self.cache_path_for_recording(rec)
-        if path is None or not path.exists():
+        path = self.existing_cache_path_for_recording(rec)
+        if path is None:
             return False
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = self._read_json_payload(path)
             if payload.get("version") != self.CACHE_VERSION:
                 return False
             if not self._cache_matches_audio(rec, payload):
@@ -152,6 +176,10 @@ class JsonHandler:
     @classmethod
     def cache_path_for_recording(cls, recording: Recording) -> Path | None:
         return cls.cache_path_for(recording.audio_filepath) if recording.audio_filepath else None
+
+    @classmethod
+    def existing_cache_path_for_recording(cls, recording: Recording) -> Path | None:
+        return cls.existing_cache_path_for(recording.audio_filepath) if recording.audio_filepath else None
 
     def to_cache_payload(
         self,
@@ -221,6 +249,56 @@ class JsonHandler:
         if rec is None:
             raise ValueError("JsonHandler requires a Recording.")
         return rec
+
+    @staticmethod
+    def _json_bytes(payload: dict) -> bytes:
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    @classmethod
+    def _read_json_payload(cls, path: Path) -> dict:
+        if path.name.endswith(cls.CACHE_SUFFIX):
+            with lzma.open(path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        if path.name.endswith(cls.GZIP_CACHE_SUFFIX):
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                return json.load(f)
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def _write_cache_payload(cls, path: Path, payload: dict) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        data = cls._json_bytes(payload)
+        if path.name.endswith(cls.CACHE_SUFFIX):
+            tmp.write_bytes(lzma.compress(data, preset=6))
+        elif path.name.endswith(cls.GZIP_CACHE_SUFFIX):
+            tmp.write_bytes(gzip.compress(data, compresslevel=6))
+        else:
+            tmp.write_bytes(data + b"\n")
+        tmp.replace(path)
+
+    @staticmethod
+    def _unlink_cache_file(path: Path) -> None:
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+        except OSError as e:
+            print(f"Could not delete recording cache '{path}': {e}")
+
+    @staticmethod
+    def _update_payload_audio_metadata(
+        payload: dict,
+        recording: Recording,
+        recording_name: str,
+    ) -> None:
+        audio_path = Path(recording.audio_filepath)
+        meta = payload.setdefault("recording", {})
+        meta["name"] = recording_name
+        meta["audio_file"] = audio_path.name
+        meta["audio_path"] = str(audio_path)
+        if audio_path.exists():
+            stat = audio_path.stat()
+            meta["audio_size"] = stat.st_size
+            meta["audio_mtime_ns"] = stat.st_mtime_ns
 
     @staticmethod
     def _cache_matches_audio(recording: Recording, payload: dict) -> bool:
