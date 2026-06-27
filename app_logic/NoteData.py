@@ -2,7 +2,9 @@ import numpy as np
 from collections import defaultdict
 from bisect import bisect_left, bisect_right
 class Note:
-    def __init__(self, i: int, start_time: float, end_time: float, midi_num: list[float], 
+    _NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+    def __init__(self, i: int, start_time: float, end_time: float, midi_num: list[float],
                  velocity: int=None, instrument: int=None):
         self.id = i # used to keep track of note within the piece
         self.start_time = start_time
@@ -16,7 +18,6 @@ class Note:
         self.midi_num = midi_num
         self.velocity = velocity # might change to a list of peaks later?
         self.instrument = instrument
-        self._NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
     def get_note_name(self) -> str:
