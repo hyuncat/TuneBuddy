@@ -381,7 +381,7 @@ class PerformTab(QWidget):
 
         # resize the score to the take's voiced NOTE span in case
         # some voiced noise got through cracks
-        rec.resize_score(to_span="note")
+        rec.resize_score(to_span="onset")
 
         rec.detect_mistakes()
         rec.mistake_checker.mistake_correction_loop()

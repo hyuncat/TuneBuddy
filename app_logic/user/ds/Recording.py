@@ -13,7 +13,7 @@ from app_logic.user.ds.Buffer import Buffer
 from app_logic.JsonHandler import JsonHandler
 from algorithms.Config import Config
 
-ResizeSpan = Literal["pitch", "note", "raw"]
+ResizeSpan = Literal["pitch", "note", "onset", "raw"]
 
 class Recording:
     TRAILING_AUDIO_PAD_SEC = 0.2
@@ -355,6 +355,10 @@ class Recording:
                 gives score-derived note-length heuristics a tempo close to the
                 take before PELT computes its min_size.
                 "note" uses the detected voiced note span for the final resize.
+                "onset" uses the first/last voiced note ONSETS (start-to-start,
+                ignoring the final note's duration), and matches the score
+                onset-to-onset too. Useful when the take's last note is held
+                longer or shorter than the score's — the onsets still line up.
                 "raw" uses the full detected-note span, or full audio span if
                 notes have not been detected yet.
             respect_clip:
@@ -375,6 +379,8 @@ class Recording:
             )
         elif to_span == "note":
             bounds = self.note_data.get_bounds(clean=True, use_note_end=True)
+        elif to_span == "onset":
+            bounds = self.note_data.get_bounds(clean=True, use_note_end=False)
         elif to_span == "raw":
             bounds = self.audio_bounds()
         else:
@@ -388,10 +394,14 @@ class Recording:
         take_anchor_time = start  # the take's first voiced app-time; the take STAYS here
 
         sd = self.score_data
+        # "onset" fits the score onset-to-onset, so measure the score span the
+        # same way (first note start -> last note start); every other mode fits
+        # against note ends.
+        score_use_note_end = to_span != "onset"
         score_bounds = sd.get_bounds(
             channel=self.active_instrument,
             respect_clip=respect_clip,
-            use_note_end=True,
+            use_note_end=score_use_note_end,
         )
         if score_bounds is None:
             return False
@@ -409,7 +419,7 @@ class Recording:
         score_bounds = sd.get_bounds(
             channel=self.active_instrument,
             respect_clip=respect_clip,
-            use_note_end=True,
+            use_note_end=score_use_note_end,
         )
         if score_bounds is None:
             return False
