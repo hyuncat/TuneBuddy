@@ -50,7 +50,7 @@ class Pitch:
 
         self.distance = distance # distance to target note (live / absolute-time)
 
-        # post-analysis distance, assigned from the string-edit alignment rather
+        # post-analysis distance, assigned from the pitch-mistake alignment rather
         # than the score note at this frame's absolute time. None until analyze()
         # runs; GuitarHero falls back to `distance` (live coloring) when it's None.
         # A pitch inside an insertion gets float('inf') so it always colors red.
@@ -129,3 +129,41 @@ class PitchData:
         if i < 0 or i >= len(self.data):
             return None
         return self.data[i]
+
+    def is_voiced_pitch(
+        self,
+        pitch: Pitch | None,
+        include_transitions: bool = True,
+    ) -> bool:
+        return (
+            pitch is not None
+            and bool(pitch.candidates)
+            and pitch.unvoiced_prob < self.UNVOICED_THRESHOLD
+            and (include_transitions or not getattr(pitch, "is_transition", False))
+        )
+
+    def get_voiced_range(
+        self,
+        include_transitions: bool = True,
+    ) -> tuple[float, float] | None:
+        """Return the app-time range covered by voiced pitch frames."""
+        first = None
+        last = None
+        for pitch in self.data:
+            if self.is_voiced_pitch(
+                pitch,
+                include_transitions=include_transitions,
+            ):
+                first = pitch
+                break
+        for pitch in reversed(self.data):
+            if self.is_voiced_pitch(
+                pitch,
+                include_transitions=include_transitions,
+            ):
+                last = pitch
+                break
+        if first is None or last is None:
+            return None
+        frame_dt = self.config.h1 / self.config.sr
+        return first.time, last.time + frame_dt

@@ -78,27 +78,45 @@ class NoteData:
             last_note = self.read_note(start_time=bounds[1])
         return last_note.end_time - first_note.start_time
     
-    def get_bounds(self) -> tuple[float, float]:
-        """return the (start_time, end_time) bounds of the note data"""
-        if not self.times:
-            return (0.0, 0.0)
-        first_time = self.times[0]
-        last_time = self.times[-1]
-        return (first_time, self.data[last_time].end_time)
+    def get_bounds(
+        self,
+        clean: bool=True,
+        use_note_end: bool=True,
+    ) -> tuple[float, float] | None:
+        """Return the (start_time, end_time) time span covered by the notes, or
+        None if there are none. With clean=True (default), rests/unvoiced notes
+        (midi_num[0] == -1) are skipped — the voiced span; clean=False uses every
+        note. With use_note_end=False, return first note start -> last note start,
+        which is useful for tempo fitting by onset span."""
+        notes = self.read(i=0, j=len(self.times), clean=clean) if self.times else []
+        if not notes:
+            return None
+        end = notes[-1].end_time if use_note_end else notes[-1].start_time
+        return notes[0].start_time, end
 
-    def get_minimum_note_length(self) -> float:
-        """return the minimum note length in seconds"""
+    def get_min_note_length(self, default: float=0.0, clean: bool=True) -> float:
+        """Return the minimum note length in seconds.
+
+        When clean=True, unvoiced/rest notes are ignored. This is the score-level
+        source for Config.min_note_length.
+        """
         if not self.times:
-            return 0.0
+            return default
         
         min_length = float('inf')
         for t in self.times:
             n = self.data[t]
+            if clean and (not n.midi_num or n.midi_num[0] == -1):
+                continue
             note_length = n.end_time - n.start_time
-            if note_length < min_length:
+            if note_length > 0 and note_length < min_length:
                 min_length = note_length
         
-        return min_length if min_length != float('inf') else -1
+        return min_length if min_length != float('inf') else default
+
+    def get_minimum_note_length(self) -> float:
+        """Compatibility alias for older callers."""
+        return self.get_min_note_length(default=0.0, clean=False)
 
     def read(self, start_time: float=None, end_time: float=None, 
              i=None, j=None, clean:bool=False) -> list[Note]:        

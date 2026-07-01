@@ -1,14 +1,19 @@
 import numpy as np
+import threading
+import time
 from pathlib import Path
+from typing import Literal
 
 from app_logic.user.ds.AudioData import AudioData
 from app_logic.user.ds.PitchData import PitchData, Pitch
 from app_logic.midi.ScoreData import ScoreData
-from app_logic.Alignment import Alignment, Mistake
+from app_logic.Alignment import Alignment
 from app_logic.NoteData import NoteData
 from app_logic.user.ds.Buffer import Buffer
 from app_logic.JsonHandler import JsonHandler
 from algorithms.Config import Config
+
+ResizeSpan = Literal["pitch", "note", "raw"]
 
 class Recording:
     TRAILING_AUDIO_PAD_SEC = 0.2
@@ -27,20 +32,21 @@ class Recording:
         from algorithms.PitchDetector import PitchDetector
         from algorithms.PitchSmoother import PitchSmoother
         from algorithms.NoteDetector import NoteDetector
-        from algorithms.StringEditor import StringEditor
+        from algorithms.MistakeDetector import MistakeDetector
         from algorithms.MistakeChecker import MistakeChecker
         self.pitch_detector = PitchDetector(recording=self)
         self.pitch_smoother = PitchSmoother(recording=self)
         self.note_detector = NoteDetector(recording=self)
-        self.string_editor = StringEditor(recording=self)
+        self.mistake_detector = MistakeDetector(recording=self)
         self.mistake_checker = MistakeChecker(recording=self)
 
         # essential data variables
         self.audio_data = AudioData(config=self.config)
         self.pitch_data = PitchData(config=self.config)
         self.note_data = NoteData()
+        self.onset_data = None
+        self.onset_detector = None
         self.alignment: Alignment = Alignment(config=self.config) # filled in later
-        self.timing_mistakes: list[Mistake] = [] # derived from alignment in analyze
         self.overridden_mistake_indices = set()
 
         # Persistence metadata. Folder/library entries point at files until their
@@ -50,10 +56,8 @@ class Recording:
         self.unsaved_changes = False
         self.loaded_from_cache = False
 
-        # queue data structures for real time pitch + note detection + correction
+        # queue data structures for real time pitch detection
         self.a2p_queue = Buffer(self.config.sr) #audio-to-pitches
-        self.p2n_queue = Buffer(sr=self.config.sr/self.config.h1) #pitches-to-notes
-        self.n2c_queue = None #notes-to-corrections
 
     def update_config(self, config: Config=None):
         """initialize the config, either with a provided one or a default one"""
@@ -61,6 +65,8 @@ class Recording:
             self.config = Config()
         else:
             self.config = config
+
+        self.sync_min_note_length_from_score()
             
         if hasattr(self, 'pitch_detector'):
             self.pitch_detector.load_config(self.config)
@@ -68,29 +74,16 @@ class Recording:
             self.pitch_smoother.update_config(self.config)
         if hasattr(self, 'note_detector'):
             self.note_detector.update_config(self.config)
-        if hasattr(self, 'string_editor'):
-            self.string_editor.update_config(self.config)
+        if hasattr(self, 'onset_detector') and self.onset_detector is not None:
+            self.onset_detector.update_config(self.config)
+        if hasattr(self, 'onset_data') and self.onset_data is not None:
+            self.onset_data.config = self.config
+        if hasattr(self, 'mistake_detector'):
+            self.mistake_detector.update_config(self.config)
         if hasattr(self, 'mistake_checker'):
             self.mistake_checker.update_config(self.config)
     # def on_pitches_detected(self, pitches):
     #     self.pitch_data.data = pitches
-
-    @staticmethod
-    def cache_path_for(audio_filepath: str | Path) -> Path:
-        return JsonHandler.cache_path_for(audio_filepath)
-
-    @staticmethod
-    def delete_cache_for(audio_filepath: str | Path) -> None:
-        JsonHandler.delete_cache_for(audio_filepath)
-
-    def cache_path(self) -> Path | None:
-        return self.cache_path_for(self.audio_filepath) if self.audio_filepath else None
-
-    def audio_file_exists(self) -> bool:
-        return self.audio_filepath is not None and Path(self.audio_filepath).exists()
-
-    def rename_files(self, new_stem: str) -> Path | None:
-        return JsonHandler.rename_recording_files(self, new_stem)
 
     def load_audio(
         self,
@@ -104,6 +97,14 @@ class Recording:
         cleanup + detection together so the views reset as one)."""
         path = Path(audio_filepath)
         self.audio_data.load_data(str(path))
+        # The pitch pipeline stamps frame times as i*h1/config.sr and converts YIN
+        # lags to frequency with config.sr too. If that rate disagrees with the
+        # audio file's REAL rate, BOTH drift: pitch times stretch (the track slides
+        # "later and later" over its length) and detected pitches come out mistuned
+        # (e.g. a 48kHz file read at 44.1k lands ~1.5 semitones flat). The audio
+        # file is the source of truth, so pin config.sr to it — and re-init the
+        # detectors + pitch grid — before detection runs.
+        self._sync_sr_to_audio()
         self.audio_filepath = path
         self.unsaved_changes = False
         self.loaded_from_cache = False
@@ -112,9 +113,20 @@ class Recording:
         if load_cache:
             self.load_cache(score_filepath=score_filepath, recording_name=recording_name)
 
+    def _sync_sr_to_audio(self):
+        """Pin config.sr to the loaded audio's real sample rate and propagate it to
+        the detectors/pitch grid, so pitch times + frequencies are computed on the
+        audio's own sample grid rather than the 44.1k default. No-op when they
+        already match. (A stale cache saved at a different sr overrides this again
+        on load — see JsonHandler; such caches must be re-detected to be correct.)"""
+        audio_sr = int(getattr(self.audio_data, "sr", 0) or 0)
+        if audio_sr and audio_sr != self.config.sr:
+            self.config.sr = audio_sr
+            self.update_config(self.config)
+
     def save_audio(self, audio_filepath: str | Path):
         """Persist this recording's current audio buffer to disk."""
-        self.truncate_end(mark_unsaved=False)
+        self.trim_end(mark_unsaved=False)
         path = Path(audio_filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.audio_data.save_data(str(path))
@@ -129,9 +141,7 @@ class Recording:
         return any(p is not None for p in self.pitch_data.data)
 
     def save_cache(
-        self,
-        score_filepath: str | Path | None = None,
-        recording_name: str | None = None,
+        self, score_filepath: str | Path=None, recording_name: str=None,
     ) -> bool:
         return JsonHandler(self).save_cache(
             score_filepath=score_filepath,
@@ -140,8 +150,8 @@ class Recording:
 
     def load_cache(
         self,
-        score_filepath: str | Path | None = None,
-        recording_name: str | None = None,
+        score_filepath: str | Path=None,
+        recording_name: str=None,
     ) -> bool:
         return JsonHandler(self).load_cache(
             score_filepath=score_filepath,
@@ -157,21 +167,42 @@ class Recording:
     def reset_analysis(self):
         """Re-init analysis-derived data structures. Called before re-analyze() in app."""
         self.note_data = NoteData()
+        self.onset_data = None
         self.alignment = Alignment(config=self.config)
-        self.timing_mistakes = []
         self.overridden_mistake_indices = set()
+
+    def sync_min_note_length_from_score(self) -> float:
+        """Refresh Config.min_note_length from the active score/clip NoteData."""
+        if not hasattr(self, "config") or self.config is None:
+            return 0.0
+        try:
+            note_data = self.score_data.clipped_note_data(channel=self.active_instrument)
+        except (AttributeError, KeyError, TypeError):
+            return self.config.min_note_length
+        return self.config.set_min_note_length_from_notedata(note_data)
 
     def detect_pitches(self, on_phase=None):
         """run pitch detection, then smoothing, on the current audio data.
         `on_phase(text)`, if given, is called at the start of each stage so a
         caller can surface progress (e.g. a status-bar message)."""
-        if on_phase:
-            on_phase("Detecting pitches...")
         audio = self.audio_data.read_all()
-        self.pitch_data.data = self.pitch_detector.detect_pitches(audio)
-        if on_phase:
-            on_phase("Smoothing pitches...")
-        self.pitch_data.data = self.pitch_smoother.smooth(self.pitch_data.data)
+        stop_status = self._phase_status_timer(on_phase, "Detecting pitches")
+        try:
+            self.pitch_data.data = self.pitch_detector.detect_pitches(
+                audio,
+                show_progress=False,
+            )
+        finally:
+            stop_status()
+
+        stop_status = self._phase_status_timer(on_phase, "Smoothing pitches")
+        try:
+            self.pitch_data.data = self.pitch_smoother.smooth(
+                self.pitch_data.data,
+                verbose=False,
+            )
+        finally:
+            stop_status()
         # the offline pass stamps frame times relative to buffer index 0, which
         # represents app-time `t_origin` (NEGATIVE for a Perform runway recorded
         # before the head). Mirror the audio buffer's origin onto the pitch data
@@ -183,42 +214,68 @@ class Recording:
                 if p is not None:
                     p.time += origin
 
-    def detect_notes(self):
-        """run note detection on the current pitch data.
+    @staticmethod
+    def _phase_status_timer(on_phase, label: str):
+        """Emit a per-phase elapsed-time status until the current phase finishes."""
+        if on_phase is None:
+            return lambda: None
 
-        A/B toggle lives on NoteDetector.USE_PELT (flip it to switch detectors;
-        find_best_w2 reads the same flag and no-ops under PELT)."""
-        if self.note_detector.USE_PELT:
-            self.note_data = self.note_detector.detect_notes2(self.pitch_data)
-        else:
-            self.note_data = self.note_detector.detect_notes(self.pitch_data)
+        stop_event = threading.Event()
+        start = time.perf_counter()
+
+        def message() -> str:
+            return f"{label}... {time.perf_counter() - start:.1f}s"
+
+        def tick():
+            while not stop_event.wait(0.25):
+                on_phase(message())
+
+        on_phase(message())
+        thread = threading.Thread(target=tick, daemon=True)
+        thread.start()
+
+        def stop():
+            stop_event.set()
+            thread.join(timeout=0.5)
+            on_phase(message())
+
+        return stop
+
+    def detect_notes(self):
+        """Run PELT note detection on the current pitch data."""
+        self.note_data = self.note_detector.detect_notes(self.pitch_data, refine_with_onsets=True)
 
     def detect_transitions(self):
-        """flag high-slope (pitch-transition) frames in the pitch data. Run after
-        detect_notes() / onset refinement and before update_alignment_distances()
-        so those biased frames are left uncolored (grey) instead of scored."""
+        """Flag high-slope pitch-transition frames before PELT note detection."""
         self.note_detector.detect_transitions(self.pitch_data)
 
     def recompute_note_pitches(self):
-        """re-median each detected note's pitch over only its non-transition
-        frames, so onset-refinement slide frames don't bias a note sharp/flat
-        (e.g. a false F5->F#5). Run after detect_transitions(), before
-        detect_mistakes()."""
+        """Re-median detected notes over non-transition frames."""
         self.note_detector.recompute_note_pitches(self.note_data, self.pitch_data)
 
     def prune_transition_notes(self):
-        """drop phantom notes that are almost entirely transition frames (notes
-        'detected' inside a slide because the ND window is wide). Run after
-        detect_transitions(), before detect_mistakes()."""
-        self.note_data = self.note_detector.prune_transition_notes(self.note_data, self.pitch_data)
+        """Drop detected notes that are mostly transition frames."""
+        self.note_data = self.note_detector.prune_transition_notes(
+            self.note_data,
+            self.pitch_data,
+        )
 
-    def detect_mistakes(self):
-        # the StringEditor only ever sees the clip's score notes (the full
+    def detect_mistakes(self, onset_aware: bool = False):
+        # The MistakeDetector only ever sees the clip's score notes (the full
         # NoteData when unclipped) — see ScoreData.clipped_note_data.
+        # onset_aware swaps in the time-anchored aligner (A/B against pitch-only).
         user_notes = self.note_data
         midi_notes = self.score_data.clipped_note_data(channel=self.active_instrument)
-        notes, mistakes = self.string_editor.string_edit(user_string=user_notes, midi_string=midi_notes)
-        self.alignment.load_alignment(notes, mistakes)
+        detect = (
+            self.mistake_detector.detect_pitch_mistakes_onset_aware
+            if onset_aware
+            else self.mistake_detector.detect_pitch_mistakes
+        )
+        notes, mistakes = detect(
+            user_string=user_notes,
+            midi_string=midi_notes,
+        )
+        self.alignment.load_alignment(notes, pitch_mistakes=mistakes)
         self.alignment.reapply_overrides(self.overridden_mistake_indices)
 
     def correct_mistakes(self):
@@ -228,72 +285,12 @@ class Recording:
         self.reindex_mistakes()
 
     def reindex_mistakes(self):
-        """Refresh mistake -> alignment-pair indices after note correction.
-
-        Pitch mistakes live on Alignment. Timing mistakes are derived separately,
-        but they still point at the same final alignment pairs for highlighting
-        and future bookkeeping.
+        """Refresh mistake -> alignment-pair indices after note correction
         """
         if self.alignment is None:
             return
         self.alignment.reindex_mistakes()
         self.alignment.reapply_overrides(self.overridden_mistake_indices)
-        if self.timing_mistakes:
-            self.alignment.reindex_mistakes(self.timing_mistakes)
-
-    def detect_timing_mistakes(self) -> list[Mistake]:
-        """Derive per-note TIMING mistakes (early / late / short / long) from the
-        current alignment, store them on `self.timing_mistakes`, and return them.
-        A pipeline step run by analyze() right after detect_mistakes()/correction
-        (it reads the final `alignment.pairs`). Pure post-processing — no new DSP
-        and no pitch detection, so it's safe to call any time an alignment exists
-        (returns [] before analysis). Drives the MistakeWidget's Timing tab; the
-        same deviations are already shown visually in GuitarHero.
-
-        Only MATCHED pairs (both notes present — string-edit goods *and*
-        substitutions) have a well-defined timing comparison; insertions and
-        deletions have no partner to compare against and are skipped. A note can
-        yield multiple timing mistakes; for example, a note whose onset is late
-        and whose duration is too long gets both rows in the Timing tab.
-
-        NOTE these are RELATIVE deviations. resize() normalizes the take's global
-        tempo to the score and co-anchors the first voiced note at the origin, so
-        this measures rubato / timing *consistency* within the piece, not an
-        absolute "you played the whole thing too fast". The first matched note
-        therefore sits near 0 offset by construction."""
-        timing_tol = max(0.0, float(self.config.timing_tolerance))
-        mistakes: list[Mistake] = []
-        for pair_index, (user_note, score_note) in enumerate(self.alignment.pairs):
-            if user_note is None or score_note is None:
-                continue  # insertion / deletion: no pair to compare timing against
-
-            onset_off = user_note.start_time - score_note.start_time  # + = late
-            user_dur = max(1e-9, user_note.end_time - user_note.start_time)
-            score_dur = max(1e-9, score_note.end_time - score_note.start_time)
-            dur_off = user_dur - score_dur  # + = too long, - = too short
-
-            if abs(onset_off) > timing_tol:
-                m = Mistake(
-                    type="late" if onset_off > 0 else "early",
-                    user_note=user_note,
-                    midi_note=score_note,
-                )
-                m.info = f"{onset_off:+.2f}s"
-                m.set_pair_index(pair_index)
-                mistakes.append(m)
-
-            if abs(dur_off) > timing_tol:
-                m = Mistake(
-                    type="long" if dur_off > 0 else "short",
-                    user_note=user_note,
-                    midi_note=score_note,
-                )
-                m.info = f"{dur_off:+.2f}s"
-                m.set_pair_index(pair_index)
-                mistakes.append(m)
-        self.timing_mistakes = mistakes
-        self.reindex_mistakes()
-        return mistakes
 
     def write_data(self, indata: np.ndarray, start_time: float):
         """write indata to the audio_data at the given start_time
@@ -304,11 +301,8 @@ class Recording:
         self.a2p_queue.push(indata)
 
     def write_pitch_data(self, indata: list[Pitch], start_time: float):
-        """write indata to the pitch_data at the given start_time
-        and append to our queue for note processing
-        """
+        """Write detected pitches to pitch_data at the given start_time."""
         self.pitch_data.write(indata, start_time)
-        self.p2n_queue.push(indata)
 
     def get_length(self, raw=True):
         if raw:
@@ -316,10 +310,11 @@ class Recording:
                 return self.note_data.get_length()
             else:
                 return self.audio_data.get_length()
-        # get start time of first VOICED note, end time of last note
-        start_time = self._get_first_note(voiced=True).start_time
-        end_time = self._get_last_note(voiced=True).end_time
-        return end_time - start_time
+        bounds = self.note_data.get_bounds(clean=True)
+        if bounds is None:
+            return 0.0
+        start, end = bounds
+        return end - start
 
     def audio_bounds(self) -> tuple[float, float] | None:
         """App-time bounds for the recording audio currently considered live."""
@@ -331,28 +326,12 @@ class Recording:
         """App-time of the recording's logical audio end."""
         return self.audio_data.get_end_time()
     
-    # get first/last notes (used in ___ find later)
-    def _get_first_note(self, voiced=True):
-        if not voiced:
-            return self.note_data.data[0] if self.note_data.data else None
-        for n in self.note_data.data.values():
-            if n.midi_num[0] != -1:
-                return n
-        return 0
-    
-    def _get_last_note(self, voiced=True):
-        if not voiced:
-            return self.note_data.data[-1] if self.note_data.data else None
-        for n in reversed(self.note_data.data.values()):
-            if n.midi_num[0] != -1:
-                return n
-        return 0
-    
     def shift(self, delta: float):
         """Slide the WHOLE recorded take (audio, pitches, notes) by `delta` sec on
         the app-time line. Audio/pitch frames move via their shared time origin (no
-        array copy); notes are rekeyed. Used post-analysis to land the first voiced
-        note on the score's clip start without translating the score."""
+        array copy); notes are rekeyed. General primitive; NOTE resize_score no
+        longer calls it — the take is kept fixed and the score is moved onto it
+        instead (so audio/pitch stay indexed in their own app-time)."""
         if not delta:
             return
         self.audio_data.t_origin += delta
@@ -362,94 +341,96 @@ class Recording:
                 p.time += delta
         self.note_data.shift(delta)
 
-    def _clip_start_time(self) -> float:
-        """App-time the take should align its first voiced note to: the score's
-        clip start when clipped, else the score's first note."""
-        cb = self.score_data.clip_bounds()
-        if cb is not None:
-            return cb[0]
-        nd = self.score_data.note_datas.get(self.active_instrument)
-        return nd.times[0] if nd and nd.times else 0.0
+    def resize_score(
+        self,
+        to_span: ResizeSpan = "pitch",
+        respect_clip: bool = True,
+        include_transitions: bool = True,
+    ) -> bool:
+        """Stretch the score to a recording span and move the score ONTO the take.
 
-    def resize(self, new_length: float):
-        """Stretch the score so its NOTE SPAN matches the take (`new_length` =
-        the take's voiced note span, rec.get_length(raw=False)), and slide the
-        take so the two line up.
+        Args:
+            to_span:
+                "pitch" uses first/last voiced pitch frames. This pre-note pass
+                gives score-derived note-length heuristics a tempo close to the
+                take before PELT computes its min_size.
+                "note" uses the detected voiced note span for the final resize.
+                "raw" uses the full detected-note span, or full audio span if
+                notes have not been detected yet.
+            respect_clip:
+                If true and a score clip exists, match the clip span to the take
+                and anchor the clip's first note onto the take's first voiced
+                note. Otherwise match the whole active-instrument score span and
+                anchor the score's first note onto the take's. The take never
+                moves — it is the app-time truth; only the score is stretched and
+                shifted to fit it.
+            include_transitions:
+                Only used for to_span="pitch". When false, high-slope transition
+                frames flagged by detect_transitions() are ignored when finding
+                the first/last voiced frame.
+        """
+        if to_span == "pitch":
+            bounds = self.pitch_data.get_voiced_range(
+                include_transitions=include_transitions,
+            )
+        elif to_span == "note":
+            bounds = self.note_data.get_bounds(clean=True, use_note_end=True)
+        elif to_span == "raw":
+            bounds = self.audio_bounds()
+        else:
+            raise ValueError(f"unknown resize span: {to_span!r}")
 
-        When CLIPPED, only the clipped span is matched to the take (not the whole
-        score) and both are anchored at t=0 — see _resize_to_clip. Otherwise the
-        score's note span is stretched and the take slides onto the score's first
-        note (so its last voiced note lands on the last score note's end)."""
-        if self.score_data.clip is not None:
-            self._resize_to_clip(new_length, self.score_data.clip)
-            return
+        if not bounds or bounds[1] <= bounds[0]:
+            return False
 
-        # Stretch so the score's NOTE SPAN (first note start -> last note end)
-        # equals the take — NOT midi_data.length_og. The MIDI carries trailing
-        # slack past the last note (a final rest / metronome tail; e.g. the demo
-        # scale's notes span 8.0s inside an 8.5s MIDI), so stretching the TOTAL
-        # length left the notes short and every note drifted progressively 'late'
-        # toward the end. new_bpm = bpm * note_span / new_length mirrors
-        # _resize_to_clip (change_tempo divides bpm_og out, so the current bpm is
-        # the right thing to scale).
+        start, end = bounds
+        target_span = end - start
+        take_anchor_time = start  # the take's first voiced app-time; the take STAYS here
+
         sd = self.score_data
-        nd = sd.note_datas[self.active_instrument]
-        if new_length <= 0 or not nd.times:
-            return
-        note_span = (nd.read_note(i=len(nd.times) - 1).end_time
-                     - nd.read_note(i=0).start_time)
-        if note_span <= 0:
-            return
-        new_bpm = max(1, round(sd.bpm * note_span / new_length))
+        score_bounds = sd.get_bounds(
+            channel=self.active_instrument,
+            respect_clip=respect_clip,
+            use_note_end=True,
+        )
+        if score_bounds is None:
+            return False
+        score_span = score_bounds[1] - score_bounds[0]
+        if score_span <= 0:
+            return False
+
+        # Stretch the relevant score span to the user's recording span. Keep the
+        # bpm FRACTIONAL: rounding to an integer quantizes the scale (~0.8%/bpm at
+        # 120 => ~0.5s drift over a 60s piece), which lands the score's endpoint
+        # off the take's even when the spans were measured perfectly.
+        new_bpm = max(1.0, sd.bpm * score_span / target_span)
         sd.change_tempo(new_bpm)
 
-        # Keep the score fixed and slide the TAKE instead, so its first voiced
-        # NOTE lands on the score's first note. With the note span matched above,
-        # the last voiced note then lands on the last score note's end.
-        first = self._get_first_note(voiced=True)
-        if first != 0:
-            self.shift(self._clip_start_time() - first.start_time)
+        score_bounds = sd.get_bounds(
+            channel=self.active_instrument,
+            respect_clip=respect_clip,
+            use_note_end=True,
+        )
+        if score_bounds is None:
+            return False
+        # Move the SCORE onto the fixed take: land the (clip) first note ON the
+        # take's first voiced note, instead of dragging the take to t=0. The take
+        # never moves, so its audio/pitch/note timeline stays the single app-time
+        # truth the slider and audio player index against (no negative t_origin,
+        # no shift — which is what used to desync the waveform from the cursor).
+        # transpose_notes takes an absolute offset from the untransposed baseline;
+        # (sd.transpose_offset - score_bounds[0]) re-bases it even when change_tempo
+        # no-ops, and + take_anchor_time then anchors the span onto the take.
+        sd.transpose_notes(sd.transpose_offset - score_bounds[0] + take_anchor_time)
+
+        self.sync_min_note_length_from_score()
         self._update_pitch_distances()
-
-    def _resize_to_clip(self, new_length: float, clip: tuple[int, int]):
-        """Clip-aware resize, in this exact order:
-          1. stretch the WHOLE score to a bpm so the CLIPPED span matches the take
-             (note(clip[1]).end - note(clip[0]).start == new_length == the take's
-             voiced NOTE span, rec.get_length(raw=False)),
-          2. translate the score so the clip's first note starts at t=0,
-          3. slide the take so its first voiced note also starts at t=0.
-        So the clip and the take are co-anchored at the origin. The clip indices
-        ride along the tempo rebuild; clip_bounds() re-derives the [0, new_length]
-        window. (The GuitarHero overlay is redrawn by the caller — see analyze.)"""
-        sd = self.score_data
-        i0, i1 = clip
-        nd = sd.note_datas[self.active_instrument]
-        if new_length <= 0 or not (0 <= i0 <= i1 < len(nd.times)):
-            return
-        clip_span = nd.read_note(i=i1).end_time - nd.read_note(i=i0).start_time
-        if clip_span <= 0:
-            return
-
-        # 1) bpm s.t. clip_span * (bpm_before / new_bpm) == new_length
-        new_bpm = max(1, round(sd.bpm * clip_span / new_length))
-        sd.change_tempo(new_bpm)  # rebuilds the notes; clip indices stay valid
-
-        # 2) translate the score so clip[0] starts at t=0 (pre-clip notes go < 0)
-        nd = sd.note_datas[self.active_instrument]
-        sd.transpose_notes(-nd.read_note(i=i0).start_time)
-
-        # 3) slide the take so its first voiced NOTE starts at t=0 (so the take's
-        # first/last voiced note map onto the clip's first-note start / last-note
-        # end — the clip span was matched to the take's note span above).
-        first = self._get_first_note(voiced=True)
-        if first != 0:
-            self.shift(-first.start_time)
-
-        self._update_pitch_distances()
+        return True
 
     def change_tempo(self, new_bpm: float):
         """Change the tempo of the recording by changing the BPM of the score data, which will automatically update the note timings and pitch distances."""
         self.score_data.change_tempo(new_bpm)
+        self.sync_min_note_length_from_score()
         self._update_pitch_distances()
 
     def _update_pitch_distances(self):
@@ -466,24 +447,12 @@ class Recording:
     TRANSITION_DISTANCE = 0.0
 
     def update_alignment_distances(self):
-        """Recompute every pitch's `align_distance` from the current string-edit
-        alignment (call after analyze()/detect_mistakes()).
-
-        Unlike `_update_pitch_distances`, which keys each pitch off the score note
-        sitting at its absolute time, this keys off the note pairing the string
-        edit chose:
-          - deletion (no user note): nothing to color, skipped.
-          - insertion (user note, no score match): all its pitches -> inf (red).
-          - good / substitution: distance to the *aligned* score note's pitch.
-
-        High-slope transition frames (flagged by detect_transitions) are always
-        skipped — their pitch is mid-slide and unreliable, so they stay None
-        (grey) rather than dragging a note's coloring or showing as a mistake.
-        Other voiced pitches not covered by any aligned note default to green
-        (TRANSITION_DISTANCE) rather than the live per-frame distance. Truly
-        empty/unvoiced frames stay None. So in post-analysis every *drawn*,
-        non-transition pitch has an align_distance; while recording (pitches
-        detected fresh) they're all None -> live coloring."""
+        """Recompute every pitch's `align_distance` from the current pitch-mistake
+        alignment (call after analyze()/detect_mistakes()) with the following coloring:
+          - deletion: nothing to color, skipped
+          - insertion: all pitches -> inf (red)
+          - good/substitution: distance to the *aligned* score note's pitch.
+        """
         # reset first so stale post-analysis colors never linger
         for p in self.pitch_data.data:
             if p is not None:
@@ -522,11 +491,11 @@ class Recording:
                 p.align_distance = self.TRANSITION_DISTANCE
     
     def toggle_mistake_override(self, mistake_index: int):
-        #error checking
-        if not (0 <= mistake_index < len(self.alignment.mistakes)):
+        # error checking
+        if not (0 <= mistake_index < len(self.alignment.pitch_mistakes)):
             return
-        #Toggle persisted override state for one mistake.
-        mistake = self.alignment.mistakes[mistake_index]
+        # toggle persisted override state for one mistake
+        mistake = self.alignment.pitch_mistakes[mistake_index]
         pair_index = mistake.get_pair_index()
         if mistake_index in self.overridden_mistake_indices:
             self.overridden_mistake_indices.remove(mistake_index)
@@ -537,47 +506,35 @@ class Recording:
             self.alignment.toggle_overridden_pair_indices(pair_index, True)
             overridden = True
 
-        if 0 <= mistake_index < len(self.alignment.mistakes):
-            self.alignment.mistakes[mistake_index].set_override(overridden)
+        if 0 <= mistake_index < len(self.alignment.pitch_mistakes):
+            self.alignment.pitch_mistakes[mistake_index].set_override(overridden)
 
-        # recolor the affected pitches: overridden notes -> green (distance 0),
-        # un-overridden -> back to their real alignment distance.
+        # recolor the affected pitches: overridden notes -> green (distance 0)
+        # un-overridden -> back to their real alignment distance
         self.update_alignment_distances()
 
     def has_analysis(self):
         """Return True if this recording has been analyzed (notes detected => alignment filled in)"""
         return len(self.note_data.times) > 0
 
-    def _last_voiced_pitch_index(self) -> int | None:
-        for i in range(len(self.pitch_data.data) - 1, -1, -1):
-            pitch = self.pitch_data.data[i]
-            if (pitch is not None
-                    and pitch.candidates
-                    and pitch.unvoiced_prob < self.pitch_data.UNVOICED_THRESHOLD):
-                return i
-        return None
-
-    def truncate_end(
-        self,
-        pad_sec: float = TRAILING_AUDIO_PAD_SEC,
-        mark_unsaved: bool = True,
+    def trim_end(
+        self, pad_sec: float = TRAILING_AUDIO_PAD_SEC, mark_unsaved: bool = True,
     ) -> bool:
         """Remove trailing silence after the last voiced pitch.
 
         Pitch times live in app-time, while AudioData stores samples from its
-        own `t_origin`; AudioData.truncate_end handles that conversion.
+        own `t_origin`; AudioData.trim_end handles that conversion.
         """
-        last_voiced_idx = self._last_voiced_pitch_index()
-        if last_voiced_idx is None:
+        voiced_range = self.pitch_data.get_voiced_range()
+        if voiced_range is None:
             return False
 
-        last_voiced = self.pitch_data.data[last_voiced_idx]
-        trim_time = last_voiced.time + max(0.0, pad_sec)
-        audio_changed = self.audio_data.truncate_end(trim_time)
+        _, voiced_end = voiced_range
+        trim_time = voiced_end + max(0.0, pad_sec)
+        audio_changed = self.audio_data.trim_end(trim_time)
 
-        keep_count = last_voiced_idx + 1
-        for i in range(last_voiced_idx + 1, len(self.pitch_data.data)):
-            pitch = self.pitch_data.data[i]
+        keep_count = 0
+        for i, pitch in enumerate(self.pitch_data.data):
             if pitch is None:
                 continue
             if pitch.time > trim_time:
@@ -593,6 +550,21 @@ class Recording:
             self.unsaved_changes = True
         return audio_changed or pitch_changed
 
-    def trim_end(self, *args, **kwargs):
-        """Compatibility alias for older callers."""
-        return self.truncate_end(*args, **kwargs)
+
+    # --- JSON LOADING / SAVING WRAPPERS ---
+    @staticmethod
+    def cache_path_for(audio_filepath: str | Path) -> Path:
+        return JsonHandler.cache_path_for(audio_filepath)
+
+    @staticmethod
+    def delete_cache_for(audio_filepath: str | Path) -> None:
+        JsonHandler.delete_cache_for(audio_filepath)
+
+    def cache_path(self) -> Path | None:
+        return self.cache_path_for(self.audio_filepath) if self.audio_filepath else None
+
+    def audio_file_exists(self) -> bool:
+        return self.audio_filepath is not None and Path(self.audio_filepath).exists()
+
+    def rename_files(self, new_stem: str) -> Path | None:
+        return JsonHandler.rename_recording_files(self, new_stem)

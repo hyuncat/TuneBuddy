@@ -11,7 +11,7 @@ class ToleranceWidget(QWidget):
     Small panel beneath the MistakeWidget for tuning whichever tolerance belongs
     to the current mistake tab.
 
-    Pitch mode presents the string-edit tolerance in semitone units. Timing mode
+    Pitch mode presents the pitch-mistake tolerance in semitone units. Timing mode
     presents the post-alignment timing tolerance in seconds. In both modes the
     line edit is the source of truth and accepts any non-negative number; the
     slider is a bounded convenience control.
@@ -24,7 +24,7 @@ class ToleranceWidget(QWidget):
         self._PITCH_HELP_TEXT = "How close to the intended note (in semitones)\nthe user can play to be counted correct.\n1 = Nearest semitone, 2 = Nearest whole step, etc."
         self._TIMING_HELP_TEXT = "How far off +/- the user's note can vary from the score in timing."
         # Pitch is shown/edited in semitones. The Config stores raw
-        # pitch_tolerance (the string-edit semitone slack); the two are linearly
+        # pitch_tolerance (the pitch-mistake semitone slack); the two are linearly
         # related: each whole semitone step on the slider is worth
         # `_TOL_PER_SEMITONE` of raw tolerance.
         #   semitones 1 2 3 4 5  <->  pitch_tolerance 0.25 0.5 0.75 1.0 1.25

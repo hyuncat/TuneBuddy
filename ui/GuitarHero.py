@@ -235,7 +235,7 @@ class GuitarHero(QWidget):
 
         # --- POST-ANALYSIS (alignment-based) palette ---
         # Used after analyze() for pitches that carry an `align_distance`. Both
-        # bounds scale with the recording's string-edit pitch_tolerance: green
+        # bounds scale with the recording's pitch-mistake tolerance: green
         # within that many semitones of the aligned score note, then ramps
         # green->red out to ALIGN_MAX_MULT * pitch_tolerance (insertions clamp to
         # the max bucket => solid red). Rebuilt per-recording in load_user().
@@ -413,7 +413,7 @@ class GuitarHero(QWidget):
         self.recording = recording
         self.score_data = recording.score_data
         self.alignment = recording.alignment
-        # green band + red ramp track this recording's string-edit tolerance
+        # green band + red ramp track this recording's pitch-mistake tolerance
         self._build_align_brushes(tolerance=recording.config.pitch_tolerance)
         self.clear_highlight()
         self.update_view_items()
@@ -445,10 +445,12 @@ class GuitarHero(QWidget):
         self.update_alignment_items(x_range)
         self.update_clip_overlay()
 
-    def _clip_bounds(self) -> tuple[float, float] | None:
+    def _active_clip_window(self) -> tuple[float, float] | None:
         """The clip's [b0, b1] window (derived from note indices), or None.
-        Single source of truth: ScoreData.clip_bounds()."""
-        return self.score_data.clip_bounds() if self.score_data else None
+        Single source of truth: ScoreData.get_bounds(respect_clip=True)."""
+        if self.score_data is None or not self.score_data.is_clipped():
+            return None
+        return self.score_data.get_bounds(respect_clip=True)
 
     def _active_score_notes_by_id(self) -> dict[int, object]:
         """Current score notes for the active instrument, keyed by stable note id."""
@@ -503,15 +505,16 @@ class GuitarHero(QWidget):
             return
 
         self.alignment.pairs = pairs
-        for mistake in self.alignment.mistakes:
-            midi_note = getattr(mistake, "midi_note", None)
-            if midi_note is None:
-                continue
-            current_midi_note = replacements.get(id(midi_note))
-            if current_midi_note is None:
-                current_midi_note = self._resolve_score_note(midi_note, score_notes_by_id)
-            if current_midi_note is not midi_note:
-                mistake.midi_note = current_midi_note
+        for mistakes in (self.alignment.pitch_mistakes, self.alignment.timing_mistakes):
+            for mistake in mistakes:
+                midi_note = getattr(mistake, "midi_note", None)
+                if midi_note is None:
+                    continue
+                current_midi_note = replacements.get(id(midi_note))
+                if current_midi_note is None:
+                    current_midi_note = self._resolve_score_note(midi_note, score_notes_by_id)
+                if current_midi_note is not midi_note:
+                    mistake.midi_note = current_midi_note
         self.alignment.init_2(pairs)
 
     def update_clip_overlay(self):
@@ -519,7 +522,7 @@ class GuitarHero(QWidget):
         (hidden when unclipped). Only re-positions the bands when the clip window
         actually CHANGES — otherwise pyqtgraph just transforms the existing static
         bands as the view scrolls, which avoids the per-tick setRegion flicker."""
-        clip = self._clip_bounds()
+        clip = self._active_clip_window()
         if clip == self._last_dim_bounds:
             return
         self._last_dim_bounds = clip
@@ -626,7 +629,7 @@ class GuitarHero(QWidget):
         # a bar for each pitch — otherwise only the first note of each chord shows.
         # When clipped, score notes OUTSIDE the clip are drawn dimmer grey (a note
         # is "in the clip" iff its START is in [b0, b1), matching the alignment).
-        clip = self._clip_bounds()
+        clip = self._active_clip_window()
         starts, ends, midis, brushes = [], [], [], []
         for n in midi_notes:
             in_clip = clip is None or (clip[0] - 1e-6 <= n.start_time < clip[1] - 1e-6)
@@ -820,7 +823,7 @@ class GuitarHero(QWidget):
         return self.distance_brushes[idx]
 
     def _build_align_brushes(self, tolerance: float):
-        """(Re)build the post-analysis palette from the string-edit
+        """(Re)build the post-analysis palette from the pitch-mistake
         pitch_tolerance: green within that many semitones of the aligned note,
         ramping green->red out to ALIGN_MAX_MULT * tolerance."""
         green_thresh = max(float(tolerance), 0.0)

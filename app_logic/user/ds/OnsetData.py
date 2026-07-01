@@ -2,9 +2,12 @@ import threading
 import numpy as np
 import librosa
 from bisect import bisect_left, bisect_right
+from typing import TYPE_CHECKING
 
-from app_logic.user.ds.Recording import Recording
 from algorithms.Config import Config
+
+if TYPE_CHECKING:
+    from app_logic.user.ds.Recording import Recording
 
 
 class OnsetData:
@@ -66,19 +69,21 @@ class OnsetDetector:
         onsets = detector.detect(audio_data)
     """
  
-    # Reasonable defaults for a violin practice context. Tune as needed.
     HOP_LENGTH = 512
     BACKTRACK = True       # snap each onset to the nearest preceding energy minimum
     DELTA = 0.07           # threshold above local mean to count as a peak
     WAIT = 10              # min frames between onsets (~10 * hop / sr seconds)
  
-    def __init__(self, recording: Recording):
+    def __init__(self, recording: "Recording"):
         self.recording = recording
         self.config = recording.config
  
         # Inspection artifacts
         self.onset_env_ = None    # the onset strength envelope
         self.onset_frames_ = None # raw frame indices returned by librosa
+
+    def update_config(self, config: Config):
+        self.config = config
  
     def detect(self) -> OnsetData:
         """Run onset detection on `audio_data` and return a populated OnsetData."""
@@ -87,8 +92,9 @@ class OnsetDetector:
             return onset_data
  
         # snapshot the recorded portion of the buffer under the lock
-        y = self.recording.audio_data.read_data(start_time=0)
-        sr = self.config.sr
+        y = self.recording.audio_data.read_all()
+        sr = int(getattr(self.recording.audio_data, "sr", self.config.sr))
+        t_origin = float(getattr(self.recording.audio_data, "t_origin", 0.0))
 
         # Onset strength envelope (frame-rate signal of "how much is starting now")
         self.onset_env_ = librosa.onset.onset_strength(
@@ -108,7 +114,7 @@ class OnsetDetector:
  
         times = librosa.frames_to_time(
             self.onset_frames_, sr=sr, hop_length=self.HOP_LENGTH
-        )
+        ) + t_origin
         # Pull the envelope value at each onset frame as a "strength" score
         strengths = self.onset_env_[self.onset_frames_] if len(self.onset_frames_) else np.array([])
  

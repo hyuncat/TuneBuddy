@@ -41,11 +41,18 @@ class Mistake:
         return f"({time:.2f} | {self.type}) u: {u}, m: {m}"
 
 class Alignment:
-    def __init__(self, config: Config, notes: list[tuple[Note, Note]]=None, mistakes: list[Mistake]=None):
+    def __init__(
+        self,
+        config: Config,
+        notes: list[tuple[Note, Note]]=None,
+        pitch_mistakes: list[Mistake]=None,
+        timing_mistakes: list[Mistake]=None,
+    ):
         self.config = config
         # these are crucial
         self.pairs: list[tuple[Note, Note]] = notes if notes else []
-        self.mistakes: list[Mistake] = mistakes if mistakes else []
+        self.pitch_mistakes: list[Mistake] = pitch_mistakes if pitch_mistakes else []
+        self.timing_mistakes: list[Mistake] = timing_mistakes if timing_mistakes else []
         self.overridden_pair_indices = set()
 
         # our time-indexable {t: (n,m)} dictionary
@@ -56,13 +63,28 @@ class Alignment:
             self.pairs_1, self.pairs_2 = {}, {}
             self.times_1, self.times_2 = [], []
             self.match_user, self.match_score = {}, {}
-        self.THRESH = self.config.pitch_tolerance # same as StringEditor.TOLERANCE
+        self.THRESH = self.config.pitch_tolerance # same as MistakeDetector.TOLERANCE
         self.reindex_mistakes()
 
-    def load_alignment(self, notes: list[tuple[Note, Note]], mistakes: list[Mistake]):
+    @property
+    def mistakes(self) -> list[Mistake]:
+        """Compatibility alias for the pitch mistake list."""
+        return self.pitch_mistakes
+
+    @mistakes.setter
+    def mistakes(self, value: list[Mistake]):
+        self.pitch_mistakes = value
+
+    def load_alignment(
+        self,
+        notes: list[tuple[Note, Note]],
+        pitch_mistakes: list[Mistake] | None = None,
+        timing_mistakes: list[Mistake] | None = None,
+    ):
         """load in the alignment data, and initialize the pairs dictionaries for time indexing"""
         self.pairs = notes
-        self.mistakes = mistakes
+        self.pitch_mistakes = pitch_mistakes or []
+        self.timing_mistakes = timing_mistakes or []
         self.overridden_pair_indices = set()
         self.init_2(notes)
         self.reindex_mistakes()
@@ -75,10 +97,15 @@ class Alignment:
         derives indices from the actual note objects/times after the final
         alignment exists.
         """
-        target = self.mistakes if mistakes is None else mistakes
-        for mistake in target:
-            pair_index = self.pair_index_for_mistake(mistake)
-            mistake.set_pair_index(pair_index if pair_index is not None else -1)
+        targets = (
+            (self.pitch_mistakes, self.timing_mistakes)
+            if mistakes is None
+            else (mistakes,)
+        )
+        for target in targets:
+            for mistake in target:
+                pair_index = self.pair_index_for_mistake(mistake)
+                mistake.set_pair_index(pair_index if pair_index is not None else -1)
 
     def pair_index_for_mistake(self, mistake: Mistake) -> int | None:
         if mistake.type == "insertion":
@@ -213,8 +240,8 @@ class Alignment:
     def reapply_overrides(self, overridden_mistake_indices: set[int]):
         self.reset_overrides()
         for index in overridden_mistake_indices:
-            if 0 <= index < len(self.mistakes):
-                m = self.mistakes[index]
+            if 0 <= index < len(self.pitch_mistakes):
+                m = self.pitch_mistakes[index]
                 m.set_override(True)
                 if m.pair_index is not None and 0 <= m.pair_index < len(self.pairs):
                     self.overridden_pair_indices.add(m.pair_index)
@@ -222,7 +249,7 @@ class Alignment:
     #removes all overrides
     def reset_overrides(self):
         self.overridden_pair_indices = set()
-        for m in self.mistakes:
+        for m in self.pitch_mistakes:
             m.set_override(False)
 
     def toggle_overridden_pair_indices(self, index: int, toggle_to: bool):
@@ -232,11 +259,6 @@ class Alignment:
             self.overridden_pair_indices.discard(index)
 
     def __repr__(self):
-        mistakes = []
-        for mis in self.mistakes:
-            n = mis.user_note
-            m = mis.midi_note
-            mistakes.append(f"({m.start_time:.2f} | {mis.type}) u: {n.get_note_name()}, m: {m.get_note_name()}")
-        mistakes_str = "\n".join(mistakes)
-        n_mis = len(self.mistakes)
-        return f"alignment ({n_mis} mistakes):\n{mistakes_str}"
+        mistakes_str = "\n".join(str(mistake) for mistake in self.pitch_mistakes)
+        n_mis = len(self.pitch_mistakes)
+        return f"alignment ({n_mis} pitch mistakes):\n{mistakes_str}"

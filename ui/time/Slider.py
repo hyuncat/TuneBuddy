@@ -29,7 +29,8 @@ class Slider(QWidget):
         # Clip window: when a clip is active the slider keeps its FULL range (the
         # whole piece stays visible) but the cursor is constrained to this
         # [b0, b1] sub-range so it can't escape the clip. Derived from the active
-        # tab's score_data.clip_bounds() on every update_range (None = no constraint).
+        # tab's score_data.get_bounds(respect_clip=True) on every update_range
+        # (None = no constraint).
         # `_clamping` guards the setValue -> valueChanged -> slider_moved re-entry.
         self.clip_window: tuple[float, float] | None = None
         self._clamping = False
@@ -85,14 +86,15 @@ class Slider(QWidget):
         score's first note (S) and the user's first played note (U), so neither
         gets clipped at the very edge of the comparison. This slider is the master
         timeline driving the ScoreViewer cursor and GuitarHero, so the lead-in
-        lands there. (resize keeps the score fixed and slides the TAKE so U lands
-        on S; a Perform runway recorded before t=0 stays left of this edge.)"""
+        lands there. resize_score keeps the take fixed and moves the score onto
+        it, so the take's first voiced note (U) sits at its own recorded app-time;
+        a Perform runway recorded before it stays left of this edge."""
         m0, m1 = 0, 0
         user_audio_bounds = None
         if score_data:
-            note_data = score_data.note_datas.get(score_data.active_instrument, None)
-            if note_data:
-                m0, m1 = note_data.get_bounds()
+            b = score_data.get_bounds(respect_clip=False)
+            if b:
+                m0, m1 = b
         if recording and recording.audio_data:
             user_audio_bounds = recording.audio_bounds()
 
@@ -131,21 +133,21 @@ class Slider(QWidget):
     @staticmethod
     def _derive_clip_window(score_data) -> tuple[float, float] | None:
         """The clip's [b0, b1] time window (derived from the score's note indices),
-        or None when unclipped. Single source of truth: ScoreData.clip_bounds()."""
-        if score_data is None:
+        or None when unclipped. Single source of truth:
+        ScoreData.get_bounds(respect_clip=True)."""
+        if score_data is None or not score_data.is_clipped():
             return None
-        return score_data.clip_bounds()
+        return score_data.get_bounds(respect_clip=True)
 
     @staticmethod
     def _user_first_note_start(recording) -> float | None:
-        """Start time of the recording's first voiced note (the same note resize()
+        """Start time of the recording's first voiced note (the same note resize
         aligns the score to), or None if there isn't one yet (no recording / no
-        notes detected). `Recording._get_first_note` returns 0 (an int, not a
-        Note) when nothing is voiced — guard on that."""
+        notes detected)."""
         if recording is None:
             return None
-        note = recording._get_first_note(voiced=True)
-        return note.start_time if hasattr(note, "start_time") else None
+        bounds = recording.note_data.get_bounds(clean=True)
+        return bounds[0] if bounds is not None else None
 
     def _update_range(self, start_time: float, end_time: float):
         """update the slider range to have [sec] amount of space"""

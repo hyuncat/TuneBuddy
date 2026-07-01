@@ -268,7 +268,12 @@ class PitchSmoother:
                 midi[t] = self.bin_midis[s]
         return times, midi, voiced
 
-    def smooth(self, pitches: list[Pitch]) -> list[Pitch]:
+    def smooth(
+        self,
+        pitches: list[Pitch],
+        show_progress: bool = False,
+        verbose: bool = True,
+    ) -> list[Pitch]:
         """Decode the track and return a new list of `Pitch` objects.
 
         Each voiced frame keeps a single candidate (the decoded midi at 10-cent
@@ -276,13 +281,23 @@ class PitchSmoother:
         frame has no candidates and unvoiced_prob 1.0. Frame time, volume and
         distance are copied from the corresponding input pitch.
         """
-        print("Starting pitch smoothing... ", end="", flush=True)
+        if verbose:
+            print("Starting pitch smoothing... ", end="", flush=True)
         start = time.time()
 
         states = self.decode(pitches)
         out: list[Pitch] = []
+        frame_states = zip(pitches, states)
+        if show_progress:
+            frame_states = tqdm(
+                frame_states,
+                total=len(pitches),
+                desc="Converting smoothed pitches",
+                leave=False,
+                mininterval=0.25,
+            )
 
-        for p, s in tqdm(zip(pitches, states), total=len(pitches)):
+        for p, s in frame_states:
             is_voiced = s < self.n_bins
             if p is None:
                 # keep the time grid intact even if the frame was empty
@@ -306,7 +321,8 @@ class PitchSmoother:
                 config=p.config,
             ))
         
-        print(f"Done! Took {time.time() - start:.2f} sec.")
+        if verbose:
+            print(f"Done! Took {time.time() - start:.2f} sec.")
         return out
 
     # convenience: operate directly on a PitchData container

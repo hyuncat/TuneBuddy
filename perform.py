@@ -372,35 +372,23 @@ class PerformTab(QWidget):
         print("analyzing... ")
         rec.reset_analysis()  # clear stale notes/alignment/mistakes before recomputing
 
-        # Detect notes at the best ND frame size, stretch the score to match the
-        # take, then build the final alignment against those resized score notes.
-        # Alignment stores score Note objects directly; if we align before the
-        # resize, overlays keep pointing at the old note timings.
-        # Flag pitch-transition (slide) frames up front so the PELT detector can
-        # exclude them — otherwise a slide's ramping pitch reads as a phantom
-        # mid-slide note. detect_transitions only reads the pitch track, so it's
-        # safe (and now required) to run before note detection.
         rec.detect_transitions()
-        rec.note_detector.find_best_w2()
+        # resize to the stable pitch span => fills in config.min_note_length (a good-enough guess)
+        rec.resize_score(to_span="pitch", include_transitions=False)
         rec.detect_notes()
-        # re-median note pitches over non-transition frames, then drop any note
-        # that is still almost entirely slide frames
         rec.recompute_note_pitches()
         rec.prune_transition_notes()
 
-        # resize the score to the take's voiced NOTE span (first->last voiced
-        # user note). resize() stretches the score's note span — first note start
-        # to last note end — not the MIDI's total length, so trailing slack past
-        # the last note doesn't leave the notes short and drifting 'late'.
-        length = rec.get_length(raw=False)
-        rec.resize(new_length=length)
+        # resize the score to the take's voiced NOTE span in case
+        # some voiced noise got through cracks
+        rec.resize_score(to_span="note")
 
         rec.detect_mistakes()
         rec.mistake_checker.mistake_correction_loop()
         rec.reindex_mistakes()
         rec.update_alignment_distances() # color the user pitches by the final alignment
-        rec.detect_timing_mistakes()     # derive early/late/short/long from the final alignment
-        rec.truncate_end()
+        rec.mistake_detector.detect_timing_mistakes()  # derive early/late/short/long from the final alignment
+        rec.trim_end()
 
         # reload every view with the fresh analysis (note/alignment may have been
         # overwritten by the correction loop)
@@ -408,11 +396,12 @@ class PerformTab(QWidget):
         self.guitar_hero.load_user(rec)
         self.guitar_hero.update_view_items()
         self.slider.update_range(score_data=self.score_data, recording=rec)
-        # a clip-resize re-anchors the clip (and the take) at t=0 — line the view up
-        # at the clip start and redraw the dim bands at the new absolute positions.
-        b = self.score_data.clip_bounds()
-        if b is not None:
-            self.slider.set_time(b[0])
+        # Resize anchored the score onto the take (which never moves). Land the
+        # view on the aligned start — the clip start when clipped, else the take's
+        # first note — and redraw the dim bands at the new positions.
+        start_bounds = self.score_data.get_bounds()
+        if start_bounds is not None:
+            self.slider.set_time(start_bounds[0])
         self.guitar_hero.update_clip_overlay()
         self._refresh_mistake_widget(rec)
         JsonHandler(rec).save_cache()
@@ -423,21 +412,21 @@ class PerformTab(QWidget):
 
     def reanalyze_if_analyzed(self):
         """Re-run Analyze only if the take has already been analyzed (used after a
-        pitch-tolerance change, which affects the string-edit step)."""
+        pitch-tolerance change, which affects the pitch-mistake step)."""
         if self._has_analysis(warn=False):
             self.analyze()
 
     # --- MISTAKE LIST <-> GUITAR HERO ---
     def _refresh_mistake_widget(self, rec: Recording):
-        """Push both mistake lists into the panel: the string-edit PITCH mistakes
+        """Push both mistake lists into the panel: the detected PITCH mistakes
         and the derived TIMING mistakes (early/late/short/long). The dropdown
         picks which is shown. Timing mistakes are computed as a step of analyze();
         backfill them here only for an already-analyzed take loaded from cache
         (its alignment is restored but the derived list isn't persisted)."""
-        if rec.has_analysis() and not rec.timing_mistakes:
-            rec.detect_timing_mistakes()
-        self.mistake_widget.load_mistakes(rec.alignment.mistakes)
-        self.mistake_widget.load_timing_mistakes(rec.timing_mistakes)
+        if rec.has_analysis() and not rec.alignment.timing_mistakes:
+            rec.mistake_detector.detect_timing_mistakes()
+        self.mistake_widget.load_mistakes(rec.alignment.pitch_mistakes)
+        self.mistake_widget.load_timing_mistakes(rec.alignment.timing_mistakes)
 
     def refresh_mistake_widget(self, rec: Recording | None = None):
         """Public wrapper used by app-level controls that update derived mistakes
@@ -455,7 +444,7 @@ class PerformTab(QWidget):
         """
         if self.recording is None:
             return
-        # index the in-view list: timing rows aren't part of alignment.mistakes
+        # index the in-view list: timing rows aren't part of alignment.pitch_mistakes
         mistakes = self.mistake_widget.mistakes_in_view()
         if 0 <= idx < len(mistakes):
             self.guitar_hero.highlight_mistake(mistakes[idx])
@@ -463,20 +452,21 @@ class PerformTab(QWidget):
     def on_mistake_override_toggled(self, idx: int):
         if self.recording is None:
             return
-        # idx indexes the in-view list. Timing mistakes aren't part of the
+        # idx indexes the in-view list. Timing mistakes aren't part of the pitch
         # alignment (no pitch recolor / pair bookkeeping); just flip their flag
         # and grey the row. Pitch mistakes go through the recording's override
         # machinery (persisted indices + pitch recoloring).
         if self.mistake_widget.is_timing_mode():
-            mistakes = self.recording.timing_mistakes
+            mistakes = self.recording.alignment.timing_mistakes
             if not (0 <= idx < len(mistakes)):
                 return
             mistakes[idx].toggle_override()
             self.mistake_widget.refresh_override(idx)
             self.guitar_hero.update_highlight_override(mistakes[idx].is_overridden())
+            JsonHandler(self.recording).save_cache()
             return
         self.recording.toggle_mistake_override(idx)
-        mistake = self.recording.alignment.mistakes[idx]
+        mistake = self.recording.alignment.pitch_mistakes[idx]
         self.mistake_widget.refresh_override(idx)
         self.guitar_hero.update_highlight_override(mistake.is_overridden())
         self.guitar_hero.update_view_items()
@@ -493,8 +483,8 @@ class PerformTab(QWidget):
         bpm_og = self.score_data.bpm_og or self.score_data.bpm
         if not bpm_og:
             return t
-        # undo the transpose offset (a clip-resize shifts the notes so the clip
-        # starts at t=0) THEN the tempo change -> original-tempo app time, the
+        # undo the transpose offset (resize_score shifts the selected score span
+        # to start at t=0) THEN the tempo change -> original-tempo app time, the
         # frame measure_onsets_og / the barline map are anchored in.
         og_t = (t - self.score_data.transpose_offset) * self.score_data.bpm / bpm_og
         return self._time_map.to_viewer(og_t)
@@ -568,12 +558,12 @@ class PerformTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
+        if self.recording is not None:
+            self.recording.sync_min_note_length_from_score()
         self.score_viewer.clear_clip_selection()
         self.slider.update_range(score_data=self.score_data, recording=self.recording)
-        if seek:
-            b = self.score_data.clip_bounds()
-            if b is not None:
-                self.slider.set_time(b[0])  # jump the cursor to the clip start
+        if seek and self.score_data.is_clipped():
+            self.slider.set_time(self.score_data.get_bounds()[0])  # jump the cursor to the clip start
         self._refresh_clip_focus()
         self.move_views(self.slider.get_time())
         if self.recording is not None:
@@ -587,6 +577,8 @@ class PerformTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
+        if self.recording is not None:
+            self.recording.sync_min_note_length_from_score()
         self._refresh_clip_focus()
         self.guitar_hero.update_view_items()
         if self.recording is not None:

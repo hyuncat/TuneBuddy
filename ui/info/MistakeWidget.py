@@ -158,7 +158,7 @@ class MistakeWidget(QWidget):
     a "Mistakes:" Pitch / Timing dropdown that swaps which kind is shown (both
     share this one tree). Row indices always refer to the list currently *in
     view* — read it back with mistakes_in_view() rather than indexing
-    alignment.mistakes.
+    alignment.pitch_mistakes.
 
     PITCH mode columns:  Index | Time | Type | Intended | Actual | Override
       Type is an icon: plus (insertion), minus (deletion), flat/sharp
@@ -168,7 +168,7 @@ class MistakeWidget(QWidget):
       Type is a TEXT label ("Too long" / "Too short" / "Early" / "Late"). Amount
       is a signed-seconds deviation (onset offset for early/late, duration
       difference for too long/short). Timing mistakes are derived post-alignment
-      (Recording.detect_timing_mistakes).
+      (MistakeDetector.detect_timing_mistakes).
 
     Both modes share an Override column: a trash-can to dismiss a flagged mistake,
     an undo arrow to undo. The Type/Override icon cells are rendered via item
@@ -319,13 +319,13 @@ class MistakeWidget(QWidget):
 
     def mistakes_in_view(self) -> list[Mistake]:
         """The list the tree is currently showing — what a `selected` index maps
-        to. Use this rather than indexing alignment.mistakes, since Timing-mode
+        to. Use this rather than indexing alignment.pitch_mistakes, since Timing-mode
         rows aren't part of that list."""
         return self._mistakes
 
     def is_timing_mode(self) -> bool:
         """True when the Timing list is shown (so the host overrides the right
-        list: timing mistakes vs. alignment.mistakes)."""
+        list: timing mistakes vs. alignment.pitch_mistakes)."""
         return self._timing_mode
 
     def _populate(self, mistakes: list[Mistake]):

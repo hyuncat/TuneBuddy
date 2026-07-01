@@ -493,9 +493,13 @@ class Attune(QMainWindow):
             return False
 
     def _reset_transport_position(self):
-        """Start a freshly loaded score from its own beginning, not the previous score's playhead."""
+        """Start a freshly loaded score from its own beginning, not the previous
+        score's playhead. Analyze anchors the score onto the take (which stays
+        put), so the beginning is the score's first-note time — not a hard 0."""
         self.wall_clock.stop()
-        self.slider.set_time(0.0)
+        sd = self._active_score_data()
+        bounds = sd.get_bounds() if sd is not None else None
+        self.slider.set_time(bounds[0] if bounds is not None else 0.0)
         self.update_time_label(self.slider.get_time())
         self._active_tab().render_at(self.slider.get_time())
 
@@ -562,7 +566,7 @@ class Attune(QMainWindow):
             return False
 
         default_name = self._safe_filename(default_name or "recording")
-        rec.truncate_end()
+        rec.trim_end()
         writable_suffixes = {".wav", ".wave", ".flac", ".ogg", ".aif", ".aiff"}
         current_suffix = rec.audio_filepath.suffix.lower() if rec.audio_filepath else ""
         can_overwrite_audio = current_suffix in writable_suffixes
@@ -1010,7 +1014,7 @@ class Attune(QMainWindow):
             rec.config.timing_tolerance = tolerance
             rec.update_config(rec.config)
             if rec.has_analysis():
-                rec.detect_timing_mistakes()
+                rec.mistake_detector.detect_timing_mistakes()
                 self.perform_tab.refresh_mistake_widget(rec)
             self._save_recording_cache(rec, recording_name=self.active_recording_name)
             return
@@ -1041,6 +1045,8 @@ class Attune(QMainWindow):
             self._save_recording_cache(self.active_recording, recording_name=self.active_recording_name)
         else:
             sd.change_tempo(new_bpm)
+            if self._practice_active():
+                self.practice_tab.recording.sync_min_note_length_from_score()
         self._active_tab().guitar_hero.update_view_items()
         self.sync_slider() # re-range the shared slider for the active tab
 

@@ -2,7 +2,10 @@ at-venv*/
 .DS_Store
 *__pycache__/
 *.pyc
-resources/benchmark*/
+benchmarks/datasets/*
+!benchmarks/datasets/.gitkeep
+benchmarks/results/*
+!benchmarks/results/.gitkeep
 CLAUDE.md
 AGENTS.md
 .claude/

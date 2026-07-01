@@ -1,7 +1,6 @@
 import numpy as np
 import threading
 import soundfile as sf
-from pydub import AudioSegment
 
 from algorithms.Config import Config
 
@@ -40,6 +39,8 @@ class AudioData:
             audio_filepath (str): A correct file path pointing to audio data to load
         """
         if audio_filepath.lower().endswith(".m4a"):
+            from pydub import AudioSegment
+
             seg = AudioSegment.from_file(audio_filepath, format="m4a")
             sr = seg.frame_rate
             samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
@@ -67,7 +68,7 @@ class AudioData:
         """Return the app-time bounds of the recorded/loaded buffer."""
         return (self.t_origin, self.get_end_time())
 
-    def truncate_end(self, end_time: float) -> bool:
+    def trim_end(self, end_time: float) -> bool:
         """Move the logical end of the buffer to app-time `end_time`.
 
         The underlying array can keep its capacity for future writes; readers and

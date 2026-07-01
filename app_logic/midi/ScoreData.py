@@ -1,5 +1,7 @@
 from pathlib import Path
 from music21 import converter, tempo, meter
+from music21 import stream as m21stream, note as m21note, chord as m21chord
+from music21 import duration as m21duration, instrument as m21instrument
 from music21 import interval as m21interval, pitch as m21pitch
 import bisect
 import tempfile
@@ -13,7 +15,7 @@ class ScoreData:
         # for their respective midiplayer / verovio uses
         self.midi_data: MidiData = None
         self.score = None # the music21 score object
-        # note data for string editing and GuitarHero visualization
+        # note data for mistake detection and GuitarHero visualization
         self.note_datas: dict[int, NoteData] = {}
 
         # --- META ---
@@ -37,7 +39,7 @@ class ScoreData:
         # order) and are tab-independent (both tabs parse the same file), so the
         # same clip is shared globally and never goes stale. None = no clip.
         # Everything else (the [b0, b1] time window, the clipped notes) is DERIVED
-        # from this via clip_bounds() / clipped_note_data(). See those + is_clipped.
+        # from this via get_bounds() / clipped_note_data(). See those + is_clipped.
         self.clip: tuple[int, int] | None = None
 
         # cumulative transpose applied to the score, in half steps (signed). Reset
@@ -143,20 +145,30 @@ class ScoreData:
         t1 = onsets[m1 + 1] if (m1 + 1) < n else float("inf")
         return self.note_index_range(t0, t1, channel)
 
-    def clip_bounds(self, channel: int | None = None) -> tuple[float, float] | None:
-        """The clip's [start, end] time window in CURRENT app-time, DERIVED from
-        the live note positions (so it auto-tracks tempo/resize). None = no clip.
-        Used by the slider window, GuitarHero dimming, and the Verovio grey-out."""
-        if self.clip is None:
-            return None
+    def get_bounds(
+        self,
+        channel: int | None = None,
+        respect_clip: bool = True,
+        use_note_end: bool = True,
+    ) -> tuple[float, float] | None:
+        """Current score note bounds.
+
+        With respect_clip=True, return the clipped note window when a clip is
+        active; otherwise return the full active-instrument note bounds. No clip
+        is not an error and does not return None. None only means there are no
+        notes for the requested channel. With use_note_end=False, return first
+        note start -> last note start for onset-based tempo fitting.
+        """
         channel = self.active_instrument if channel is None else channel
-        nd = self.note_datas.get(channel)
-        if not nd or not nd.times:
+        try:
+            nd = (
+                self.clipped_note_data(channel=channel)
+                if respect_clip
+                else self.note_datas[channel]
+            )
+        except KeyError:
             return None
-        i0, i1 = self.clip
-        if not (0 <= i0 <= i1 < len(nd.times)):
-            return None
-        return (nd.read_note(i=i0).start_time, nd.read_note(i=i1).end_time)
+        return nd.get_bounds(clean=False, use_note_end=use_note_end)
 
     def clip_measure_range(self, channel: int | None = None
                            ) -> tuple[int, int] | None:
@@ -182,7 +194,7 @@ class ScoreData:
 
     def clipped_note_data(self, channel: int | None = None) -> NoteData:
         """The active instrument's notes WITHIN the clip (exactly indices i0..i1),
-        or the full NoteData when unclipped. This is what the StringEditor /
+        or the full NoteData when unclipped. This is what the MistakeDetector /
         MistakeChecker / alignment consume so they only ever see the clip."""
         channel = self.active_instrument if channel is None else channel
         nd = self.note_datas[channel]
@@ -223,6 +235,8 @@ class ScoreData:
         elif ext in {'.mid', '.midi'}: 
             self.midi_data = MidiData(p)
 
+        normalized_channels = self.midi_data.normalize_duplicate_program_channels()
+
         self.length = self.midi_data.length_og
         self.bpm = self.score.metronomeMarkBoundaries()[0][2].number if self.score.metronomeMarkBoundaries() else 120
         # remember the tempo Verovio renders the score at, so later tempo changes
@@ -243,12 +257,14 @@ class ScoreData:
         # init stuff from midi
         self.note_datas = self.midi_data.make_notedatas()
         self.instruments = self.midi_data.instruments
+        # take the channel MidiData actually assigned (None if no free channel)
+        self.metronome_channel = self.midi_data.metronome_channel
+        if normalized_channels:
+            self.score = self._score_from_notedatas()
 
         # reset other shit
         self.displayed_instruments = set(self.instruments.keys())
         self.playing_instruments = set(self.instruments.keys())
-        # take the channel MidiData actually assigned (None if no free channel)
-        self.metronome_channel = self.midi_data.metronome_channel
         self.active_instrument = self.get_default_instrument()
 
     def measure_onsets_og(self, channel: int | None = None) -> list[float]:
@@ -327,7 +343,7 @@ class ScoreData:
 
         # fast path: full score still at the original tempo -> export the score
         # directly (cheapest, no deep copy), then clean the credits/title below.
-        if part is None and round(self.bpm) == round(self.bpm_og):
+        if part is None and abs(float(self.bpm) - float(self.bpm_og)) < 1e-9:
             return self._strip_engraving_credits(self._write_musicxml(self.score))
 
         # otherwise build an isolated copy (single part or full) so we never
@@ -359,21 +375,23 @@ class ScoreData:
             return written_path.read_bytes()
 
     # --- TEMPO STUFF ---
-    def change_tempo(self, new_bpm: int, _factor: float=None):
+    def change_tempo(self, new_bpm: float, _factor: float=None):
         """Change the tempo of the score to new_bpm. Changes tempo in
             1. midi data (for playback)
             2. music21 score (for exporting and viewing)
             3. notedata (for editing and visualization)
+        new_bpm may be FRACTIONAL (resize_score fits an exact tempo to the take's
+        measured span; the toolbar rounds it only for display). The midi/notedata
+        timings scale by the float `factor`, so timing stays exact.
         If _factor is supplied, uses that instead of calculating from new_bpm and self.bpm"""
-        factor = _factor if _factor else self.bpm_og / new_bpm
+        factor = _factor if _factor is not None else self.bpm_og / new_bpm
         if new_bpm == self.bpm or self.score is None:
             return # no change needed
         
         # 1. change tempo in midi data (rebuilds messages from the original score)
         self.midi_data.change_tempo(factor)
         # 2. change tempo in music21 score
-        for mark in self.score.recurse().getElementsByClass(tempo.MetronomeMark):
-            mark.number = round(mark.number * factor)
+        self._pin_tempo(self.score, float(new_bpm))
         # 3. update metadata
         self.bpm = new_bpm
         self.length = self.midi_data.length_og * factor
@@ -389,6 +407,79 @@ class ScoreData:
         # 5. remake notedatas (now reflects the refreshed metronome track)
         self.note_datas = self.midi_data.make_notedatas()
         print(f"Tempo changed to {new_bpm} BPM (factor: {factor:.2f}). Score length is now {self.length:.2f} sec.")
+
+    def _score_from_notedatas(self):
+        """Build a compact music21 score from the current logical instruments.
+
+        Used after duplicate same-program MIDI channels are collapsed. The
+        original parsed score still has one part per raw MIDI channel, which
+        would make the single normalized channel render as only the first source
+        fragment. Rebuilding from NoteData makes the sheet view match the merged
+        logical channel used by GuitarHero, playback filtering, and analysis.
+        """
+        score = m21stream.Score()
+        if self.score is not None and self.score.metadata is not None:
+            import copy
+            score.insert(0, copy.deepcopy(self.score.metadata))
+        self._pin_tempo(score, self.bpm_og)
+
+        ts = self._first_time_signature()
+        sec_to_ql = (self.bpm_og or self.bpm or 120) / 60.0
+        quantum = 1 / 48
+
+        def quantize(value: float) -> float:
+            return round(value / quantum) * quantum
+
+        for channel, program in self.instruments.items():
+            if channel == self.metronome_channel:
+                continue
+            nd = self.note_datas.get(channel)
+            if nd is None or not nd.times:
+                continue
+            part = m21stream.Part()
+            part.id = f"channel-{channel}"
+            part.partName = self._program_name(program)
+            part.insert(0, self._instrument_for_program(program))
+            part.insert(0, meter.TimeSignature(ts.ratioString))
+            for n in nd.read(i=0, j=len(nd.times)):
+                midis = [int(round(m)) for m in n.midi_num if m != -1]
+                if not midis:
+                    element = m21note.Rest()
+                elif len(midis) == 1:
+                    element = m21note.Note(midis[0])
+                else:
+                    element = m21chord.Chord(midis)
+                element.duration = m21duration.Duration(
+                    max(quantum, quantize((n.end_time - n.start_time) * sec_to_ql))
+                )
+                part.insert(max(0.0, quantize(n.start_time * sec_to_ql)), element)
+            part.makeMeasures(inPlace=True)
+            score.insert(0, part)
+        return score
+
+    def _first_time_signature(self):
+        if self.score is not None:
+            signatures = list(self.score.recurse().getElementsByClass(meter.TimeSignature))
+            if signatures:
+                return signatures[0]
+        return meter.TimeSignature("4/4")
+
+    @staticmethod
+    def _program_name(program: int) -> str:
+        try:
+            from resources.program_map import program_to_name
+            return program_to_name(program)
+        except Exception:
+            return f"Program {program}"
+
+    @staticmethod
+    def _instrument_for_program(program: int):
+        try:
+            return m21instrument.instrumentFromMidiProgram(program)
+        except Exception:
+            inst = m21instrument.Instrument()
+            inst.partName = ScoreData._program_name(program)
+            return inst
 
     def _rebuild_beats(self):
         """Recompute the live beat grid (`beats`) from the original baseline
@@ -419,7 +510,7 @@ class ScoreData:
         # length/tempo: a longer target => a slower (lower) bpm. Let change_tempo
         # recompute the factor from new_bpm so bpm and length stay consistent.
         factor = new_length / self.midi_data.length_og
-        new_bpm = round(self.bpm_og / factor)
+        new_bpm = self.bpm_og / factor
         self.change_tempo(new_bpm)
 
     def get_bpm(self) -> float:

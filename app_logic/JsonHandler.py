@@ -366,8 +366,8 @@ class JsonHandler:
             sd.transpose(transpose_semitones)
 
         bpm = self._unpack_number(payload.get("bpm"), default=sd.bpm)
-        if bpm and round(bpm) != round(sd.bpm):
-            sd.change_tempo(int(round(bpm)))
+        if bpm and abs(float(bpm) - float(sd.bpm)) > 1e-9:
+            sd.change_tempo(float(bpm))
 
         offset = self._unpack_number(payload.get("transpose_offset"), default=0.0)
         if offset:
@@ -400,7 +400,7 @@ class JsonHandler:
             recording.score_data.clip is not None
             or recording.score_data.transpose_semitones != 0
             or abs(recording.score_data.transpose_offset) > 1e-9
-            or round(recording.score_data.bpm) != round(recording.score_data.bpm_og)
+            or abs(recording.score_data.bpm - recording.score_data.bpm_og) > 1e-9
         )
 
     @staticmethod
@@ -436,15 +436,18 @@ class JsonHandler:
             if k not in valid:
                 continue
             value = self._unpack_number(payload[k])
-            if isinstance(getattr(defaults, k), int):
+            default_value = getattr(defaults, k)
+            if isinstance(default_value, bool):
+                value = bool(value)
+            elif isinstance(default_value, int):
                 value = int(round(value))
             kwargs[k] = value
-        config = Config(**kwargs)
-        if "h2" not in payload:
-            config.h2 = config.w2 - 2
-        if "slope_thresh" not in payload:
-            config.slope_thresh = 0.75 / config.w2
-        return config
+        if kwargs.get("note_detection_pelt_jump") == 5:
+            # jump=5 was a transient app-side regression: it quantizes PELT
+            # boundaries enough to create short transition notes in existing
+            # sidecars. This is not a user-facing setting, so migrate it back.
+            kwargs["note_detection_pelt_jump"] = defaults.note_detection_pelt_jump
+        return Config(**kwargs)
 
     def _pitch_data_to_payload(self, recording: Recording) -> dict:
         last = -1
@@ -551,15 +554,13 @@ class JsonHandler:
 
         return {
             "pairs": [[uidx(u), sidx(s)] for u, s in recording.alignment.pairs],
-            "mistakes": [
-                [
-                    m.type,
-                    uidx(m.user_note),
-                    sidx(m.midi_note),
-                    int(m.get_pair_index()) if m.get_pair_index() is not None else None,
-                    bool(m.is_overridden()),
-                ]
-                for m in recording.alignment.mistakes
+            "pitch_mistakes": [
+                self._mistake_to_payload(m, uidx, sidx)
+                for m in recording.alignment.pitch_mistakes
+            ],
+            "timing_mistakes": [
+                self._mistake_to_payload(m, uidx, sidx)
+                for m in recording.alignment.timing_mistakes
             ],
         }
 
@@ -577,10 +578,9 @@ class JsonHandler:
             (note_at(user_notes, uidx), note_at(score_notes, sidx))
             for uidx, sidx in payload.get("pairs", [])
         ]
-        mistakes = []
-        for item in payload.get("mistakes", []):
+        def mistake_from_payload(item):
             if len(item) < 5:
-                continue
+                return None
             mistake = Mistake(
                 type=item[0],
                 user_note=note_at(user_notes, item[1]),
@@ -589,11 +589,40 @@ class JsonHandler:
             if item[3] is not None:
                 mistake.set_pair_index(int(item[3]))
             mistake.set_override(bool(item[4]))
-            mistakes.append(mistake)
+            if len(item) > 5:
+                mistake.info = str(item[5] or "")
+            return mistake
+
+        pitch_payload = payload.get("pitch_mistakes", payload.get("mistakes", []))
+        pitch_mistakes = [
+            mistake
+            for item in pitch_payload
+            if (mistake := mistake_from_payload(item)) is not None
+        ]
+        timing_mistakes = [
+            mistake
+            for item in payload.get("timing_mistakes", [])
+            if (mistake := mistake_from_payload(item)) is not None
+        ]
 
         alignment = Alignment(config=recording.config)
-        alignment.load_alignment(pairs, mistakes)
+        alignment.load_alignment(
+            pairs,
+            pitch_mistakes=pitch_mistakes,
+            timing_mistakes=timing_mistakes,
+        )
         return alignment
+
+    @staticmethod
+    def _mistake_to_payload(mistake: Mistake, user_index, score_index) -> list:
+        return [
+            mistake.type,
+            user_index(mistake.user_note),
+            score_index(mistake.midi_note),
+            int(mistake.get_pair_index()) if mistake.get_pair_index() is not None else None,
+            bool(mistake.is_overridden()),
+            mistake.info,
+        ]
 
     @staticmethod
     def _note_index_maps(notes: list[Note]) -> dict:
@@ -615,6 +644,8 @@ class JsonHandler:
     def _pack_number(value):
         if value is None:
             return None
+        if isinstance(value, bool):
+            return value
         value = float(value)
         if math.isinf(value):
             return "inf" if value > 0 else "-inf"

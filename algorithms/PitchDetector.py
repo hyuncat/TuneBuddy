@@ -144,6 +144,14 @@ class PitchDetector(QObject):
         # preprocess audio to center and get rid of low frequency noise
         x, volume = self.preprocess_audio(x)
 
+        # constant/silent frame (volume 0): no periodicity to find -> unvoiced.
+        # Guards the downstream divides (normalize, CMNDF range) that would
+        # otherwise emit NaN pitch candidates and crash the smoother's HMM.
+        if volume == 0 or not np.any(x):
+            return Pitch(time=start_time, candidates=[],
+                         volume=0.0, unvoiced_prob=1.0,
+                         distance=None, config=self.config)
+
         # compute autocorrelation and modify it to avoid 0-lag peak
         acf, _ = self.autocorrelation_fft(x)
         cdf = self.cmndf(x, acf)
@@ -169,7 +177,12 @@ class PitchDetector(QObject):
         return pitch
 
 
-    def detect_pitches(self, x: np.ndarray) -> list[Pitch]:
+    def detect_pitches(
+        self,
+        x: np.ndarray,
+        show_progress: bool = True,
+        progress_desc: str = "Detecting pitches",
+    ) -> list[Pitch]:
         """
         Computes multi-frame pitch detection on an arbitrary length array of audio data.
         Returns a nested list of pitches, each corresponding to the freq estimates (probabilistic)
@@ -180,8 +193,17 @@ class PitchDetector(QObject):
         n_frames = 1 + (len(x) - self.FRAME_SIZE) // self.HOP_SIZE 
 
         pitches = []
+        frames_iter = enumerate(frames)
+        if show_progress:
+            frames_iter = tqdm(
+                frames_iter,
+                total=n_frames,
+                desc=progress_desc,
+                leave=False,
+                mininterval=0.25,
+            )
 
-        for i, frame in tqdm(enumerate(frames), total=n_frames):
+        for i, frame in frames_iter:
 
             start_time = (i*self.HOP_SIZE)/self.SR # elapsed time of the frame
             pitch = self.detect_pitch(frame, start_time)
@@ -521,7 +543,10 @@ class PitchDetector(QObject):
         # x = x.astype(float)
         x = x - np.mean(x) # center
         volume = np.sqrt(np.mean(x ** 2))  # get volume as mean |amplitude| of the x (before normalizing)
-        x = x/np.max(np.abs(x)) # normalize
+        peak = np.max(np.abs(x))
+        if peak == 0:  # constant/silent frame (digital silence, DC) -> no pitch
+            return np.zeros_like(x), 0.0
+        x = x/peak # normalize
         x = self.bandpass_filter(x, fmin=self.config.fmin*0.8, fmax=self.config.fmax*1.2) # get rid of noise outside of pitch range
         # x = self.high_pass_iir_filter(x, iir_cutoff_freq)
         return x, volume

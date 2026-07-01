@@ -9,7 +9,7 @@ from app_logic.Alignment import Alignment, Mistake
 class MistakeChecker:
     """Post-processes a recording's alignment to fix mistakes caused by
     *incomplete note detection* — e.g. two played notes detected as one, which
-    string editing then reports as a deletion. Splits the merged note back into
+    pitch-mistake detection then reports as a deletion. Splits the merged note back into
     two and re-aligns. Returns brand new NoteData / Alignment (never mutates the
     recording's own data)."""
 
@@ -18,12 +18,10 @@ class MistakeChecker:
         self.config = recording.config if recording else config
         self.pd = self.nd = self.alignment = None
         self.verbose = verbose  # print step-by-step edit diagnostics
-        self.MIN_CLOSE = self.config.min_close  # min # of close pitch frames to consider a split viable
 
     def update_config(self, config: Config):
         """update the config and all relevant parameters"""
         self.config = config
-        self.MIN_CLOSE = self.config.min_close
 
     def check_mistakes(self, recording: Recording=None) -> tuple[NoteData, Alignment]:
         """Walk the mistakes, gather note edits, apply them, and re-align.
@@ -38,7 +36,7 @@ class MistakeChecker:
         alignment = self.recording.alignment
         while True:
             new_nd, new_alignment, n_edits = self._check_mistakes_once(note_data, alignment)
-            if n_edits == 0 or len(new_alignment.mistakes) >= len(alignment.mistakes):
+            if n_edits == 0 or len(new_alignment.pitch_mistakes) >= len(alignment.pitch_mistakes):
                 return note_data, alignment
             note_data, alignment = new_nd, new_alignment
 
@@ -48,7 +46,7 @@ class MistakeChecker:
         self.alignment = alignment
 
         mistakes = sorted(
-            alignment.mistakes,
+            alignment.pitch_mistakes,
             key=lambda m: 0 if m.type == "deletion" else 1 if m.type == "insertion" else 2,
         )
         edits = []  # each edit is (notes_to_remove, notes_to_add)
@@ -100,7 +98,7 @@ class MistakeChecker:
         if not rec or not rec.alignment:
             print("No active recording or alignment to correct mistakes on.")
             return
-        n_mistakes = len(rec.alignment.mistakes)
+        n_mistakes = len(rec.alignment.pitch_mistakes)
         print(f"initial mistakes: {n_mistakes}")
         while True:
             # keep the current (best-so-far) state in case this pass regresses
@@ -108,7 +106,7 @@ class MistakeChecker:
             prev_alignment = rec.alignment
 
             rec.correct_mistakes()
-            new_n_mistakes = len(rec.alignment.mistakes)
+            new_n_mistakes = len(rec.alignment.pitch_mistakes)
             print(f" > mistakes after correction: {new_n_mistakes}")
 
             if new_n_mistakes >= n_mistakes:
@@ -144,7 +142,7 @@ class MistakeChecker:
         if self.verbose:
             print(f"      [split] host@{host.start_time:.2f} -> "
                   f"halves=[{split[0].midi_num[0]:.1f}, {split[1].midi_num[0]:.1f}] "
-                  f"targets=({targets[0]:.1f}, {targets[1]:.1f}) resembles={ok} (tol={self.config.pitch_thresh})")
+                  f"targets=({targets[0]:.1f}, {targets[1]:.1f}) resembles={ok} (tol={self.config.pitch_tolerance})")
         if not ok:
             return None
         return [host], split
@@ -166,10 +164,10 @@ class MistakeChecker:
         merged = self._merge_notes(inserted, neighbor)
         self._remedian_notes([merged])
         target = self._score_pitch(neighbor)
-        if abs(merged.midi_num[0] - target) > self.config.pitch_thresh:
+        if abs(merged.midi_num[0] - target) > self.config.pitch_tolerance:
             if self.verbose:
                 print(f"      [merge-fail] merged={merged.midi_num[0]:.1f} "
-                      f"target={target:.1f} (tol={self.config.pitch_thresh})")
+                      f"target={target:.1f} (tol={self.config.pitch_tolerance})")
             return None
         return [inserted, neighbor], [merged]
 
@@ -184,14 +182,15 @@ class MistakeChecker:
         pitch, places the split boundary where the score says the two notes meet.)"""
         n_prev = self._count_close(prev_note, intended) if prev_note else 0
         n_next = self._count_close(next_note, intended) if next_note else 0
+        min_close = self._min_close_frames()
 
         if self.verbose:
             pp = f"{prev_note.midi_num[0]:.1f}@{prev_note.start_time:.2f}" if prev_note else "—"
             nn = f"{next_note.midi_num[0]:.1f}@{next_note.start_time:.2f}" if next_note else "—"
             print(f"      [split?] intended={intended.midi_num[0]:.1f} | prev({pp}) close={n_prev}"
-                  f" next({nn}) close={n_next} | need>={self.MIN_CLOSE}")
+                  f" next({nn}) close={n_next} | need>={min_close}")
 
-        if max(n_prev, n_next) < self.MIN_CLOSE:
+        if max(n_prev, n_next) < min_close:
             return None, None
 
         if n_prev >= n_next:
@@ -227,9 +226,9 @@ class MistakeChecker:
             aligned = self._is_well_aligned(neighbor)
             if self.verbose:
                 print(f"      [merge?] inserted={pitch:.1f} | {label}({neighbor.midi_num[0]:.1f}"
-                      f"@{neighbor.start_time:.2f}) dist={dist:.2f} (<={self.config.pitch_thresh}?)"
+                      f"@{neighbor.start_time:.2f}) dist={dist:.2f} (<={self.config.pitch_tolerance}?)"
                       f" well_aligned={aligned}")
-            if dist <= self.config.pitch_thresh and aligned:
+            if dist <= self.config.pitch_tolerance and aligned:
                 candidates.append((dist, neighbor))
 
         if not candidates:
@@ -246,7 +245,7 @@ class MistakeChecker:
         score_note = alignment.get_match(user_note=user_note)
         if score_note is None:
             return False
-        return abs(user_note.midi_num[0] - score_note.midi_num[0]) <= self.config.pitch_thresh
+        return abs(user_note.midi_num[0] - score_note.midi_num[0]) <= self.config.pitch_tolerance
 
     def _count_close(self, note: Note, intended: Note) -> int:
         """How many of `note`'s voiced pitch frames sit within tolerance of the
@@ -255,15 +254,21 @@ class MistakeChecker:
         pitches = self.pd.read(start_time=note.start_time, end_time=note.end_time, clean=True)
         target = intended.midi_num[0]
         return sum(1 for p in pitches
-                   if p.candidates and abs(p.candidates[0][0] - target) <= self.config.pitch_thresh)
+                   if p.candidates and abs(p.candidates[0][0] - target) <= self.config.pitch_tolerance)
+
+    def _min_close_frames(self) -> int:
+        """Minimum close pitch frames needed to treat a split as viable."""
+        return self.config.min_note_pitch_frames(
+            self.config.mistake_checker_min_note_factor
+        )
 
     def _split_resembles_score(self, split: list, targets: tuple) -> bool:
         """Accept a split only if each half resembles the score note it would
         align to. `targets` are the (host, intended) / (intended, host) pitches
         in the same order as the split halves, so each half must land within
-        tolerance of its target. (`< tol` matches StringEditor's "same note"
+        tolerance of its target. (`< tol` matches MistakeDetector's "same note"
         convention.)"""
-        tol = self.config.pitch_thresh
+        tol = self.config.pitch_tolerance
         return all(abs(note.midi_num[0] - target) <= tol
                    for note, target in zip(split, targets))
 
@@ -351,7 +356,7 @@ class MistakeChecker:
             target_support = [
                 p for p in pitches
                 if p.candidates
-                and abs(p.candidates[0][0] - target) <= self.config.pitch_thresh
+                and abs(p.candidates[0][0] - target) <= self.config.pitch_tolerance
             ]
 
         medians = self._median_pitches(target_support or pitches)
@@ -391,14 +396,14 @@ class MistakeChecker:
         return new_nd
 
     def _realign(self, note_data: NoteData) -> Alignment:
-        """Re-run string editing against the score to produce a fresh Alignment.
+        """Re-run pitch-mistake detection against the score to produce a fresh Alignment.
         Uses the CLIPPED score notes (the full NoteData when unclipped) — the same
         set detect_mistakes aligns against — so the correction loop stays within
         the clip and never merges the note after the clip into a clipped neighbor."""
         midi_notes = self.recording.score_data.clipped_note_data(
             channel=self.recording.active_instrument)
-        notes, mistakes = self.recording.string_editor.string_edit(
+        notes, mistakes = self.recording.mistake_detector.detect_pitch_mistakes(
             user_string=note_data, midi_string=midi_notes)
         alignment = Alignment(self.config)
-        alignment.load_alignment(notes, mistakes)
+        alignment.load_alignment(notes, pitch_mistakes=mistakes)
         return alignment

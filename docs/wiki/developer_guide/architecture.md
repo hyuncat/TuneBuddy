@@ -24,4 +24,4 @@ PitchDetector.py
 
 NoteDetector.py
 
-StringEditor.py
+MistakeDetector.py

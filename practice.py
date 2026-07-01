@@ -143,6 +143,7 @@ class PracticeTab(QWidget):
         (the GuitarHero/ScoreViewer both key off score_data.active_instrument)."""
         self.score_data.active_instrument = channel
         self.recording.active_instrument = channel
+        self.recording.update_config(self.recording.config)
         self.refresh_score_viewer()
         self.guitar_hero.update_view_items()
 
@@ -426,12 +427,11 @@ class PracticeTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
+        self.recording.sync_min_note_length_from_score()
         self.score_viewer.clear_clip_selection()
         self.slider.update_range(score_data=self.score_data, recording=self.recording)
-        if seek:
-            b = self.score_data.clip_bounds()
-            if b is not None:
-                self.slider.set_time(b[0])
+        if seek and self.score_data.is_clipped():
+            self.slider.set_time(self.score_data.get_bounds()[0])
         self._refresh_clip_focus()
         self._move_views(self.slider.get_time())
 
@@ -442,6 +442,7 @@ class PracticeTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
+        self.recording.sync_min_note_length_from_score()
         self._refresh_clip_focus()
         self.guitar_hero.update_view_items()
 

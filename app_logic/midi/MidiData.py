@@ -33,6 +33,7 @@ class MidiData:
         # self.length = 0 # length of the piece in seconds
         # self.bpm: int = 120 # default bullshit tempo (set to musescore default)
         self.instruments: dict[int, int] = {} # {channel: program_number}
+        self.normalized_channel_groups: list[dict] = []
 
         # metronome click track lives on its own channel; the click note_on/off
         # messages are (re)generated from the beat grid by set_metronome so they
@@ -89,6 +90,73 @@ class MidiData:
         self.instruments = instruments
         self.length_og = elapsed_time
         self.length = elapsed_time # total length of the piece in seconds
+
+    def normalize_duplicate_program_channels(self, min_channels: int = 4) -> bool:
+        """Collapse many channels with the same program into one logical channel.
+
+        Some scraped/converted solo MIDI files shard one instrument across many
+        MIDI channels even though every channel has the same program. That makes
+        the app show a long list of identical instruments and, worse, each
+        channel only contains a fragment of the part. Collapse only when the
+        duplicate group is numerous enough that it is almost certainly a channel
+        artifact rather than a small ensemble split.
+        """
+        by_program: dict[int, list[int]] = {}
+        for channel, program in self.instruments.items():
+            by_program.setdefault(program, []).append(channel)
+
+        channel_map: dict[int, int] = {}
+        normalized_groups = []
+        for program, channels in by_program.items():
+            channels = sorted(channels)
+            if len(channels) < min_channels:
+                continue
+            target = channels[0]
+            for channel in channels:
+                channel_map[channel] = target
+            normalized_groups.append({
+                "program": program,
+                "target": target,
+                "channels": channels,
+            })
+
+        if not channel_map:
+            return False
+
+        def remap_message(msg):
+            channel = getattr(msg, "channel", None)
+            if channel not in channel_map:
+                return msg
+            target = channel_map[channel]
+            if msg.type == "program_change" and channel != target:
+                return None
+            return msg.copy(channel=target)
+
+        def remap_messages(source: dict) -> dict:
+            remapped = {}
+            for t, msgs in source.items():
+                kept = []
+                for msg in msgs:
+                    new_msg = remap_message(msg)
+                    if new_msg is not None:
+                        kept.append(new_msg)
+                if kept:
+                    remapped[t] = kept
+            return remapped
+
+        self.messages_og = remap_messages(self.messages_og)
+        self.messages = remap_messages(self.messages)
+        self.programs_og = remap_messages(self.programs_og)
+        self.programs = remap_messages(self.programs)
+
+        collapsed = {}
+        for channel, program in self.instruments.items():
+            target = channel_map.get(channel, channel)
+            if target == channel:
+                collapsed[target] = program
+        self.instruments = dict(sorted(collapsed.items()))
+        self.normalized_channel_groups = normalized_groups
+        return True
     
     def make_notedatas(self) -> dict[int, NoteData]:
         """Convert the stored messages into Note objects in NoteData.
@@ -112,13 +180,13 @@ class MidiData:
 
                 # velocity>0 because sometimes midi files are weird lol
                 if msg.type=='note_on' and msg.velocity>0:
-                    note_onsets[key] = elapsed_time
+                    note_onsets.setdefault(key, []).append((elapsed_time, msg.velocity))
 
                 elif msg.type=='note_off' or (msg.type=='note_on' and msg.velocity==0):
                     if key not in note_onsets:
                         continue
                     # end the note we recorded in note_onsets and write to NoteData
-                    start_time = note_onsets[key]
+                    start_time, velocity = note_onsets[key].pop(0)
                     existing = note_lists[msg.channel].get(start_time)
                     if existing is not None:
                         # CHORD: another note already starts at this exact onset.
@@ -138,14 +206,15 @@ class MidiData:
                             start_time=start_time,
                             end_time=elapsed_time,
                             midi_num=[msg.note],
-                            velocity=msg.velocity,
+                            velocity=velocity,
                             instrument=self.instruments.get(msg.channel, None)
                         )
                         note_lists[msg.channel][start_time] = note
                         i += 1  # one id per onset -> id stays aligned with note index
 
                     # cleanup our iteration variables
-                    del note_onsets[key]
+                    if not note_onsets[key]:
+                        del note_onsets[key]
 
         note_datas = {}
         for channel, notes in note_lists.items():
