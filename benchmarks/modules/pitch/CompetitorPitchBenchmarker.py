@@ -82,7 +82,6 @@ ROOT = REPO_ROOT
 
 from benchmarks.modules.CocoChoralesBenchmarker import CocoChoralesBenchmarker  # noqa: E402
 from benchmarks.modules.pitch.PitchBenchmarker import (  # noqa: E402
-    PITCH_COMPUTE_COL,
     PITCH_REALTIME_COL,
     PathLike,
     PitchBenchmarker,
@@ -322,13 +321,7 @@ class PennTracker(PitchTracker):
 
     @staticmethod
     def _disable_mps_backend(torch: Any) -> None:
-        """Stop penn's viterbi dep (torbi) from JIT-compiling its MPS Metal backend.
-
-        torbi only attempts that compile when ``torch.backends.mps.is_available()``;
-        on an anaconda macOS env the compile fails (libc++ header search is broken)
-        AND torbi's own except handler is buggy, so the failure crashes the import
-        rather than skipping. We never use Metal here (everything runs cuda-or-cpu),
-        so report MPS unavailable before penn -> torbi is imported. No-op elsewhere.
+        """Stop penn's viterbi dep (torbi) from JIT-compiling its MPS Metal backend
         """
         try:
             torch.backends.mps.is_available = lambda: False
@@ -439,7 +432,6 @@ class PraatTracker(PitchTracker):
 # so the model is auto-found without --rmvpe-checkpoint/--rmvpe-module or PYTHONPATH.
 _VENDORED_RMVPE_DIR = ROOT / "benchmarks" / "datasets" / "rmvpe"
 
-
 class RmvpeTracker(PitchTracker):
     """RMVPE has no canonical pip package -- it's vendored across RVC forks.
 
@@ -543,7 +535,6 @@ ALL_MODELS: list[str] = [
 # because they are heavy optional PyTorch competitors.
 DEFAULT_MODELS: list[str] = [m for m in ALL_MODELS if m not in {"torchcrepe", "penn"}]
 
-
 def make_tracker(model: str, **opts: Any) -> PitchTracker | None:
     """Build a tracker for ``model`` (or ``None`` for the pYIN baselines)."""
     if model in PYIN_MODELS:
@@ -565,7 +556,7 @@ def make_tracker(model: str, **opts: Any) -> PitchTracker | None:
 
 
 # --------------------------------------------------------------------------- #
-#  Benchmarker bindings: swap the detector, keep each dataset's loader/scoring #
+#  benchmarker bindings: swap detector, keep each dataset's loader/scoring    #
 # --------------------------------------------------------------------------- #
 class _CompetitorEvalMixin:
     """Override ``bench_pitch_track`` to score a tracker (or a pYIN baseline).
@@ -603,9 +594,9 @@ class _CompetitorEvalMixin:
         fmax: float = 3000.0,
     ) -> PitchMetricRow:
         if self.model_name in PYIN_MODELS:
-            from_cache = bool(
-                PYIN_MODELS[self.model_name]
-                and self.cache_path_for_wav(wav_path).exists()  # type: ignore[attr-defined]
+            from_cache = self.has_pitch_cache(  # type: ignore[attr-defined]
+                self.cache_path_for_wav(wav_path),  # type: ignore[attr-defined]
+                smooth=PYIN_MODELS[self.model_name],
             )
             # Reuse the EXISTING Attune pipeline unchanged: stage-1 only vs +HMM.
             row = super().bench_pitch_track(  # type: ignore[misc]
@@ -726,14 +717,8 @@ class _CompetitorEvalMixin:
     def _uniform_grid(times: np.ndarray) -> npt.NDArray[np.float64]:
         """Snap near-uniform frame times back onto an exact ``t0 + k*step`` grid.
 
-        Every competitor tracker emits times as ``arange(n) * hop`` (uniform), so
-        any wobble is float noise -- e.g. an older float32 cache whose timestamps
-        drift ~1us by the track's end. That wobble trips mir_eval's
-        ``resample_melody_series`` "Non-uniform timescale" warning, which then
-        interpolates pitch in a way that mishandles silences. Rebuilding the grid
-        from the endpoints is loss-free for our trackers (positions shift < 1us)
-        and a no-op on a fresh float64 track, so it also heals pre-existing caches
-        without a recompute.
+        On lossy float32 conversions, this helps avoid mir_eval's "Non-uniform
+        timescale" warning which triggers a fallback interpolation that corrupts silences
         """
         t = np.asarray(times, dtype=float).reshape(-1)
         if t.size < 2:
@@ -744,7 +729,6 @@ class _CompetitorEvalMixin:
 
 class CompetitorPitchBenchmarker(_CompetitorEvalMixin, PitchBenchmarker):
     """Competitor models over the audio/annot corpora (bach10-mf0-synth, mdb-*)."""
-
     def _load_ref(self, wav_path, annot_path, tighten, fmin, fmax):
         ref_times, ref_freqs = self.parse_annot(annot_path)
         if tighten:
@@ -760,7 +744,6 @@ class CompetitorPitchBenchmarker(_CompetitorEvalMixin, PitchBenchmarker):
 
 class CompetitorCocoBenchmarker(_CompetitorEvalMixin, CocoChoralesBenchmarker):
     """Competitor models over the CocoChorales tiny per-stem corpus."""
-
     def _load_ref(self, wav_path, annot_path, tighten, fmin, fmax):
         stem_voice = self._voice_idx(wav_path)
         ref_times, ref_freqs = self.load_f0(annot_path, stem_voice)
@@ -874,7 +857,7 @@ def run_model(
             out = bench.write_pitch_result(df, model, dataset_label)
             print(f"[{model}] wrote {len(df)} rows -> {out}")
     display = bench.display_pitch_columns(df)
-    bench.summarize(display, cols=[*PitchBenchmarker.PITCH_METRICS, PITCH_COMPUTE_COL, PITCH_REALTIME_COL], name=model)
+    bench.summarize(display, cols=[*PitchBenchmarker.PITCH_METRICS, PITCH_REALTIME_COL], name=model)
     return df
 
 
@@ -886,7 +869,7 @@ def write_comparison(
 ) -> None:
     import pandas as pd
 
-    cols = [*PitchBenchmarker.PITCH_METRICS, PITCH_COMPUTE_COL, PITCH_REALTIME_COL]
+    cols = [*PitchBenchmarker.PITCH_METRICS, PITCH_REALTIME_COL]
     display_summaries = {
         model: bench.display_pitch_columns(df) for model, df in summaries.items()
     }

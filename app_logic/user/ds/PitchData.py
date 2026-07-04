@@ -4,63 +4,114 @@ import numpy as np
 
 from algorithms.Config import Config
 
-class PitchConfig:
-    def __init__(self, tuning=440.0, fmin=196, fmax=5000):
-        self.tuning = tuning
-        self.fmin = fmin
-        self.fmax = fmax
-
-    def freq_to_midi(self, freq: float) -> float:
-        """
-        Convert a frequency to a MIDI note number.
-        """
-        if freq <= 0:
-            # print("bad freq")
-            return(-1)
-        return 69 + 12 * np.log2(freq / self.tuning)
-
-    def midi_to_freq(self, midi_num: float) -> float:
-        """
-        Convert a MIDI note number to frequency.
-        """
-        return self.tuning * (2 ** ((midi_num - 69) / 12))
-
-    def load_config(self, config: dict):
-        """load in a config dictionary"""
-        self.tuning = config.get("tuning", self.tuning)
-        self.fmin = config.get("fmin", self.fmin)
-        self.fmax = config.get("fmax", self.fmax)
-
 class Pitch:
-    def __init__(self, time: float, candidates: list[tuple[float, float]], 
-                 volume: float, unvoiced_prob: float, distance: float, config: Config):
+    def __init__(self, time: float, volume: float, unvoiced_prob: float,
+                 live_distance: float, config: Config,
+                 candidates: list[tuple[float, float]] | None=None, value: float=-1):
         """
-        The quintessential pitch object for the app.
-        ---
-        Corresponds to a given [time] in the PitchData and stores all possible 
-        pitch [candidates] = [(midi_num, prob), ...] sorted from most --> least probable    
-        as well as the volume and a reference to the settings (config) with which it was computed
+        The quintessential pitch object for the app. Corresponds to a given [time] in the
+        PitchData and stores all possible pitch [candidates] = [(midi_num, prob), ...]
+        sorted from most --> least probable as well as the volume and a reference to the
+        settings (config) with which it was computed
         """
-        self.config = config # tuning / fmin/fmax
-        # -- essential variables --
-        self.time = time
-        self.candidates = candidates # [(midi_num, prob), ...]; sorted
-        self.volume = volume # mean |amplitude| of the frame
+        # --- essential --- #
+        candidates = [
+            (float(midi), float(prob))
+            for midi, prob in (candidates or [])
+        ]
+        self.config = config  # tuning / fmin/fmax / note naming
+        self.time = time      # center time of the frame when pitch was computed
+        self.value = candidates[0][0] if value == -1 and candidates else value
+        self.volume = volume  # mean |amplitude| of the frame
+
+        # ---> pre-smoother characteristics
         self.unvoiced_prob = unvoiced_prob # how messy the signal was (no clean periodicity)
-
-        self.distance = distance # distance to target note (live / absolute-time)
-
-        # post-analysis distance, assigned from the pitch-mistake alignment rather
-        # than the score note at this frame's absolute time. None until analyze()
-        # runs; GuitarHero falls back to `distance` (live coloring) when it's None.
-        # A pitch inside an insertion gets float('inf') so it always colors red.
-        self.align_distance = None
-
-        # whether this frame sits in a high-slope pitch transition (slide between
-        # notes). None until NoteDetector.detect_transitions() runs as a post-pass;
-        # then True/False per frame. Transition frames are excluded from alignment
-        # distances so they don't bias a note's median or get colored as mistakes.
+        self.candidate_pitches = candidates # [(midi_num, prob), ...]; descending probability
+        # --- used in note detection --- #
         self.is_transition = None
+
+        # --- alignment-based --- #
+        self.live_distance = live_distance  # distance to target note, filled in live
+        self.aligned_distance = None # post-analysis distance
+
+    def get_note_name(self) -> str:
+        return self.config.get_note_name(self.value)
+
+    def set_transition(self, value: bool):
+        self.is_transition = value
+
+    @property
+    def candidates(self) -> list[tuple[float, float]]:
+        """Backward-compatible alias for pre-rename caches/code."""
+        return self.__dict__.get(
+            "candidate_pitches",
+            self.__dict__.get("candidates", []),
+        )
+
+    @candidates.setter
+    def candidates(self, value: list[tuple[float, float]] | None):
+        self.__dict__["candidate_pitches"] = [
+            (float(midi), float(prob))
+            for midi, prob in (value or [])
+        ]
+
+    @property
+    def distance(self):
+        return self.__dict__.get("live_distance", self.__dict__.get("distance"))
+
+    @distance.setter
+    def distance(self, value):
+        self.__dict__["live_distance"] = value
+
+    @property
+    def align_distance(self):
+        return self.__dict__.get(
+            "aligned_distance",
+            self.__dict__.get("align_distance"),
+        )
+
+    @align_distance.setter
+    def align_distance(self, value):
+        self.__dict__["aligned_distance"] = value
+
+    def ensure_compatible(self, config: Config | None = None) -> "Pitch":
+        """Patch legacy pickled Pitch instances in-place.
+
+        Older caches used `candidates`, `distance`, and `align_distance`; the
+        current app uses `candidate_pitches`, `value`, `live_distance`, and
+        `aligned_distance`.
+        """
+        if config is not None:
+            self.config = config
+        elif not hasattr(self, "config") or self.config is None:
+            self.config = Config()
+
+        if not hasattr(self, "candidate_pitches"):
+            self.candidate_pitches = [
+                (float(midi), float(prob))
+                for midi, prob in (self.__dict__.get("candidates", []) or [])
+            ]
+        else:
+            self.candidate_pitches = [
+                (float(midi), float(prob))
+                for midi, prob in (self.candidate_pitches or [])
+            ]
+
+        if not hasattr(self, "value"):
+            self.value = self.candidate_pitches[0][0] if self.candidate_pitches else -1
+        if not hasattr(self, "live_distance"):
+            self.live_distance = self.__dict__.get("distance")
+        if not hasattr(self, "aligned_distance"):
+            self.aligned_distance = self.__dict__.get("align_distance")
+        if not hasattr(self, "is_transition"):
+            self.is_transition = None
+        if not hasattr(self, "volume"):
+            self.volume = 0.0
+        if not hasattr(self, "unvoiced_prob"):
+            self.unvoiced_prob = 1.0
+        if not hasattr(self, "time"):
+            self.time = 0.0
+        return self
 
 class PitchData:
     def __init__(self, config: Config):
@@ -93,12 +144,19 @@ class PitchData:
 
     def load(self, pitches: list[Pitch]):
         """load in an entire pitch array"""
-        self.data = pitches
+        self.data = [
+            p.ensure_compatible(self.config) if p is not None else None
+            for p in pitches
+        ]
 
     def write(self, pitches: list[Pitch] | Pitch, start_time: float=0):
         """write the pitches to the data at the given time index"""
         if isinstance(pitches, Pitch):
             pitches = [pitches]
+        pitches = [
+            p.ensure_compatible(self.config) if p is not None else None
+            for p in pitches
+        ]
         if not start_time:
             start_time = pitches[0].time
 
@@ -119,7 +177,7 @@ class PitchData:
             j = min(self.time_to_index(end_time), len(self.data)-1)
 
         if clean:
-            return [p for p in self.data[i:j] if p is not None and p.candidates!=[] and p.unvoiced_prob < self.UNVOICED_THRESHOLD]
+            return [p for p in self.data[i:j] if self.is_voiced_pitch(p)]
 
         return self.data[i:j]
     
@@ -135,9 +193,11 @@ class PitchData:
         pitch: Pitch | None,
         include_transitions: bool = True,
     ) -> bool:
+        if pitch is not None:
+            pitch.ensure_compatible(self.config)
         return (
             pitch is not None
-            and bool(pitch.candidates)
+            and pitch.value != -1
             and pitch.unvoiced_prob < self.UNVOICED_THRESHOLD
             and (include_transitions or not getattr(pitch, "is_transition", False))
         )

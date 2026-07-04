@@ -205,7 +205,7 @@ class PitchSmoother:
         for t, pitch in enumerate(pitches):
             voiced = np.zeros(self.n_bins, dtype=np.float64)
             if pitch is not None:
-                for midi, prob in pitch.candidates:
+                for midi, prob in pitch.candidate_pitches:
                     b = self._midi_to_bin(midi)
                     if b is not None:
                         voiced[b] += prob
@@ -268,12 +268,7 @@ class PitchSmoother:
                 midi[t] = self.bin_midis[s]
         return times, midi, voiced
 
-    def smooth(
-        self,
-        pitches: list[Pitch],
-        show_progress: bool = False,
-        verbose: bool = True,
-    ) -> list[Pitch]:
+    def smooth(self, pitches: list[Pitch], show_progress: bool=False, verbose: bool = False) -> list[Pitch]:
         """Decode the track and return a new list of `Pitch` objects.
 
         Each voiced frame keeps a single candidate (the decoded midi at 10-cent
@@ -314,10 +309,11 @@ class PitchSmoother:
 
             out.append(Pitch(
                 time=p.time,
+                value=midi if is_voiced else -1,
                 candidates=candidates,
                 volume=p.volume,
                 unvoiced_prob=unvoiced_prob,
-                distance=p.distance,
+                live_distance=p.live_distance,
                 config=p.config,
             ))
         

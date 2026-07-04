@@ -92,6 +92,7 @@ pexpect==4.9.0
 pillow==11.3.0
 platformdirs==4.5.0
 pretty_midi==0.2.11
+praat-parselmouth==0.4.6
 prometheus_client==0.23.1
 prompt_toolkit==3.0.52
 psutil==7.1.3

@@ -43,99 +43,85 @@ NoteMethodConfig: TypeAlias = dict[str, Any]
 NOTE_CACHE_VERSION: int = 1
 
 
-def _expanded_ruptures_methods() -> dict[str, NoteMethodConfig]:
-    bases: list[tuple[str, NoteMethodConfig]] = [
-        ("pelt-l2", dict(method="ruptures", ruptures_algorithm="pelt", model="l2")),
-        ("pelt-l1", dict(method="ruptures", ruptures_algorithm="pelt", model="l1")),
-        ("pelt-rbf", dict(method="ruptures", ruptures_algorithm="pelt", model="rbf")),
-        (
-            "pelt-normal",
-            dict(
-                method="ruptures",
-                ruptures_algorithm="pelt",
-                model="normal",
-                features=("pitch", "delta_pitch", "volume", "voiced_prob"),
-            ),
-        ),
-        ("pelt-rank", dict(method="ruptures", ruptures_algorithm="pelt", model="rank")),
-        ("kernelcpd-rbf", dict(method="ruptures", ruptures_algorithm="kernelcpd", model="rbf")),
-        ("window-l2", dict(method="ruptures", ruptures_algorithm="window", model="l2")),
-        ("window-rbf", dict(method="ruptures", ruptures_algorithm="window", model="rbf")),
-        ("bottomup-l2", dict(method="ruptures", ruptures_algorithm="bottomup", model="l2")),
-        ("bottomup-rbf", dict(method="ruptures", ruptures_algorithm="bottomup", model="rbf")),
-        (
-            "dynp-l2-oracle",
-            dict(
-                method="ruptures",
-                ruptures_algorithm="dynp",
-                model="l2",
-                oracle_note_count=True,
-            ),
-        ),
-    ]
+def _cpd_note_methods() -> dict[str, NoteMethodConfig]:
+    """Change-point-detection note families.
 
+    The current production row calls ``Recording.detect_notes()`` directly. The
+    other change-point methods keep the benchmark adapter path so their ruptures
+    variants remain comparable. Kernel-CPD kernels map through ruptures' cost
+    name: linear<-l2, gaussian<-rbf, cosine. ``dynp`` needs a target segment
+    count, which it takes from the score (a real input in-app), so it is the one
+    score-informed / "oracle" row.
+    """
+    bases: list[tuple[str, NoteMethodConfig]] = [
+        ("pelt-l1", dict(method="ruptures", ruptures_algorithm="pelt", model="l1")),
+        ("pelt-l2", dict(method="ruptures", ruptures_algorithm="pelt", model="l2",
+                         current_notedetector=True)),
+        ("pelt-rbf", dict(method="ruptures", ruptures_algorithm="pelt", model="rbf")),
+        ("dynp", dict(method="ruptures", ruptures_algorithm="dynp", model="l2",
+                      oracle_note_count=True)),
+        ("kernelcpd-linear", dict(method="ruptures", ruptures_algorithm="kernelcpd", model="l2")),
+        ("kernelcpd-gaussian", dict(method="ruptures", ruptures_algorithm="kernelcpd", model="rbf")),
+        ("kernelcpd-cosine", dict(method="ruptures", ruptures_algorithm="kernelcpd", model="cosine")),
+        ("bottomup", dict(method="ruptures", ruptures_algorithm="bottomup", model="l2")),
+        ("window-base", dict(method="ruptures", ruptures_algorithm="window", model="l2")),
+        ("window-slope-aware", dict(method="slope_window")),
+    ]
     methods: dict[str, NoteMethodConfig] = {}
-    for base_label, base_config in bases:
-        for exclude_transitions in (False, True):
-            for refined in (False, True):
-                transition_label = "exclude-transitions" if exclude_transitions else "keep-transitions"
-                onset_label = "onset-refined" if refined else "raw"
-                label = f"{base_label}__{transition_label}__{onset_label}"
-                config = dict(base_config)
-                config.update(
-                    exclude_transitions=exclude_transitions,
-                    refined_with_onsets=refined,
-                    benchmark_group="ruptures",
-                    base_method=base_label,
-                    current_notedetector=(
-                        base_label == "pelt-l2"
-                        and exclude_transitions
-                        and not refined
-                    ),
-                )
-                methods[label] = config
+    for label, base_config in bases:
+        config = dict(base_config)
+        config.setdefault("current_notedetector", False)
+        config.update(
+            exclude_transitions=True,
+            refined_with_onsets=False,
+            postprocess_transitions=True,
+            benchmark_group="cpd",
+            base_method=label,
+        )
+        if config.get("current_notedetector", False):
+            config["postprocess_transitions"] = False
+        methods[label] = config
     return methods
 
 
-def _competitor_methods() -> dict[str, NoteMethodConfig]:
+def _moreover_note_methods() -> dict[str, NoteMethodConfig]:
+    """Non-change-point baselines. These bring their own segmentation and are
+    scored as-is: the transition re-median / prune post-pass is deliberately NOT
+    applied (per spec, only the CPD families get it)."""
     return {
-        "crepe-notes": dict(
-            method="crepe_notes",
-            refined_with_onsets=False,
-            external_baseline=True,
-            uses_onsets=True,
-            benchmark_group="external",
-            base_method="crepe-notes",
-        ),
         "onset-only": dict(
             method="onset_only",
             exclude_transitions=False,
             refined_with_onsets=False,
+            postprocess_transitions=False,
             uses_onsets=True,
-            benchmark_group="onset",
+            benchmark_group="moreover",
             base_method="onset-only",
-        ),
-        "onset-pitch-hybrid": dict(
-            method="onset_pitch_hybrid",
-            exclude_transitions=False,
-            refined_with_onsets=False,
-            uses_onsets=True,
-            benchmark_group="competitor",
-            base_method="onset-pitch-hybrid",
         ),
         "basic-pitch": dict(
             method="basic_pitch",
             refined_with_onsets=False,
+            postprocess_transitions=False,
             external_baseline=True,
-            benchmark_group="external",
+            benchmark_group="moreover",
             base_method="basic-pitch",
         ),
-        "tony-pyin": dict(
+        "tony": dict(
             method="tony_pyin",
             refined_with_onsets=False,
+            postprocess_transitions=False,
             external_baseline=True,
-            benchmark_group="external",
-            base_method="tony-pyin",
+            benchmark_group="moreover",
+            base_method="tony",
+        ),
+        "crepe-notes": dict(
+            method="crepe_notes",
+            refined_with_onsets=False,
+            postprocess_transitions=False,
+            external_baseline=True,
+            uses_onsets=True,
+            benchmark_group="moreover",
+            base_method="crepe-notes",
         ),
     }
 
@@ -143,36 +129,17 @@ def _competitor_methods() -> dict[str, NoteMethodConfig]:
 def _default_note_methods(
     all_methods: dict[str, NoteMethodConfig],
 ) -> dict[str, NoteMethodConfig]:
-    """Practical default set for interactive benchmark runs.
-
-    The full matrix intentionally includes expensive oracle/kernel/external
-    baselines. Keep the default useful enough to compare the main families while
-    avoiding methods that can take minutes per 20k-frame etude.
-    """
-    labels = [
-        "pelt-l2__keep-transitions__raw",
-        "pelt-l2__keep-transitions__onset-refined",
-        "pelt-l2__exclude-transitions__raw",
-        "pelt-l2__exclude-transitions__onset-refined",
-        "pelt-l1__exclude-transitions__raw",
-        "pelt-l1__exclude-transitions__onset-refined",
-        "pelt-rank__exclude-transitions__raw",
-        "pelt-rank__exclude-transitions__onset-refined",
-        "bottomup-l2__exclude-transitions__raw",
-        "bottomup-l2__exclude-transitions__onset-refined",
-        "crepe-notes",
-        "onset-only",
-        "onset-pitch-hybrid",
-        "basic-pitch",
-        "tony-pyin",
-    ]
-    return {label: all_methods[label] for label in labels}
+    """The curated matrix used to narrow the field: all CPD families plus the
+    moreover baselines. Same set feeds the 10-song shortlist and the full run;
+    ``--method`` / ``--no-external`` prune it further per invocation."""
+    return dict(all_methods)
 
 
 _ALL_NOTE_METHODS = {
-    **_expanded_ruptures_methods(),
-    **_competitor_methods(),
+    **_cpd_note_methods(),
+    **_moreover_note_methods(),
 }
+_EXTERNAL_NOTE_METHODS = {"basic-pitch", "tony", "crepe-notes"}
 
 
 class NoteBenchmarker(PitchBenchmarker):
@@ -265,13 +232,28 @@ class NoteBenchmarker(PitchBenchmarker):
         detect_transitions: bool=True,
     ) -> Recording:
         if detect_transitions:
-            recording.detect_transitions()
+            recording.transition_detector.detect_transitions(recording.pitch_data.data)
         if resize_score_to_pitch: # sets min_note_length from this
             recording.resize_score(
                 to_span="pitch",
                 include_transitions=not detect_transitions,
             )
+        recording.update_min_note_length()
         return recording
+
+    @staticmethod
+    def detect_recording_notes(recording: Recording) -> NoteData:
+        """Run the production note pipeline exactly as the app does."""
+        recording.detect_notes()
+        return recording.note_data
+
+    def detect_recording_notes_timed(
+        self,
+        recording: Recording,
+    ) -> tuple[NoteData, float]:
+        start = time.perf_counter()
+        notes = self.detect_recording_notes(recording)
+        return notes, time.perf_counter() - start
 
     def detect_notes_timed(
         self, recording: Recording, method: str="pelt", 
@@ -300,21 +282,9 @@ class NoteBenchmarker(PitchBenchmarker):
         refine_with_onsets: bool | None = None,
         **_unused,
     ) -> dict[str, float]:
+        del method, model, refine_with_onsets
         recording.reset_analysis()
-        self.prepare_for_note_detection(
-            recording,
-            resize_score_to_pitch=True,
-            detect_transitions=True,
-        )
-        _, note_compute_time = self.detect_notes_timed(
-            recording,
-            method=method,
-            model=model,
-            do_transitions=False,
-            refine_with_onsets=refine_with_onsets,
-        )
-        if recording.note_data.times:
-            recording.resize_score(to_span="note")
+        _, note_compute_time = self.detect_recording_notes_timed(recording)
         if truncate:
             recording.trim_end(mark_unsaved=False)
 
@@ -437,13 +407,15 @@ class NoteBenchmarker(PitchBenchmarker):
         if cache_path.exists():
             recording.note_data, metadata = self.load_note_data(cache_path)
             return recording.note_data, float(metadata.get("note_compute_time", 0.0))
-        notes, note_compute_time = self.detect_notes_timed(
-            recording, model=model, do_transitions=False,
-        )
+        del model
+        notes, note_compute_time = self.detect_recording_notes_timed(recording)
         if write_cache:
             self.save_note_data(
                 notes, cache_path,
-                metadata={"note_compute_time": note_compute_time, "model": model},
+                metadata={
+                    "note_compute_time": note_compute_time,
+                    "method": "recording.detect_notes",
+                },
             )
         return notes, note_compute_time
 
@@ -503,6 +475,19 @@ class NoteBenchmarker(PitchBenchmarker):
         )
 
     @classmethod
+    def _method_needs_audio(cls, method_config: NoteMethodConfig) -> bool:
+        """True when a method reads the raw waveform (external transcribers) or the
+        spectral onsets derived from it. Pure change-point methods run on the
+        cached pitch track alone, so their recordings can skip the audio load."""
+        method = cls._normalized_method_name(method_config)
+        return bool(
+            method_config.get("current_notedetector", False)
+            or method_config.get("external_baseline", False)
+            or cls._method_uses_onsets(method_config)
+            or method in {"basic_pitch", "tony_pyin", "crepe_notes", "onset_only", "onset_pitch_hybrid"}
+        )
+
+    @classmethod
     def _base_detection_config(cls, method_config: NoteMethodConfig) -> NoteMethodConfig:
         config = dict(method_config)
         for key in (
@@ -510,6 +495,7 @@ class NoteBenchmarker(PitchBenchmarker):
             "base_method",
             "current_notedetector",
             "external_baseline",
+            "postprocess_transitions",
             "uses_onsets",
             "uses_attune_onsets",
         ):
@@ -577,6 +563,7 @@ class NoteBenchmarker(PitchBenchmarker):
             ),
             "oracle_note_count": bool(method_config.get("oracle_note_count", False)),
             "external_baseline": bool(method_config.get("external_baseline", False)),
+            "postprocess_transitions": bool(method_config.get("postprocess_transitions", False)),
             "uses_onsets": cls._method_uses_onsets(method_config),
             "current_notedetector": bool(method_config.get("current_notedetector", False)),
         }
@@ -589,6 +576,21 @@ class NoteBenchmarker(PitchBenchmarker):
         onset_data=None,
     ) -> tuple[NoteData, dict[str, float]]:
         cache_key = self._method_cache_key(method_config)
+        if bool(method_config.get("current_notedetector", False)):
+            cache_key = f"recording.detect_notes:{cache_key}"
+            if cache_key not in method_cache:
+                recording.reset_analysis()
+                notes, note_time = self.detect_recording_notes_timed(recording)
+                method_cache[cache_key] = (clone_note_data(notes), note_time)
+            notes, note_time = method_cache[cache_key]
+            recording.note_data = clone_note_data(notes)
+            return recording.note_data, {
+                "base_note_compute_time": note_time,
+                "onset_refinement_compute_time": 0.0,
+                "transition_postprocess_compute_time": 0.0,
+                "note_compute_time": note_time,
+            }
+
         if cache_key not in method_cache:
             base_config = self._base_detection_config(method_config)
             base_notes, base_time = self.detect_notes_timed(
@@ -614,11 +616,21 @@ class NoteBenchmarker(PitchBenchmarker):
             )
             refinement_time = time.perf_counter() - start
 
+        # Production cleanup (perform.py::analyze): re-median each note over its
+        # non-transition frames, then drop phantom slide notes. Applied to the
+        # change-point families only; the moreover baselines opt out via the flag.
+        postprocess_time = 0.0
+        if bool(method_config.get("postprocess_transitions", False)):
+            start = time.perf_counter()
+            notes = BenchmarkNoteDetector(recording).apply_transition_postprocess(notes)
+            postprocess_time = time.perf_counter() - start
+
         recording.note_data = notes
         return notes, {
             "base_note_compute_time": base_time,
             "onset_refinement_compute_time": refinement_time,
-            "note_compute_time": base_time + refinement_time,
+            "transition_postprocess_compute_time": postprocess_time,
+            "note_compute_time": base_time + refinement_time + postprocess_time,
         }
 
     @staticmethod
@@ -633,6 +645,261 @@ class NoteBenchmarker(PitchBenchmarker):
             "base_note_compute_time": np.nan,
             "onset_refinement_compute_time": np.nan,
             "error": f"{type(error).__name__}: {error}",
+        }
+
+    # ------------------------------------------------------------------ #
+    # single-method scoring (used by the parallel benchmark_notes runner)
+    # ------------------------------------------------------------------ #
+    REALTIME_COL: ClassVar[str] = "Audio(s)/Compute(s)"
+    NOTE_COMPUTE_COL: ClassVar[str] = "Note Compute Time (s)"
+    NOTE_QUALITY_METRICS: ClassVar[list[str]] = ["F-measure", "Precision", "Recall"]
+    #: columns kept (and their order) in the per-method raw CSVs. Pitch-detection
+    #: time is intentionally absent — only the note detector's own cost is scored.
+    NOTE_RESULT_COLUMNS: ClassVar[list[str]] = [
+        "Track ID",
+        "F-measure",
+        "Precision",
+        "Recall",
+        "Average Overlap Ratio",
+        "Estimated Notes",
+        "Reference Notes",
+        REALTIME_COL,
+        NOTE_COMPUTE_COL,
+        "Split",
+        "Track",
+        "Ensemble",
+        "Instrument",
+        "Voice",
+        "error",
+    ]
+
+    def note_result_csv_path(self, method: str, dataset: str) -> Path:
+        safe_dataset = dataset.replace("/", "_")
+        safe_method = method.replace("/", "_")
+        return self.RESULTS / "note" / "raw_outputs" / safe_method / f"{safe_dataset}.csv"
+
+    @property
+    def note_summary_csv_path(self) -> Path:
+        return self.RESULTS / "note" / "note_benchmarks.csv"
+
+    def display_note_columns(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        out = df.copy()
+        if out.index.name in (None, "track_id"):
+            out.index.name = "Track ID"
+        rename_candidates = {
+            "track_id": "Track ID",
+            "method_label": "Method",
+            "realtime_factor": self.REALTIME_COL,
+            "note_compute_time": self.NOTE_COMPUTE_COL,
+            "split": "Split",
+            "track": "Track",
+            "ensemble": "Ensemble",
+            "instrument": "Instrument",
+            "voice": "Voice",
+        }
+        rename = {
+            src: dst
+            for src, dst in rename_candidates.items()
+            if src in out.columns and (dst not in out.columns or src == dst)
+        }
+        if rename:
+            out = out.rename(columns=rename)
+        # audio length + per-stage timings are internal; the row keeps only the
+        # note-detection compute time and Audio(s)/Compute(s).
+        out = out.drop(
+            columns=[
+                c for c in (
+                    "audio_seconds", "base_note_compute_time",
+                    "onset_refinement_compute_time", "transition_postprocess_compute_time",
+                    "onset_compute_time", "model", "dataset",
+                ) if c in out.columns
+            ],
+            errors="ignore",
+        )
+        ordered = [c for c in self.NOTE_RESULT_COLUMNS if c in out.columns]
+        remaining = [c for c in out.columns if c not in ordered]
+        return out[ordered + remaining]
+
+    def write_note_result(
+        self, df: "pd.DataFrame", method: str, dataset: str, index: bool = True,
+    ) -> Path:
+        out_path = self.note_result_csv_path(method, dataset)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.display_note_columns(df).to_csv(out_path, index=index)
+        return out_path
+
+    def _audio_seconds(self, wav_path: PathLike | None) -> float:
+        if wav_path is None:
+            return float("nan")
+        try:
+            import soundfile as sf
+
+            info = sf.info(str(wav_path))
+            return float(info.frames) / float(info.samplerate)
+        except Exception:  # noqa: BLE001
+            return float("nan")
+
+    @staticmethod
+    def _timing_columns(note_compute_time: float, audio_seconds: float) -> dict[str, Any]:
+        realtime = (
+            audio_seconds / note_compute_time
+            if note_compute_time and note_compute_time > 0 and np.isfinite(audio_seconds)
+            else float("nan")
+        )
+        return {
+            "note_compute_time": float(note_compute_time),
+            "audio_seconds": float(audio_seconds),
+            "realtime_factor": float(realtime),
+        }
+
+    def _eval_intervals(
+        self,
+        ref_iv: npt.NDArray[np.float64],
+        ref_pi: npt.NDArray[np.float64],
+        est_iv: npt.NDArray[np.float64],
+        est_pi: npt.NDArray[np.float64],
+        *,
+        align: str,
+        latency_align: bool,
+        trim_boundaries: bool,
+        onset_tolerance: float,
+    ) -> tuple[float, float, float, float]:
+        """Shared identity/resize interval scoring: constant latency shift +
+        boundary trim + non-negative pad, then mir_eval overlap PRF."""
+        if align == "identity" and latency_align and est_iv.size:
+            est_iv = est_iv + self._latency_offset(ref_iv[:, 0], est_iv[:, 0])
+        if trim_boundaries:
+            est_iv = self._trim_boundaries(est_iv, ref_iv)
+        mins = [0.0]
+        if est_iv.size:
+            mins.append(float(est_iv.min()))
+        if ref_iv.size:
+            mins.append(float(ref_iv.min()))
+        pad = -min(mins)
+        if pad:
+            ref_iv = ref_iv + pad
+            est_iv = est_iv + pad
+        return mir_eval.transcription.precision_recall_f1_overlap(
+            ref_iv, ref_pi, est_iv, est_pi,
+            onset_tolerance=onset_tolerance,
+            offset_ratio=None,
+        )
+
+    def _prepare_note_recording(
+        self,
+        primary_path: PathLike,
+        reference_path: PathLike,
+        align: str = "identity",
+        needs_audio: bool = True,
+    ) -> tuple[Recording, npt.NDArray[np.float64], npt.NDArray[np.float64], float]:
+        """Build a Recording with cached pitches + score reference for one etude.
+
+        Returns (recording, reference_intervals, reference_pitches, audio_seconds).
+        The etude WAV is synthesized from the reference MIDI; pitch data is loaded
+        from (or written to) the shared pyin_smooth cache — pitch detection time is
+        NOT charged to the note benchmark. Subclasses (CocoChorales) override this
+        with their own audio/reference/pitch-cache loading. ``needs_audio`` lets the
+        override skip the waveform load for pure change-point methods (the etude
+        path always has audio from synthesis, so it ignores the hint)."""
+        midi_path = Path(reference_path)
+        score_data = OneInstrumentScoreData(midi_path)
+        config = self.config_for(*self.range_from_midi(score_data.midi_numbers))
+        recording = self.recording_for(config, score_data=score_data)
+        wav_path = self.synth_midi(midi_path)
+        recording.audio_data = AudioData(audio_filepath=str(wav_path), config=recording.config)
+        recording.audio_filepath = wav_path
+        self.load_or_detect_pitches(
+            recording,
+            cache_path=self.pitch_cache_path(
+                self.etude_corpus_dir_for_midi(midi_path), midi_path.stem,
+            ),
+            smooth=True, write_cache=True, verbose=self.algorithm_verbose,
+        )
+        self.prepare_for_note_detection(
+            recording,
+            resize_score_to_pitch=(align == "resize"),
+            detect_transitions=True,
+        )
+        ref_iv, ref_pi = self.notedata_to_intervals(
+            recording.score_data.clipped_note_data(channel=recording.active_instrument),
+            recording.config,
+        )
+        return recording, ref_iv, ref_pi, self._audio_seconds(wav_path)
+
+    def score_note_track(
+        self,
+        primary_path: PathLike,
+        reference_path: PathLike,
+        method_label: str,
+        method_config: NoteMethodConfig,
+        *,
+        align: str = "identity",
+        latency_align: bool = True,
+        trim_boundaries: bool = True,
+        onset_tolerance: float | None = None,
+    ) -> dict[str, Any]:
+        """Detect + score ONE method on ONE track, returning a single flat row.
+
+        This is the note analogue of ``PitchBenchmarker.bench_pitch_track``: the
+        parallel runner calls it once per (method, track). The row carries the note
+        detection compute time and Audio(s)/Compute(s) — never pitch time."""
+        onset_tolerance = (
+            self.onset_tolerance if onset_tolerance is None else onset_tolerance
+        )
+        recording, ref_iv, ref_pi, audio_seconds = self._prepare_note_recording(
+            primary_path, reference_path, align,
+            needs_audio=self._method_needs_audio(method_config),
+        )
+        row_meta = self._method_row_metadata(method_label, method_config)
+        onset_data = None
+        onset_time = 0.0
+        if self._method_needs_attune_onsets(method_config):
+            start = time.perf_counter()
+            onset_data = BenchmarkNoteDetector(recording)._onset_data()
+            onset_time = time.perf_counter() - start
+
+        try:
+            notes, note_timing = self._detect_notes_for_method(
+                recording, method_config, method_cache={}, onset_data=onset_data,
+            )
+        except Exception as exc:  # noqa: BLE001 -- isolate a bad method/track
+            return {
+                **row_meta,
+                "Precision": np.nan, "Recall": np.nan, "F-measure": np.nan,
+                "Average Overlap Ratio": np.nan,
+                "Estimated Notes": 0, "Reference Notes": int(len(ref_iv)),
+                **self._timing_columns(float("nan"), audio_seconds),
+                "onset_compute_time": onset_time,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        if align == "resize" and notes.times:
+            recording.resize_score(to_span="note")
+            ref_iv, ref_pi = self.notedata_to_intervals(
+                recording.score_data.clipped_note_data(channel=recording.active_instrument),
+                recording.config,
+            )
+        est_iv, est_pi = self.notedata_to_intervals(notes, recording.config)
+        note_compute_time = note_timing["note_compute_time"]
+        if len(est_iv) == 0:
+            precision = recall = f_measure = aor = 0.0
+        else:
+            precision, recall, f_measure, aor = self._eval_intervals(
+                ref_iv, ref_pi, est_iv, est_pi,
+                align=align, latency_align=latency_align,
+                trim_boundaries=trim_boundaries, onset_tolerance=onset_tolerance,
+            )
+        return {
+            **row_meta,
+            "Precision": float(precision),
+            "Recall": float(recall),
+            "F-measure": float(f_measure),
+            "Average Overlap Ratio": float(aor),
+            "Estimated Notes": int(len(est_iv)),
+            "Reference Notes": int(len(ref_iv)),
+            **self._timing_columns(note_compute_time, audio_seconds),
+            "onset_compute_time": onset_time,
+            "error": None,
         }
 
     def bench_note_track(
@@ -715,7 +982,7 @@ class NoteBenchmarker(PitchBenchmarker):
                 return None
             if shared_onset_data is None:
                 start = time.perf_counter()
-                shared_onset_data = recording.note_detector._detect_spectral_onsets()
+                shared_onset_data = BenchmarkNoteDetector(recording)._onset_data()
                 shared_onset_time = time.perf_counter() - start
             return shared_onset_data
 
@@ -749,20 +1016,26 @@ class NoteBenchmarker(PitchBenchmarker):
                 continue
 
             note_compute_time = note_timing["note_compute_time"]
-            # auto-cache the RAW production PELT-L2 notes (before any resize
-            # shifts them) so the mistake benchmarker can skip re-detecting.
+            # Auto-cache the production notes so the mistake benchmarker can skip
+            # re-running Recording.detect_notes() for the same synthesized take.
             if (
                 write_note_cache
                 and row_base["current_notedetector"]
                 and method_config.get("model") == "l2"
             ):
+                cache_key = f"recording.detect_notes:{self._method_cache_key(method_config)}"
+                base_notes, base_time = method_cache[cache_key]
                 self.save_note_data(
-                    notes,
+                    base_notes,
                     self.note_cache_path(
                         self.etude_corpus_dir_for_midi(midi_path),
                         midi_path.stem,
                     ),
-                    metadata={"note_compute_time": note_compute_time, "model": "l2"},
+                    metadata={
+                        "note_compute_time": base_time,
+                        "model": "l2",
+                        "method": "recording.detect_notes",
+                    },
                 )
             if align == "resize":
                 # Re-align the score to the take's detected NOTE onsets, mirroring

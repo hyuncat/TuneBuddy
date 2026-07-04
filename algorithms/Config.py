@@ -2,96 +2,100 @@ import numpy as np
 from dataclasses import dataclass
 from typing import ClassVar
 
+# --- pYIN voicing / volume-gate defaults (shared with the benchmark harness) ---
+PRAAT_DEFAULT_VOICING_THRESHOLD = 0.45
+PYIN_PRAAT_MIRROR_UNV_THRESH = 1.0 - PRAAT_DEFAULT_VOICING_THRESHOLD
+PYIN_DEFAULT_UNV_THRESH = 0.9
+PYIN_DEFAULT_MIN_VOLUME = 0.05
+PYIN_DEFAULT_MAX_VOLUME = 0.95
+
+
 @dataclass
 class Config:
     DEFAULT_MIN_NOTE_LENGTH: ClassVar[float] = 0.03
 
+    # note-name spellings indexed by pitch class (midi % 12). get_note_name()
+    # picks one; the transpose autocomplete offers both.
+    SHARP_NOTE_NAMES: ClassVar[list] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    FLAT_NOTE_NAMES: ClassVar[list] = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+
+    verbose: bool = False
+
     # --- PITCH DETECTION PARAMETERS ---
-    sr: int = 44100    # sample rate
+    sr: int = 44100     # sample rate
     w1: int = 1024 * 4  # frame size
     h1: int = 128       # hop size
-    fmin: float = 196.0
-    fmax: float = 3000.0
-    tuning: float = 440.0
-    unv_thresh: float = 0.9 # if unvoiced_prob > unv_thresh, consider the frame unvoiced
+    fmin: float = 196.0 # Hz
+    fmax: float = 3000.0 # Hz
+    tuning: float = 440.0  # Hz
+    unv_thresh: float = 0.9  # if unvoiced_prob > unv_thresh, consider the frame unvoiced
+
+    # volume gating
+    min_volume: float = 0.05  # remove any frame < min_volume * max_volume reference
+    max_volume: float = 0.95  # %th percentile (as a fraction) of frame RMS used as the loud reference
 
     # --- NOTE DETECTION PARAMETERS ---
-    pitch_thresh: float = 0.5 # minimum difference between two notes to consider them distinct (in semitones)
-    min_note_length: float = DEFAULT_MIN_NOTE_LENGTH # shortest expected note, in seconds
-    note_detection_min_note_factor: float = 0.6
-    note_detection_pelt_jump: int = 1
-    note_detection_refine_with_onsets: bool = False
-    note_detection_onset_min_note_factor: float = 1.0
-    note_detection_onset_min_stable_ratio: float = 0.8
-    mistake_checker_min_note_factor: float = 0.3
+    pitch_thresh: float = 0.25  # in semitones, min diff b/w 2 notes to consider them distinct
+    min_note_length: float = 0.03  # in sec
+    h2: int = 1  # PELT jump parameter
+    min_gap_length: float = 0.1 # in sec
 
-    # --- STRING EDIT PARAMETERS (pitch-only aligner + MistakeChecker) ---
+    # --- STRING EDIT PARAMETERS ---
     ins_cost: float = 5
     del_cost: float = 5
-    pitch_tolerance: float = 0.5
+    pitch_tolerance: float = 0.5   # semitones
+    timing_tolerance: float = 0.25  # sec
 
-    # --- ONSET-AWARE ALIGNMENT COST MODEL ---
-    # The onset-aware aligner sets its DP costs to the negative log-priors of a
-    # simple generative mistake model (plus Gaussian onset/pitch penalties), so the
-    # substitution-vs-(insertion+deletion) tradeoff is determined by these stats
-    # rather than hand-tuned magic numbers. `mistake_rate` and the screwup-type
-    # shares default to the PolyTune injector (16 uniform codes: 1 deletion,
-    # 1 substitution, 2 insertion, 12 timing-only) — change mistake_rate and the
-    # costs follow. See alignment_priors() / MistakeDetector._align_cost_model().
-    mistake_rate: float = 0.25
-    screwup_deletion_share: float = 1 / 16
-    screwup_substitution_share: float = 1 / 16
-    screwup_insertion_share: float = 2 / 16
-    align_onset_sigma: float = 0.20   # sec; stdev of a matched/substituted onset
-    align_pitch_sigma: float = 2.0    # semitones; stdev of a substitution's pitch
+    # --- note-name helper ---
+    @staticmethod
+    def get_note_name(midi_num: float | None, prefer_flats: bool = False) -> str:
+        """Convert a MIDI number to a letter name like C4, F#3 (or Bb3 with
+        prefer_flats). Note naming is tuning-independent, so this is a static
+        method that both Pitch and Note route through. Rests/unvoiced (None or a
+        negative midi_num) render as an em dash."""
+        if midi_num is None or midi_num < 0:
+            return "—"
+        n = int(round(midi_num))
+        names = Config.FLAT_NOTE_NAMES if prefer_flats else Config.SHARP_NOTE_NAMES
+        return f"{names[n % 12]}{n // 12 - 1}"
+    
+    def get_min_note_length(self, type: str="sec"):
+        """Return the minimum note length in seconds or pitch frames (h1/sr grid)."""
+        if type == "sec":
+            return self.min_note_length
+        elif type == "frames":
+            fr = self.sr / self.h1
+            return max(1, int(np.ceil(self.min_note_length * fr)))
+        else:
+            raise ValueError(f"Invalid type {type} for get_min_note_length()")
 
-    # --- TIMING FEEDBACK PARAMETERS ---
-    # Threshold for post-alignment timing mistakes. A matched note is flagged
-    # early/late when its onset is off by more than this many seconds, and
-    # short/long when its duration differs by more than this many seconds.
-    timing_tolerance: float = 0.25
-
-    def set_min_note_length(self, seconds: float | None) -> float:
+    def set_min_note_length(self, sec: float):
         """Set the central shortest-note estimate in seconds."""
-        if seconds is None or seconds <= 0:
-            seconds = self.DEFAULT_MIN_NOTE_LENGTH
-        self.min_note_length = float(seconds)
-        return self.min_note_length
+        if sec is None or sec <= 0:
+            sec = self.DEFAULT_MIN_NOTE_LENGTH
+        self.min_note_length = float(sec)
 
     def set_min_note_length_from_notedata(self, note_data) -> float:
-        """Update min_note_length from a score/annotation NoteData."""
+        """Compatibility helper for older benchmark/notebook callers."""
         if note_data is None:
-            return self.set_min_note_length(self.DEFAULT_MIN_NOTE_LENGTH)
+            self.set_min_note_length(self.DEFAULT_MIN_NOTE_LENGTH)
+            return self.min_note_length
         try:
-            seconds = note_data.get_min_note_length(
+            sec = note_data.get_min_note_length(
                 default=self.DEFAULT_MIN_NOTE_LENGTH,
                 clean=True,
             )
         except AttributeError:
-            seconds = self.DEFAULT_MIN_NOTE_LENGTH
-        return self.set_min_note_length(seconds)
+            sec = self.DEFAULT_MIN_NOTE_LENGTH
+        self.set_min_note_length(sec)
+        return self.min_note_length
 
     def min_note_seconds(self, factor: float = 1.0) -> float:
-        """Shortest-note estimate after applying an algorithm-specific factor."""
         return max(0.0, float(self.min_note_length) * float(factor))
 
     def min_note_pitch_frames(self, factor: float = 1.0) -> int:
-        """Shortest-note estimate converted to pitch frames (h1/sr grid)."""
         frame_rate = self.sr / self.h1
         return max(1, int(np.ceil(self.min_note_seconds(factor) * frame_rate)))
-
-    def alignment_priors(self) -> tuple[float, float, float, float]:
-        """Per-score-note operation priors (p_correct, p_substitution, p_insertion,
-        p_deletion) for the onset-aware aligner, derived from `mistake_rate` and the
-        screwup-type shares. Automated: the aligner's DP costs follow whenever these
-        change (a note is 'correct' unless it was deleted or substituted; insertions
-        are extra notes scored against the same per-note budget)."""
-        lam = max(0.0, min(1.0, float(self.mistake_rate)))
-        p_del = lam * self.screwup_deletion_share
-        p_sub = lam * self.screwup_substitution_share
-        p_ins = lam * self.screwup_insertion_share
-        p_correct = max(1e-6, 1.0 - p_del - p_sub)
-        return p_correct, p_sub, p_ins, p_del
 
     # --- pitch conversion methods ---
     def freq_to_midi(self, freq: float) -> float:
@@ -111,6 +115,6 @@ class Config:
 
 
     def __repr__(self):
-        return (f"Config\n---\n   sr={self.sr}, w1={self.w1}, h1={self.h1}, fmin={self.fmin}, fmax={self.fmax}, tuning={self.tuning}, unv_thresh={self.unv_thresh},\n"
-                f"   pitch_thresh={self.pitch_thresh}, min_note_length={self.min_note_length:.3f}, note_detection_pelt_jump={self.note_detection_pelt_jump}, note_detection_refine_with_onsets={self.note_detection_refine_with_onsets}, note_detection_onset_min_note_factor={self.note_detection_onset_min_note_factor}, note_detection_onset_min_stable_ratio={self.note_detection_onset_min_stable_ratio},\n"
+        return (f"Config\n---\n   sr={self.sr}, w1={self.w1}, h1={self.h1}, fmin={self.fmin}, fmax={self.fmax}, tuning={self.tuning}, unv_thresh={self.unv_thresh}, min_volume={self.min_volume}, max_volume={self.max_volume},\n"
+                f"   pitch_thresh={self.pitch_thresh}, min_note_length={self.min_note_length:.3f}, h2={self.h2},\n"
                 f"   ins_cost={self.ins_cost}, del_cost={self.del_cost}, pitch_tolerance={self.pitch_tolerance}, timing_tolerance={self.timing_tolerance}")

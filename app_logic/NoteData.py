@@ -1,9 +1,10 @@
 import numpy as np
 from collections import defaultdict
 from bisect import bisect_left, bisect_right
-class Note:
-    _NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
+from algorithms.Config import Config
+
+class Note:
     def __init__(self, i: int, start_time: float, end_time: float, midi_num: list[float],
                  velocity: int=None, instrument: int=None):
         self.id = i # used to keep track of note within the piece
@@ -20,12 +21,12 @@ class Note:
         self.instrument = instrument
 
 
-    def get_note_name(self) -> str:
-        """Convert the most-likely MIDI note to a letter name like C4 or F#3."""
+    def get_note_name(self, prefer_flats: bool = False) -> str:
+        """Convert the most-likely MIDI note to a letter name like C4 or F#3 (or
+        Bb3 with prefer_flats), via Config's shared note-name method."""
         if len(self.midi_num) == 0:
             return "—"
-        n = int(round(self.midi_num[0]))
-        return f"{self._NOTE_NAMES[n % 12]}{n // 12 - 1}"
+        return Config.get_note_name(self.midi_num[0], prefer_flats=prefer_flats)
 
 class NoteData:
     """Data to store and retrieve notes efficiently (indexing + binary search)

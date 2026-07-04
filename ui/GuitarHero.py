@@ -557,27 +557,27 @@ class GuitarHero(QWidget):
         # --- update PITCHES ---
         xs, ys, brushes = [], [], []
         for p in user_pitches:
-            for c in p.candidates:
+            for c in p.candidate_pitches:
                 xs.append(p.time)
                 ys.append(c[0]) # pitch value
                 # high-slope transition frames (slides between notes) are always
                 # neutral grey: their pitch is mid-slide, so we never score them by
                 # distance — even post-analyze where _update_pitch_distances has
-                # given them a (meaningless) live `distance`.
+                # given them a (meaningless) live_distance.
                 if getattr(p, "is_transition", False):
                     brushes.append(self.rest_brush)
                     break
                 # after analyze() pitches carry an alignment-based distance; color
                 # by that. while recording (or pre-analysis) it's None, so fall
                 # back to the live per-frame distance coloring.
-                ad = getattr(p, "align_distance", None)
+                ad = getattr(p, "aligned_distance", None)
                 if ad is not None:
                     brushes.append(self.get_align_distance_brush(ad))
                 else:
-                    brushes.append(self.get_distance_brush(getattr(p, "distance", None)))
+                    brushes.append(self.get_distance_brush(getattr(p, "live_distance", None)))
                 break
                     
-        # get_alpha = lambda p: int(50 + 205*(1 - p.candidates[0][1]))
+        # get_alpha = lambda p: int(50 + 205*(1 - p.candidate_pitches[0][1]))
         # alphas = np.asarray([get_alpha(p) for p in user_pitches], dtype=np.float32)
         # brushes = [pg.mkBrush(41, 177, 240, a) for a in alphas]
 

@@ -23,15 +23,15 @@ class ToleranceWidget(QWidget):
 
         self._PITCH_HELP_TEXT = "How close to the intended note (in semitones)\nthe user can play to be counted correct.\n1 = Nearest semitone, 2 = Nearest whole step, etc."
         self._TIMING_HELP_TEXT = "How far off +/- the user's note can vary from the score in timing."
-        # Pitch is shown/edited in semitones. The Config stores raw
-        # pitch_tolerance (the pitch-mistake semitone slack); the two are linearly
-        # related: each whole semitone step on the slider is worth
-        # `_TOL_PER_SEMITONE` of raw tolerance.
-        #   semitones 1 2 3 4 5  <->  pitch_tolerance 0.25 0.5 0.75 1.0 1.25
-        self._TOL_PER_SEMITONE = 0.25
+        # Pitch is shown/edited in semitones, one-to-one with the raw Config
+        # pitch_tolerance: 1 semitone displayed == 1.0 pitch_tolerance == 1 MIDI
+        # step. The slider steps in whole semitones; the box is the source of truth
+        # and can hold fractional values (e.g. the 0.5 default).
+        #   semitones 1 2 3 4 5  <->  pitch_tolerance 1 2 3 4 5
+        self._TOL_PER_SEMITONE = 1.0
         self._SEMITONE_MIN = 1
         self._SEMITONE_MAX = 5
-        self._DEFAULT_SEMITONES = 2  # -> 0.5 tolerance
+        self._DEFAULT_SEMITONES = 0.5  # -> 0.5 tolerance (matches Config.pitch_tolerance)
         self._TIMING_SLIDER_MIN = 1    # hundredths of a second, i.e. 0.01s
         self._TIMING_SLIDER_MAX = 100  # 1.00s
         self._DEFAULT_TIMING = 0.25

@@ -31,12 +31,15 @@ class Recording:
         # algorithms!!
         from algorithms.PitchDetector import PitchDetector
         from algorithms.PitchSmoother import PitchSmoother
-        from algorithms.NoteDetector import NoteDetector
+        from algorithms.NoteDetector import NoteDetector, TransitionDetector
+        from app_logic.user.ds.OnsetData import OnsetDetector, OnsetData
         from algorithms.MistakeDetector import MistakeDetector
         from algorithms.MistakeChecker import MistakeChecker
+
         self.pitch_detector = PitchDetector(recording=self)
         self.pitch_smoother = PitchSmoother(recording=self)
         self.note_detector = NoteDetector(recording=self)
+        self.transition_detector = TransitionDetector(recording=self)
         self.mistake_detector = MistakeDetector(recording=self)
         self.mistake_checker = MistakeChecker(recording=self)
 
@@ -44,8 +47,8 @@ class Recording:
         self.audio_data = AudioData(config=self.config)
         self.pitch_data = PitchData(config=self.config)
         self.note_data = NoteData()
-        self.onset_data = None
-        self.onset_detector = None
+        self.onset_data = OnsetData(config=self.config)
+        self.onset_detector = OnsetDetector(recording=self)
         self.alignment: Alignment = Alignment(config=self.config) # filled in later
         self.overridden_mistake_indices = set()
 
@@ -66,8 +69,6 @@ class Recording:
         else:
             self.config = config
 
-        self.sync_min_note_length_from_score()
-            
         if hasattr(self, 'pitch_detector'):
             self.pitch_detector.load_config(self.config)
         if hasattr(self, 'pitch_smoother'):
@@ -171,17 +172,7 @@ class Recording:
         self.alignment = Alignment(config=self.config)
         self.overridden_mistake_indices = set()
 
-    def sync_min_note_length_from_score(self) -> float:
-        """Refresh Config.min_note_length from the active score/clip NoteData."""
-        if not hasattr(self, "config") or self.config is None:
-            return 0.0
-        try:
-            note_data = self.score_data.clipped_note_data(channel=self.active_instrument)
-        except (AttributeError, KeyError, TypeError):
-            return self.config.min_note_length
-        return self.config.set_min_note_length_from_notedata(note_data)
-
-    def detect_pitches(self, on_phase=None):
+    def detect_pitches(self, on_phase=None, verbose: bool = False):
         """run pitch detection, then smoothing, on the current audio data.
         `on_phase(text)`, if given, is called at the start of each stage so a
         caller can surface progress (e.g. a status-bar message)."""
@@ -190,19 +181,23 @@ class Recording:
         try:
             self.pitch_data.data = self.pitch_detector.detect_pitches(
                 audio,
-                show_progress=False,
+                show_progress=verbose,
+                verbose=verbose,
             )
         finally:
             stop_status()
 
-        stop_status = self._phase_status_timer(on_phase, "Smoothing pitches")
-        try:
-            self.pitch_data.data = self.pitch_smoother.smooth(
-                self.pitch_data.data,
-                verbose=False,
-            )
-        finally:
-            stop_status()
+        # pYIN emits candidate distributions that need the HMM stage; trackers
+        # like Praat can opt out when they already return a final f0 track.
+        if getattr(self.pitch_detector, "requires_smoothing", True):
+            stop_status = self._phase_status_timer(on_phase, "Smoothing pitches")
+            try:
+                self.pitch_data.data = self.pitch_smoother.smooth(
+                    self.pitch_data.data,
+                    verbose=verbose,
+                )
+            finally:
+                stop_status()
         # the offline pass stamps frame times relative to buffer index 0, which
         # represents app-time `t_origin` (NEGATIVE for a Perform runway recorded
         # before the head). Mirror the audio buffer's origin onto the pitch data
@@ -241,26 +236,46 @@ class Recording:
 
         return stop
 
+    def update_min_note_length(self):
+        """Sync Config to the resized score so the detector's frame thresholds track tempo."""
+        notes = self.score_data.clipped_note_data(channel=self.active_instrument)
+        self.config.set_min_note_length(
+            notes.get_min_note_length(default=self.config.get_min_note_length(), clean=True)
+        )
+
     def detect_notes(self):
         """Run PELT note detection on the current pitch data."""
-        self.note_data = self.note_detector.detect_notes(self.pitch_data, refine_with_onsets=True)
+        self.transition_detector.detect_transitions(self.pitch_data.data)
+        # resize to the stable pitch span so score-derived note-length heuristics
+        # use a tempo close to the take before PELT runs.
+        self.resize_score(to_span="pitch", include_transitions=False)
+        self.update_min_note_length()
+        self.onset_data = self.onset_detector.detect()
+        # self.transition_detector.detect_transitions(self.pitch_data.data)
+        nd = self.note_detector.detect_notes(self.pitch_data.data)
+        self.note_data = self.note_detector.refine_with_onsets(nd, self.onset_data.times)
+        # resize the score to the take's voiced NOTE span in case
+        # some voiced noise got through cracks
+        self.resize_score(to_span="onset")
 
-    def detect_transitions(self):
-        """Flag high-slope pitch-transition frames before PELT note detection."""
-        self.note_detector.detect_transitions(self.pitch_data)
 
-    def recompute_note_pitches(self):
+    def recompute_note_pitches(self, verbose: bool = False):
         """Re-median detected notes over non-transition frames."""
-        self.note_detector.recompute_note_pitches(self.note_data, self.pitch_data)
+        self.note_detector.recompute_note_pitches(
+            self.note_data,
+            self.pitch_data,
+            verbose=verbose,
+        )
 
-    def prune_transition_notes(self):
+    def prune_transition_notes(self, verbose: bool = False):
         """Drop detected notes that are mostly transition frames."""
         self.note_data = self.note_detector.prune_transition_notes(
             self.note_data,
             self.pitch_data,
+            verbose=verbose,
         )
 
-    def detect_mistakes(self, onset_aware: bool = False):
+    def detect_mistakes(self, onset_aware: bool = False, verbose: bool = False):
         # The MistakeDetector only ever sees the clip's score notes (the full
         # NoteData when unclipped) — see ScoreData.clipped_note_data.
         # onset_aware swaps in the time-anchored aligner (A/B against pitch-only).
@@ -274,12 +289,16 @@ class Recording:
         notes, mistakes = detect(
             user_string=user_notes,
             midi_string=midi_notes,
+            verbose=verbose,
         )
         self.alignment.load_alignment(notes, pitch_mistakes=mistakes)
         self.alignment.reapply_overrides(self.overridden_mistake_indices)
 
-    def correct_mistakes(self):
-        nd, alignment = self.mistake_checker.check_mistakes(recording=self)
+    def correct_mistakes(self, verbose: bool = False):
+        nd, alignment = self.mistake_checker.check_mistakes(
+            recording=self,
+            verbose=verbose,
+        )
         self.note_data = nd
         self.alignment = alignment
         self.reindex_mistakes()
@@ -433,14 +452,12 @@ class Recording:
         # no-ops, and + take_anchor_time then anchors the span onto the take.
         sd.transpose_notes(sd.transpose_offset - score_bounds[0] + take_anchor_time)
 
-        self.sync_min_note_length_from_score()
         self._update_pitch_distances()
         return True
 
     def change_tempo(self, new_bpm: float):
         """Change the tempo of the recording by changing the BPM of the score data, which will automatically update the note timings and pitch distances."""
         self.score_data.change_tempo(new_bpm)
-        self.sync_min_note_length_from_score()
         self._update_pitch_distances()
 
     def _update_pitch_distances(self):
@@ -450,14 +467,14 @@ class Recording:
                 continue
             pitches = self.pitch_data.read(start_time=note.start_time, end_time=note.end_time, clean=True)
             for p in pitches:
-                p.distance = note.midi_num[0] - p.candidates[0][0]
+                p.live_distance = note.midi_num[0] - p.value
 
-    # default align_distance for voiced pitches that no aligned note covers
+    # default aligned_distance for voiced pitches that no aligned note covers
     # (transitions / slides between notes): 0.0 => green. Don't penalize them.
     TRANSITION_DISTANCE = 0.0
 
     def update_alignment_distances(self):
-        """Recompute every pitch's `align_distance` from the current pitch-mistake
+        """Recompute every pitch's `aligned_distance` from the current pitch-mistake
         alignment (call after analyze()/detect_mistakes()) with the following coloring:
           - deletion: nothing to color, skipped
           - insertion: all pitches -> inf (red)
@@ -466,7 +483,7 @@ class Recording:
         # reset first so stale post-analysis colors never linger
         for p in self.pitch_data.data:
             if p is not None:
-                p.align_distance = None
+                p.aligned_distance = None
 
         for pair_index, (user_note, midi_note) in enumerate(self.alignment.pairs):
             if user_note is None:
@@ -482,23 +499,23 @@ class Recording:
                 # overridden mistake: the user dismissed it, so force its pitches
                 # to distance 0 => green, regardless of the underlying mismatch.
                 for p in pitches:
-                    p.align_distance = 0.0
+                    p.aligned_distance = 0.0
             elif midi_note is None:
                 # insertion: a note that isn't in the score at all -> all red
                 for p in pitches:
-                    p.align_distance = float('inf')
+                    p.aligned_distance = float('inf')
             else:
                 target = midi_note.midi_num[0]
                 for p in pitches:
-                    p.align_distance = target - p.candidates[0][0]
+                    p.aligned_distance = target - p.value
 
         # any remaining voiced (drawable) pitch no note covered: color green by
         # default instead of falling back to live coloring -- but skip high-slope
         # transition frames, which stay None (grey) so slides aren't penalized.
         for p in self.pitch_data.data:
-            if (p is not None and p.align_distance is None and p.candidates
+            if (p is not None and p.aligned_distance is None and p.value != -1
                     and not p.is_transition):
-                p.align_distance = self.TRANSITION_DISTANCE
+                p.aligned_distance = self.TRANSITION_DISTANCE
     
     def toggle_mistake_override(self, mistake_index: int):
         # error checking

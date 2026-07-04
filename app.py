@@ -1045,8 +1045,6 @@ class Attune(QMainWindow):
             self._save_recording_cache(self.active_recording, recording_name=self.active_recording_name)
         else:
             sd.change_tempo(new_bpm)
-            if self._practice_active():
-                self.practice_tab.recording.sync_min_note_length_from_score()
         self._active_tab().guitar_hero.update_view_items()
         self.sync_slider() # re-range the shared slider for the active tab
 

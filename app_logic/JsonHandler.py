@@ -442,11 +442,10 @@ class JsonHandler:
             elif isinstance(default_value, int):
                 value = int(round(value))
             kwargs[k] = value
-        if kwargs.get("note_detection_pelt_jump") == 5:
-            # jump=5 was a transient app-side regression: it quantizes PELT
-            # boundaries enough to create short transition notes in existing
-            # sidecars. This is not a user-facing setting, so migrate it back.
-            kwargs["note_detection_pelt_jump"] = defaults.note_detection_pelt_jump
+        # note_detection_pelt_jump was renamed to Config.h2 (default 1). Old
+        # sidecars that stored the pre-rename key (including the jump=5 regression
+        # that quantized PELT into short transition notes) fall through the `valid`
+        # filter above, so h2 defaults back to 1 for them.
         return Config(**kwargs)
 
     def _pitch_data_to_payload(self, recording: Recording) -> dict:
@@ -476,32 +475,65 @@ class JsonHandler:
             return None
         return [
             self._pack_number(pitch.time),
-            [[self._pack_number(m), self._pack_number(prob)] for m, prob in pitch.candidates],
+            [[self._pack_number(m), self._pack_number(prob)] for m, prob in pitch.candidate_pitches],
             self._pack_number(pitch.volume),
             self._pack_number(pitch.unvoiced_prob),
-            self._pack_number(pitch.distance),
-            self._pack_number(pitch.align_distance),
+            self._pack_number(pitch.live_distance),
+            self._pack_number(pitch.aligned_distance),
             pitch.is_transition,
+            self._pack_number(pitch.value),
         ]
 
     def _pitch_from_payload(self, recording: Recording, payload) -> Pitch | None:
         if payload is None:
             return None
+        if isinstance(payload, Pitch):
+            return payload.ensure_compatible(recording.config)
+        if isinstance(payload, dict):
+            raw_candidates = (
+                payload.get("candidate_pitches")
+                or payload.get("candidates")
+                or []
+            )
+            candidates = [
+                (self._unpack_number(c[0], default=0.0), self._unpack_number(c[1], default=0.0))
+                for c in raw_candidates
+            ]
+            pitch = Pitch(
+                time=self._unpack_number(payload.get("time"), default=0.0),
+                candidates=candidates,
+                value=self._unpack_number(payload.get("value"), default=-1),
+                volume=self._unpack_number(payload.get("volume"), default=0.0),
+                unvoiced_prob=self._unpack_number(payload.get("unvoiced_prob"), default=1.0),
+                live_distance=self._unpack_number(
+                    payload.get("live_distance", payload.get("distance")),
+                    default=None,
+                ),
+                config=recording.config,
+            )
+            pitch.aligned_distance = self._unpack_number(
+                payload.get("aligned_distance", payload.get("align_distance")),
+                default=None,
+            )
+            pitch.is_transition = payload.get("is_transition")
+            return pitch.ensure_compatible(recording.config)
+
         candidates = [
             (self._unpack_number(c[0], default=0.0), self._unpack_number(c[1], default=0.0))
-            for c in payload[1]
+            for c in (payload[1] if len(payload) > 1 else [])
         ]
         pitch = Pitch(
             time=self._unpack_number(payload[0], default=0.0),
             candidates=candidates,
             volume=self._unpack_number(payload[2], default=0.0),
             unvoiced_prob=self._unpack_number(payload[3], default=1.0),
-            distance=self._unpack_number(payload[4], default=None),
+            live_distance=self._unpack_number(payload[4] if len(payload) > 4 else None, default=None),
+            value=self._unpack_number(payload[7] if len(payload) > 7 else None, default=-1),
             config=recording.config,
         )
-        pitch.align_distance = self._unpack_number(payload[5], default=None)
+        pitch.aligned_distance = self._unpack_number(payload[5] if len(payload) > 5 else None, default=None)
         pitch.is_transition = payload[6] if len(payload) > 6 else None
-        return pitch
+        return pitch.ensure_compatible(recording.config)
 
     def _note_data_to_payload(self, note_data: NoteData) -> list:
         return [self._note_to_payload(note_data.data[t]) for t in note_data.times]

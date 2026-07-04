@@ -184,17 +184,7 @@ class MistakeBenchmarker(NoteBenchmarker):
             }
         else:
             recording.reset_analysis()
-            self.prepare_for_note_detection(
-                recording,
-                resize_score_to_pitch=True,
-                detect_transitions=True,
-            )
-            _, note_compute_time = self.detect_notes_timed(
-                recording,
-                method="pelt",
-                model="l2",
-                do_transitions=False,
-            )
+            _, note_compute_time = self.detect_recording_notes_timed(recording)
             self._trim_boundary_notes(recording.note_data, performance_notes)
             note_timing = {"note_compute_time": note_compute_time}
             self.save_note_data(
@@ -203,7 +193,7 @@ class MistakeBenchmarker(NoteBenchmarker):
                 metadata={
                     **note_timing,
                     "model": "l2",
-                    "method": "pelt",
+                    "method": "recording.detect_notes",
                     "trimmed_boundaries": True,
                     "trim_reference": "generated_performance_midi",
                 },
@@ -290,23 +280,14 @@ class MistakeBenchmarker(NoteBenchmarker):
         onset_aware: bool = True,
     ) -> dict[str, float]:
         recording.reset_analysis()
-        self.prepare_for_note_detection(
-            recording,
-            resize_score_to_pitch=True,
-            detect_transitions=True,
-        )
         if note_cache_path is not None and Path(note_cache_path).exists():
-            # Reuse cached PELT-L2 notes. The boundary trim below is idempotent,
+            # Reuse cached production notes. The boundary trim below is idempotent,
             # so both old raw caches and new trimmed mistake-db caches are safe.
             recording.note_data, metadata = self.load_note_data(note_cache_path)
             note_compute_time = float(metadata.get("note_compute_time", 0.0))
         else:
-            _, note_compute_time = self.detect_notes_timed(
-                recording,
-                method=method,
-                model=model,
-                do_transitions=False,
-            )
+            del method, model
+            _, note_compute_time = self.detect_recording_notes_timed(recording)
             if trim_reference is not None:
                 # same boundary trim as the note benchmark: clamp the first/last
                 # detected notes to the synthesized MIDI's true durations (synth
@@ -319,8 +300,8 @@ class MistakeBenchmarker(NoteBenchmarker):
                     note_cache_path,
                     metadata={
                         "note_compute_time": note_compute_time,
-                        "model": model,
-                        "method": method,
+                        "model": "l2",
+                        "method": "recording.detect_notes",
                         "trimmed_boundaries": trim_reference is not None,
                     },
                 )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import lzma
+import os
 import pickle
 import shutil
 import subprocess
@@ -15,6 +17,11 @@ import mir_eval
 import numpy as np
 import numpy.typing as npt
 import pretty_midi
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback, not expected on macOS
+    fcntl = None
 
 def _bootstrap_repo_root() -> Path:
     for candidate in Path(__file__).resolve().parents:
@@ -32,7 +39,13 @@ from benchmarks.paths import REPO_ROOT, ensure_repo_on_path  # noqa: E402
 ensure_repo_on_path()
 ROOT = REPO_ROOT
 
-from algorithms.Config import Config  # noqa: E402
+from algorithms.Config import (  # noqa: E402
+    Config,
+    PYIN_DEFAULT_MIN_VOLUME,
+    PYIN_DEFAULT_MAX_VOLUME,
+    PYIN_DEFAULT_UNV_THRESH,
+    PYIN_PRAAT_MIRROR_UNV_THRESH,
+)
 from app_logic.midi.ScoreData import ScoreData  # noqa: E402
 from app_logic.NoteData import NoteData  # noqa: E402
 from app_logic.user.ds.AudioData import AudioData  # noqa: E402
@@ -44,7 +57,9 @@ PitchMetricRow: TypeAlias = dict[str, float | bool | str]
 
 SF_PATH: Path = ROOT / "resources" / "MuseScore_General.sf3"
 SR: int = 44100
-PITCH_CACHE_VERSION: int = 1
+PITCH_CACHE_VERSION: int = 5
+PITCH_RAW_STAGE = "raw"
+PITCH_SMOOTHED_STAGE = "smoothed"
 PITCH_COMPUTE_COL = "Compute Time (s)"
 PITCH_REALTIME_COL = "Audio(s)/Compute(s)"
 PITCH_AUDIO_SECONDS_COL = "Audio Length (s)"
@@ -91,6 +106,9 @@ class PitchBenchmarker:
         self.MISTAKE_DIR = self.DATASETS / "mistake-db"
         self.SOUNDFONT_PATH = SF_PATH
         self.RESULTS.mkdir(parents=True, exist_ok=True)
+        self.algorithm_verbose = False
+        self.use_cache = True
+        self.config_overrides: dict[str, Any] = {}
 
         self.DEFAULT_CONFIG = Config(
             sr=44100,
@@ -99,8 +117,13 @@ class PitchBenchmarker:
             fmin=196.0,
             fmax=3000.0,
             tuning=440.0,
-            unv_thresh=0.9,
+            unv_thresh=PYIN_DEFAULT_UNV_THRESH,
+            min_volume=PYIN_DEFAULT_MIN_VOLUME,
+            max_volume=PYIN_DEFAULT_MAX_VOLUME,
             pitch_thresh=0.5,
+            # PELT jump: 5 in the benchmark for parity with the other note-detection
+            # methods (the app keeps Config's default of 1).
+            h2=5,
             ins_cost=5,
             del_cost=5,
             pitch_tolerance=1,
@@ -108,11 +131,15 @@ class PitchBenchmarker:
         )
 
     def config_for(self, fmin: float, fmax: float, **overrides: Any) -> Config:
+        all_overrides = {
+            **self.config_overrides,
+            **overrides,
+            "fmin": float(fmin),
+            "fmax": float(fmax),
+        }
         return replace(
             self.DEFAULT_CONFIG,
-            fmin=float(fmin),
-            fmax=float(fmax),
-            **overrides,
+            **all_overrides,
         )
 
     @staticmethod
@@ -309,18 +336,23 @@ class PitchBenchmarker:
         score_notes: NoteData | None = None,
         score_data: ScoreData | None = None,
     ) -> Recording:
+        from algorithms.PitchDetector import PitchDetector
+        from algorithms.PitchSmoother import PitchSmoother
+
         if score_data is not None:
             rec = Recording(score_data=score_data, config=config)
-            rec.sync_min_note_length_from_score()
+            rec.pitch_detector = PitchDetector(recording=rec)
+            rec.pitch_smoother = PitchSmoother(recording=rec)
             return rec
 
         rec = Recording(config=config)
+        rec.pitch_detector = PitchDetector(recording=rec)
+        rec.pitch_smoother = PitchSmoother(recording=rec)
         if score_notes is not None:
             rec.score_data.note_datas = {0: score_notes}
             rec.score_data.active_instrument = 0
             rec.score_data.clip = None
             rec.active_instrument = 0
-            rec.sync_min_note_length_from_score()
         return rec
 
     def pitch_cache_path(self, corpus_dir: PathLike, track_id: str) -> Path:
@@ -338,15 +370,17 @@ class PitchBenchmarker:
     def _pitch_to_payload(pitch: Pitch | None) -> dict[str, Any] | None:
         if pitch is None:
             return None
+        pitch.ensure_compatible()
         return {
             "time": float(pitch.time),
+            "value": float(pitch.value),
             "candidates": [
-                (float(midi), float(prob)) for midi, prob in pitch.candidates
+                (float(midi), float(prob)) for midi, prob in pitch.candidate_pitches
             ],
             "volume": float(pitch.volume),
             "unvoiced_prob": float(pitch.unvoiced_prob),
-            "distance": float(getattr(pitch, "distance", 0.0) or 0.0),
-            "align_distance": getattr(pitch, "align_distance", None),
+            "distance": float(getattr(pitch, "live_distance", 0.0) or 0.0),
+            "align_distance": getattr(pitch, "aligned_distance", None),
             "is_transition": getattr(pitch, "is_transition", None),
         }
 
@@ -354,104 +388,327 @@ class PitchBenchmarker:
     def _pitch_from_payload(payload: dict[str, Any] | None, config: Config) -> Pitch | None:
         if payload is None:
             return None
+        if isinstance(payload, Pitch):
+            return payload.ensure_compatible(config)
+        if not isinstance(payload, dict):
+            raw_candidates = payload[1] if len(payload) > 1 else []
+            pitch = Pitch(
+                time=float(payload[0]) if len(payload) > 0 else 0.0,
+                candidates=[(float(midi), float(prob)) for midi, prob in raw_candidates],
+                value=float(payload[7]) if len(payload) > 7 and payload[7] is not None else -1,
+                volume=float(payload[2]) if len(payload) > 2 else 0.0,
+                unvoiced_prob=float(payload[3]) if len(payload) > 3 else 1.0,
+                live_distance=(None if len(payload) <= 4 or payload[4] is None else float(payload[4])),
+                config=config,
+            )
+            pitch.aligned_distance = None if len(payload) <= 5 else payload[5]
+            pitch.is_transition = None if len(payload) <= 6 else payload[6]
+            return pitch.ensure_compatible(config)
+
+        raw_candidates = (
+            payload.get("candidate_pitches")
+            or payload.get("candidates")
+            or []
+        )
+        raw_value = payload.get("value", -1.0)
         pitch = Pitch(
             time=float(payload["time"]),
-            candidates=[(float(midi), float(prob)) for midi, prob in payload["candidates"]],
+            candidates=[(float(midi), float(prob)) for midi, prob in raw_candidates],
+            value=-1 if raw_value is None else float(raw_value),
             volume=float(payload["volume"]),
             unvoiced_prob=float(payload["unvoiced_prob"]),
-            distance=float(payload.get("distance", 0.0) or 0.0),
+            live_distance=payload.get("live_distance", payload.get("distance")),
             config=config,
         )
-        pitch.align_distance = payload.get("align_distance")
+        pitch.aligned_distance = payload.get(
+            "aligned_distance",
+            payload.get("align_distance"),
+        )
         pitch.is_transition = payload.get("is_transition")
-        return pitch
+        return pitch.ensure_compatible(config)
 
-    def save_pitch_data(
-        self, pitch_data: PitchData, cache_path: PathLike, metadata: dict[str, Any]=None,
-    ) -> Path:
-        cache_path = Path(cache_path)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": PITCH_CACHE_VERSION,
-            "metadata": metadata or {},
+    @staticmethod
+    def _pitch_stage(smooth: bool) -> str:
+        return PITCH_SMOOTHED_STAGE if smooth else PITCH_RAW_STAGE
+
+    @staticmethod
+    def _timing_defaults(
+        timing: dict[str, Any],
+        smooth: bool,
+        raw_timing: dict[str, Any] | None = None,
+    ) -> dict[str, float]:
+        detector_time = float(timing.get("pitch_detector_compute_time", 0.0) or 0.0)
+        if smooth and raw_timing:
+            raw_detector_time = float(
+                raw_timing.get("pitch_detector_compute_time", 0.0) or 0.0
+            )
+            if raw_detector_time > 0:
+                detector_time = raw_detector_time
+
+        smoother_time = float(timing.get("pitch_smoother_compute_time", 0.0) or 0.0)
+        component_compute = detector_time + smoother_time if smooth else detector_time
+        stored_compute = float(timing.get("pitch_compute_time", 0.0) or 0.0)
+        compute_time = component_compute if component_compute > 0 else stored_compute
+        return {
+            "pitch_detector_compute_time": detector_time,
+            "pitch_smoother_compute_time": smoother_time if smooth else 0.0,
+            "pitch_compute_time": compute_time,
+        }
+
+    @contextlib.contextmanager
+    def _pitch_cache_lock(self, cache_path: Path):
+        lock_path = cache_path.with_name(f"{cache_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a", encoding="utf-8") as lock_fh:
+            if fcntl is not None:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+    def _pitch_data_to_stage_payload(self, pitch_data: PitchData) -> dict[str, Any]:
+        return {
             "t_origin": float(pitch_data.t_origin),
             "pitches": [self._pitch_to_payload(p) for p in pitch_data.data],
         }
-        with lzma.open(cache_path, "wb") as fh:
-            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _stage_payload_to_pitch_data(
+        self,
+        payload: dict[str, Any],
+        config: Config,
+    ) -> PitchData:
+        pitch_data = PitchData(config=config)
+        pitch_data.t_origin = float(payload.get("t_origin", 0.0))
+        pitch_data.data = [
+            self._pitch_from_payload(p, config) for p in payload.get("pitches", [])
+        ]
+        return pitch_data
+
+    @staticmethod
+    def _load_pitch_cache_payload(cache_path: PathLike) -> dict[str, Any]:
+        with lzma.open(cache_path, "rb") as fh:
+            return pickle.load(fh)
+
+    @staticmethod
+    def _normalise_pitch_cache_payload(
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        version = payload.get("version")
+        if version == 1:
+            return (
+                {
+                    PITCH_SMOOTHED_STAGE: {
+                        "t_origin": float(payload.get("t_origin", 0.0)),
+                        "pitches": payload.get("pitches", []),
+                    },
+                },
+                {PITCH_SMOOTHED_STAGE: dict(payload.get("metadata") or {})},
+            )
+        if version != PITCH_CACHE_VERSION:
+            raise ValueError(f"Unsupported pitch cache version: {version}")
+
+        raw_stages = payload.get("stages") or {}
+        raw_metadata = payload.get("metadata") or {}
+        stages = {
+            str(stage): dict(stage_payload or {})
+            for stage, stage_payload in raw_stages.items()
+        }
+        metadata: dict[str, dict[str, Any]] = {}
+        for stage in stages:
+            stage_metadata = raw_metadata.get(stage, {}) if isinstance(raw_metadata, dict) else {}
+            metadata[stage] = dict(stage_metadata or {})
+        return stages, metadata
+
+    def has_pitch_cache(self, cache_path: PathLike, smooth: bool = True) -> bool:
+        cache_path = Path(cache_path)
+        if not cache_path.exists():
+            return False
+        try:
+            payload = self._load_pitch_cache_payload(cache_path)
+            stages, _ = self._normalise_pitch_cache_payload(payload)
+        except Exception:  # noqa: BLE001 -- corrupt caches should be recomputed
+            return False
+        return self._pitch_stage(smooth) in stages
+
+    def save_pitch_data(
+        self,
+        pitch_data: PitchData,
+        cache_path: PathLike,
+        metadata: dict[str, Any]=None,
+        stage: str = PITCH_SMOOTHED_STAGE,
+    ) -> Path:
+        return self.save_pitch_cache(
+            cache_path,
+            stages={stage: pitch_data},
+            metadata={stage: metadata or {}},
+        )
+
+    def save_pitch_cache(
+        self,
+        cache_path: PathLike,
+        stages: dict[str, PitchData],
+        metadata: dict[str, dict[str, Any]] | None = None,
+    ) -> Path:
+        cache_path = Path(cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = metadata or {}
+
+        with self._pitch_cache_lock(cache_path):
+            merged_stages: dict[str, dict[str, Any]] = {}
+            merged_metadata: dict[str, dict[str, Any]] = {}
+            if cache_path.exists():
+                try:
+                    payload = self._load_pitch_cache_payload(cache_path)
+                    merged_stages, merged_metadata = self._normalise_pitch_cache_payload(payload)
+                except Exception:  # noqa: BLE001 -- replace corrupt/incompatible caches
+                    merged_stages = {}
+                    merged_metadata = {}
+
+            for stage, pitch_data in stages.items():
+                merged_stages[stage] = self._pitch_data_to_stage_payload(pitch_data)
+                merged_metadata[stage] = dict(metadata.get(stage, {}))
+
+            payload = {
+                "version": PITCH_CACHE_VERSION,
+                "metadata": merged_metadata,
+                "stages": merged_stages,
+            }
+            tmp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+            try:
+                with lzma.open(tmp_path, "wb") as fh:
+                    pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+                tmp_path.replace(cache_path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
         return cache_path
 
     def load_pitch_data(
         self,
         cache_path: PathLike,
         config: Config,
+        smooth: bool = True,
     ) -> tuple[PitchData, dict[str, Any]]:
-        with lzma.open(cache_path, "rb") as fh:
-            payload = pickle.load(fh)
-        if payload.get("version") != PITCH_CACHE_VERSION:
-            raise ValueError(f"Unsupported pitch cache version: {payload.get('version')}")
-        pitch_data = PitchData(config=config)
-        pitch_data.t_origin = float(payload.get("t_origin", 0.0))
-        pitch_data.data = [
-            self._pitch_from_payload(p, config) for p in payload.get("pitches", [])
-        ]
-        return pitch_data, dict(payload.get("metadata") or {})
+        payload = self._load_pitch_cache_payload(cache_path)
+        stages, metadata = self._normalise_pitch_cache_payload(payload)
+        stage = self._pitch_stage(smooth)
+        if stage not in stages:
+            raise ValueError(f"Pitch cache does not contain {stage!r} data: {cache_path}")
+        pitch_data = self._stage_payload_to_pitch_data(stages[stage], config)
+        return pitch_data, self._timing_defaults(
+            metadata.get(stage, {}),
+            smooth=smooth,
+            raw_timing=metadata.get(PITCH_RAW_STAGE),
+        )
+
+    def _apply_pitch_origin(self, pitch_data: PitchData, origin: float) -> PitchData:
+        pitch_data.t_origin = origin
+        if origin:
+            for p in pitch_data.data:
+                if p is not None:
+                    p.time += origin
+        return pitch_data
+
+    def detect_pitch_stages(
+        self,
+        rec: Recording,
+        make_smoothed: bool = True,
+        verbose: bool = False,
+    ) -> tuple[dict[str, PitchData], dict[str, dict[str, float]]]:
+        audio = rec.audio_data.read_all()
+
+        detector_start = time.perf_counter()
+        raw_pitches = rec.pitch_detector.detect_pitches(
+            audio,
+            show_progress=verbose,
+            verbose=verbose,
+        )
+        detector_compute_time = time.perf_counter() - detector_start
+        gate_stats = dict(getattr(rec.pitch_detector, "_last_volume_gate_stats", {}) or {})
+
+        origin = rec.audio_data.t_origin
+        smoothed_pitches = None
+        smoother_compute_time = 0.0
+        if make_smoothed:
+            smoother_start = time.perf_counter()
+            smoothed_pitches = rec.pitch_smoother.smooth(raw_pitches, verbose=verbose)
+            smoother_compute_time = time.perf_counter() - smoother_start
+
+        raw_data = PitchData(config=rec.config)
+        raw_data.data = raw_pitches
+        self._apply_pitch_origin(raw_data, origin)
+
+        stages = {PITCH_RAW_STAGE: raw_data}
+        timing = {
+            PITCH_RAW_STAGE: {
+                "pitch_detector_compute_time": detector_compute_time,
+                "pitch_smoother_compute_time": 0.0,
+                "pitch_compute_time": detector_compute_time,
+                **gate_stats,
+            },
+        }
+
+        if smoothed_pitches is not None:
+            smoothed_data = PitchData(config=rec.config)
+            smoothed_data.data = smoothed_pitches
+            self._apply_pitch_origin(smoothed_data, origin)
+            stages[PITCH_SMOOTHED_STAGE] = smoothed_data
+            timing[PITCH_SMOOTHED_STAGE] = {
+                "pitch_detector_compute_time": detector_compute_time,
+                "pitch_smoother_compute_time": smoother_compute_time,
+                "pitch_compute_time": detector_compute_time + smoother_compute_time,
+                **gate_stats,
+            }
+
+        return stages, timing
 
     def detect_pitches(
         self,
         rec: Recording,
         smooth: bool = True,
+        verbose: bool = False,
     ) -> dict[str, float]:
-        audio = rec.audio_data.read_all()
-        rec.pitch_data = PitchData(config=rec.config)
-
-        detector_start = time.perf_counter()
-        rec.pitch_data.data = rec.pitch_detector.detect_pitches(audio)
-        detector_compute_time = time.perf_counter() - detector_start
-
-        smoother_compute_time = 0.0
-        if smooth:
-            smoother_start = time.perf_counter()
-            rec.pitch_data.data = rec.pitch_smoother.smooth(rec.pitch_data.data)
-            smoother_compute_time = time.perf_counter() - smoother_start
-
-        origin = rec.audio_data.t_origin
-        rec.pitch_data.t_origin = origin
-        if origin:
-            for p in rec.pitch_data.data:
-                if p is not None:
-                    p.time += origin
-
-        return {
-            "pitch_detector_compute_time": detector_compute_time,
-            "pitch_smoother_compute_time": smoother_compute_time,
-            "pitch_compute_time": detector_compute_time + smoother_compute_time,
-        }
+        stages, timing = self.detect_pitch_stages(
+            rec,
+            make_smoothed=smooth,
+            verbose=verbose,
+        )
+        stage = self._pitch_stage(smooth)
+        rec.pitch_data = stages[stage]
+        return timing[stage]
 
     def load_or_detect_pitches(
         self,
         rec: Recording,
         cache_path: PathLike,
         smooth: bool = True,
+        use_cache: bool = True,
         write_cache: bool = True,
+        verbose: bool = False,
     ) -> dict[str, float]:
         cache_path = Path(cache_path)
-        if smooth and cache_path.exists():
-            rec.pitch_data, metadata = self.load_pitch_data(cache_path, rec.config)
-            return {
-                "pitch_detector_compute_time": float(
-                    metadata.get("pitch_detector_compute_time", 0.0)
-                ),
-                "pitch_smoother_compute_time": float(
-                    metadata.get("pitch_smoother_compute_time", 0.0)
-                ),
-                "pitch_compute_time": float(metadata.get("pitch_compute_time", 0.0)),
-            }
+        if use_cache and cache_path.exists():
+            try:
+                rec.pitch_data, metadata = self.load_pitch_data(
+                    cache_path,
+                    rec.config,
+                    smooth=smooth,
+                )
+                return metadata
+            except Exception:  # noqa: BLE001 -- missing/corrupt stage gets recomputed
+                pass
 
-        timing = self.detect_pitches(rec, smooth=smooth)
-        if smooth and write_cache:
-            self.save_pitch_data(rec.pitch_data, cache_path, metadata=dict(timing))
-        return timing
+        stages, timing = self.detect_pitch_stages(
+            rec,
+            make_smoothed=smooth,
+            verbose=verbose,
+        )
+        stage = self._pitch_stage(smooth)
+        rec.pitch_data = stages[stage]
+        if write_cache:
+            self.save_pitch_cache(cache_path, stages=stages, metadata=timing)
+        return timing[stage]
 
     @staticmethod
     def pitchdata_to_melody(
@@ -463,8 +720,8 @@ class PitchBenchmarker:
             if p is None:
                 continue
             times.append(p.time)
-            voiced = p.candidates and p.unvoiced_prob < config.unv_thresh
-            freqs.append(config.midi_to_freq(p.candidates[0][0]) if voiced else 0.0)
+            voiced = p.value != -1 and p.unvoiced_prob < config.unv_thresh
+            freqs.append(config.midi_to_freq(p.value) if voiced else 0.0)
         return np.asarray(times, dtype=float), np.asarray(freqs, dtype=float)
 
     def iter_tracks(self, dataset: str) -> Iterator[tuple[str, Path, Path]]:
@@ -512,7 +769,9 @@ class PitchBenchmarker:
             rec,
             cache_path=cache_path,
             smooth=smooth,
-            write_cache=smooth,
+            use_cache=getattr(self, "use_cache", True),
+            write_cache=True,
+            verbose=self.algorithm_verbose,
         )
         est_times, est_freqs = self.pitchdata_to_melody(rec.pitch_data, cfg)
         metrics = {

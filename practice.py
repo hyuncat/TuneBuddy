@@ -319,11 +319,11 @@ class PracticeTab(QWidget):
 
         p = self.recording.pitch_data.read_pitch(t)
         unv_thresh = self.recording.pitch_data.UNVOICED_THRESHOLD
-        if p is None or not p.candidates or p.unvoiced_prob >= unv_thresh:
+        if p is None or not p.candidate_pitches or p.unvoiced_prob >= unv_thresh:
             self.status_bar.update_status(f"Waiting for note: {m:.1f}…")
             return False
 
-        u = p.candidates[0][0]
+        u = p.value
         # NaN/inf guard: abs(nan - m) <= tol is False anyway, but be explicit so a
         # garbage candidate can never be read as "on pitch".
         if not np.isfinite(u):
@@ -427,7 +427,6 @@ class PracticeTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
-        self.recording.sync_min_note_length_from_score()
         self.score_viewer.clear_clip_selection()
         self.slider.update_range(score_data=self.score_data, recording=self.recording)
         if seek and self.score_data.is_clipped():
@@ -442,7 +441,6 @@ class PracticeTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
-        self.recording.sync_min_note_length_from_score()
         self._refresh_clip_focus()
         self.guitar_hero.update_view_items()
 

@@ -6,10 +6,8 @@ Each method writes raw per-track CSVs under
 ``benchmarks/results/pitch/raw_outputs/<method>/`` and the final comparison table
 to ``benchmarks/results/pitch/pitch_benchmarks.csv``.
 
-The work is partitioned by model-aware chunks: heavy neural competitors keep all
-selected tracks in one worker by default so the model is loaded once, while
-lightweight/CPU-bound methods such as pYIN and Praat are split across workers.
-Use ``--tracks-per-task`` to override that partitioning.
+The work is partitioned into model-aware chunks sized to keep the configured
+worker pool busy. Use ``--tracks-per-task`` to override that partitioning.
 """
 from __future__ import annotations
 
@@ -32,12 +30,9 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import argparse
 import math
-import multiprocessing
 import sys
 import time
 import traceback
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any
 
@@ -68,25 +63,45 @@ from benchmarks.modules.pitch.CompetitorPitchBenchmarker import (  # noqa: E402
     make_tracker,
 )
 from benchmarks.modules.pitch.PitchBenchmarker import (  # noqa: E402
+    PITCH_AUDIO_SECONDS_COL,
     PITCH_COMPUTE_COL,
+    PITCH_RAW_STAGE,
     PITCH_REALTIME_COL,
+    PITCH_SMOOTHED_STAGE,
+    PYIN_DEFAULT_MIN_VOLUME,
+    PYIN_DEFAULT_MAX_VOLUME,
+    PYIN_DEFAULT_UNV_THRESH,
+    PYIN_PRAAT_MIRROR_UNV_THRESH,
     PitchBenchmarker,
 )
-
-TrackItem = tuple[str, str, str, str]  # dataset, track_id, wav_path, annot_path
-WorkChunk = tuple[str, tuple[TrackItem, ...]]  # model, tracks
-
-HEAVY_MODEL_LOADS = {"swiftf0", "crepe", "torchcrepe", "penn", "spice", "rmvpe"}
+from benchmarks.modules.runner import (  # noqa: E402
+    TrackItem,
+    WorkChunk,
+    fmt_dur,
+    parse_shard,
+    process_chunks,
+)
 
 
 def make_benchmarker(kind: str, opts: dict[str, Any] | None = None):
     opts = opts or {}
     if kind == "coco":
-        return CompetitorCocoBenchmarker(
+        bench = CompetitorCocoBenchmarker(
             root=opts.get("root"),
             f0_fps=float(opts.get("f0_fps", F0_FPS_DEFAULT)),
         )
-    return CompetitorPitchBenchmarker()
+    else:
+        bench = CompetitorPitchBenchmarker()
+    if opts.get("pyin_unv_thresh") is not None:
+        bench.config_overrides["unv_thresh"] = float(opts["pyin_unv_thresh"])
+    if opts.get("pyin_volume_gate_ratio") is not None:
+        bench.config_overrides["min_volume"] = float(opts["pyin_volume_gate_ratio"])
+    if opts.get("pyin_volume_gate_percentile") is not None:
+        # CLI percentile is 0-100; Config.max_volume stores it as a fraction.
+        bench.config_overrides["max_volume"] = float(
+            opts["pyin_volume_gate_percentile"]
+        ) / 100.0
+    return bench
 
 
 def list_work(
@@ -103,13 +118,17 @@ def list_work(
         or opts.get("ensembles")
         or opts.get("max_tracks") is not None
         or opts.get("per_stratum") is not None
+        or opts.get("materialize")
     ):
         for ds in datasets:
             records = pb.select_records(
                 split=ds,
                 per_stratum=opts.get("per_stratum"),
                 seed=int(opts.get("seed", 0)),
-                max_tracks=opts.get("max_tracks"),
+                # Cap after records_to_tracks() below so --max-tracks means
+                # runnable materialized stems, not manifest rows that may be
+                # skipped because their WAVs are not local.
+                max_tracks=opts.get("max_tracks") if opts.get("materialize") else None,
                 ensembles=opts.get("ensembles"),
                 instruments=opts.get("instruments"),
                 rebuild_manifest=False,
@@ -130,7 +149,7 @@ def list_work(
     if kind != "coco" and opts.get("instruments"):
         wanted = [str(name).lower() for name in opts["instruments"]]
         work = [item for item in work if any(name in item[1].lower() for name in wanted)]
-    if kind != "coco" and opts.get("max_tracks") is not None:
+    if opts.get("max_tracks") is not None:
         work = work[: int(opts["max_tracks"])]
     if shard is not None:
         i, n = shard
@@ -143,7 +162,7 @@ def is_cached_for_model(bench: Any, model: str, item: TrackItem, no_cache: bool)
         return False
     wav = item[2]
     if model in PYIN_MODELS:
-        return bool(PYIN_MODELS[model] and bench.cache_path_for_wav(wav).exists())
+        return bench.has_pitch_cache(bench.cache_path_for_wav(wav), smooth=PYIN_MODELS[model])
     previous = getattr(bench, "model_name", "pyin")
     bench.model_name = model
     try:
@@ -157,8 +176,6 @@ def chunk_size_for(model: str, track_count: int, workers: int, tracks_per_task: 
         return 1
     if tracks_per_task > 0:
         return tracks_per_task
-    if model in HEAVY_MODEL_LOADS:
-        return track_count
     return max(1, math.ceil(track_count / max(1, workers)))
 
 
@@ -170,14 +187,24 @@ def build_chunks(
     kind: str,
     opts: dict[str, Any],
     skip_cached: bool,
+    cache_only: bool = False,
 ) -> tuple[list[WorkChunk], dict[str, dict[str, int]]]:
     cache_bench = make_benchmarker(kind, opts)
     chunks: list[WorkChunk] = []
     counts: dict[str, dict[str, int]] = {}
+    progress_index = 1
+
+    # In cache-only mode we never run detection, so the caches are what we can
+    # actually score: select only the cached tracks (missing ones are reported
+    # as skipped afterwards) and ignore --no-cache when probing.
+    cache_probe_no_cache = opts["no_cache"] and not cache_only
 
     for model in models:
-        cached = [item for item in tracks if is_cached_for_model(cache_bench, model, item, opts["no_cache"])]
-        selected = [item for item in tracks if item not in cached] if skip_cached else list(tracks)
+        cached = [item for item in tracks if is_cached_for_model(cache_bench, model, item, cache_probe_no_cache)]
+        if cache_only:
+            selected = list(cached)
+        else:
+            selected = [item for item in tracks if item not in cached] if skip_cached else list(tracks)
         counts[model] = {
             "total": len(tracks),
             "cached": len(cached),
@@ -185,9 +212,10 @@ def build_chunks(
         }
         size = chunk_size_for(model, len(selected), workers, tracks_per_task)
         for start in range(0, len(selected), size):
-            chunks.append((model, tuple(selected[start : start + size])))
+            chunks.append((model, progress_index + start, tuple(selected[start : start + size])))
+        progress_index += len(selected)
 
-    chunks.sort(key=lambda c: (c[0], c[1][0][0] if c[1] else "", c[1][0][1] if c[1] else ""))
+    chunks.sort(key=lambda c: (c[0], c[2][0][0] if c[2] else "", c[2][0][1] if c[2] else ""))
     return chunks, counts
 
 
@@ -196,16 +224,36 @@ def run_chunk(
     kind: str,
     opts: dict[str, Any],
     verbose: bool,
+    progress_queue: Any | None = None,
+    progress_total: int = 0,
 ) -> tuple[str, str, list[dict[str, Any]], list[tuple[str, str, str, str]], float, str | None]:
-    model, items = chunk
+    model, first_progress_index, items = chunk
     started = time.perf_counter()
     rows: list[dict[str, Any]] = []
     errors: list[tuple[str, str, str, str]] = []
+
+    def progress(event: str, index: int, dataset: str, track_id: str, ok: bool | None = None) -> None:
+        if progress_queue is None:
+            return
+        try:
+            progress_queue.put({
+                "event": event,
+                "pid": os.getpid(),
+                "index": index,
+                "total": progress_total,
+                "model": model,
+                "dataset": dataset,
+                "track_id": track_id,
+                "ok": ok,
+            })
+        except (BrokenPipeError, EOFError, OSError):
+            return
 
     try:
         bench = make_benchmarker(kind, opts)
         bench.model_name = model
         bench.use_cache = not opts["no_cache"]
+        bench.algorithm_verbose = bool(opts.get("algorithm_verbose", False))
         bench.tracker = make_tracker(model, **opts)
         if bench.tracker is not None:
             bench.tracker.ensure_available()
@@ -216,23 +264,36 @@ def run_chunk(
         return ("err", model, rows, [(model, "", "", tb)], time.perf_counter() - started, None)
 
     for i, (dataset, track_id, wav, annot) in enumerate(items, start=1):
+        progress_index = first_progress_index + i - 1
+        progress("start", progress_index, dataset, track_id)
         try:
-            row = bench.bench_pitch_track(wav, annot)
-            row["track_id"] = track_id
-            row["dataset"] = dataset
-            row["model"] = model
-            rows.append(row)
-            if verbose:
-                rtf = row.get("realtime_factor", float("nan"))
+            if model == "pyin_smoothed" and opts.get("emit_pyin_from_smoothed", False):
+                track_rows = bench_pyin_family_rows(bench, wav, annot)
+            else:
+                row = bench.bench_pitch_track(wav, annot)
+                row["model"] = model
+                track_rows = [row]
+
+            for row in track_rows:
+                row["track_id"] = track_id
+                row["dataset"] = dataset
+                rows.append(row)
+            progress("done", progress_index, dataset, track_id, ok=True)
+            if verbose and progress_queue is None:
+                primary = next((r for r in track_rows if r.get("model") == model), track_rows[-1])
+                rtf = primary.get("realtime_factor", float("nan"))
                 print(
                     f"[{model}] {i:>4}/{len(items)} {dataset:18s} {track_id[:36]:36s} "
-                    f"RPA={row['Raw Pitch Accuracy']:.3f} OA={row['Overall Accuracy']:.3f} "
-                    f"{rtf:.0f}xRT",
+                    f"RPA={primary['Raw Pitch Accuracy']:.3f} OA={primary['Overall Accuracy']:.3f} "
+                    f"{rtf:.0f}xRT"
+                    + (" (+pyin)" if len(track_rows) > 1 else ""),
                     flush=True,
                 )
         except MissingDependency as exc:
+            progress("done", progress_index, dataset, track_id, ok=False)
             return ("skip", model, rows, errors, time.perf_counter() - started, str(exc))
         except Exception as exc:  # noqa: BLE001 -- isolate bad tracks
+            progress("done", progress_index, dataset, track_id, ok=False)
             tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             errors.append((model, dataset, track_id, tb))
             print(f"[{model}] {dataset} / {track_id} ERROR: {exc!r}", file=sys.stderr, flush=True)
@@ -240,223 +301,163 @@ def run_chunk(
     return ("ok", model, rows, errors, time.perf_counter() - started, None)
 
 
-def fmt_dur(seconds: float) -> str:
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}h{m:02d}m{s:02d}s" if h else f"{m:d}m{s:02d}s"
-
-
-def parse_shard(text: str | None) -> tuple[int, int] | None:
-    if text is None:
-        return None
-    i, n = (int(x) for x in text.split("/"))
-    if not (0 <= i < n):
-        raise argparse.ArgumentTypeError(f"shard index {i} out of range for {n} shards")
-    return i, n
-
-
-def _force_teardown(ex: ProcessPoolExecutor) -> None:
-    ex.shutdown(wait=False, cancel_futures=True)
-    for child in multiprocessing.active_children():
-        child.terminate()
-    for child in multiprocessing.active_children():
-        child.join(timeout=10)
-        if child.is_alive():
-            child.kill()
-
-
-def process_chunks(
-    chunks: list[WorkChunk],
-    workers: int,
-    batch_size: int,
-    watchdog: float,
-    max_attempts: int,
-    kind: str,
-    opts: dict[str, Any],
-    verbose: bool,
-) -> tuple[list[dict[str, Any]], list[tuple[str, str, str, str]], dict[str, str]]:
-    rows: list[dict[str, Any]] = []
-    errors: list[tuple[str, str, str, str]] = []
-    skipped: dict[str, str] = {}
-    attempts: dict[str, int] = {}
-    queue = list(chunks)
-    total_tracks = sum(len(items) for _, items in chunks)
-    completed_tracks = 0
-    started = time.perf_counter()
-
-    def chunk_key(chunk: WorkChunk) -> str:
-        model, items = chunk
-        if not items:
-            return f"{model}:empty"
-        return f"{model}:{items[0][0]}:{items[0][1]}:{items[-1][0]}:{items[-1][1]}:{len(items)}"
-
-    def log(tag: str, model: str, n: int, dur: float, extra: str = "") -> None:
-        nonlocal completed_tracks
-        completed_tracks += n
-        elapsed = time.perf_counter() - started
-        rate = completed_tracks / elapsed if elapsed else 0.0
-        eta = (total_tracks - completed_tracks) / rate if rate else 0.0
-        print(
-            f"[{completed_tracks:>4}/{total_tracks}] {tag:7s} {model:14s} "
-            f"{n:>4} track(s) in {fmt_dur(dur)} {extra}"
-            f"| elapsed {fmt_dur(elapsed)} eta {fmt_dur(eta)}",
-            flush=True,
-        )
-
-    while queue:
-        batch, queue = queue[:batch_size], queue[batch_size:]
-        runnable: list[WorkChunk] = []
-        for chunk in batch:
-            key = chunk_key(chunk)
-            attempts[key] = attempts.get(key, 0) + 1
-            if attempts[key] > max_attempts:
-                model, items = chunk
-                tb = f"gave up after {max_attempts} attempts (kept hanging/failing)"
-                for dataset, track_id, *_ in items:
-                    errors.append((model, dataset, track_id, tb))
-                log("GIVEUP", model, len(items), 0.0)
-            else:
-                runnable.append(chunk)
-        if not runnable:
-            continue
-
-        ex = ProcessPoolExecutor(max_workers=workers)
-        futs = {ex.submit(run_chunk, chunk, kind, opts, verbose): chunk for chunk in runnable}
-        try:
-            pending = set(futs)
-            while pending:
-                done_set, pending = wait(pending, timeout=watchdog, return_when=FIRST_COMPLETED)
-                if not done_set:
-                    stuck = [futs[fut] for fut in pending]
-                    print(
-                        f"\n!! watchdog: no chunk finished in {fmt_dur(watchdog)} -- "
-                        f"re-queueing {len(stuck)} in-flight chunk(s).",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    for model, items in stuck:
-                        first = items[0][1] if items else "empty"
-                        print(f"   stuck: {model} / {first} ({len(items)} tracks)", file=sys.stderr, flush=True)
-                    queue.extend(stuck)
-                    break
-
-                broke = False
-                for fut in done_set:
-                    chunk = futs[fut]
-                    model, items = chunk
-                    try:
-                        status, result_model, chunk_rows, chunk_errors, dur, skip_msg = fut.result()
-                    except BrokenProcessPool:
-                        broke = True
-                        break
-
-                    if status == "skip":
-                        rows.extend(chunk_rows)
-                        errors.extend(chunk_errors)
-                        skipped[result_model] = skip_msg or "dependency unavailable"
-                        log("SKIP", result_model, len(items), dur)
-                        print(f"[{result_model}] SKIPPED -- {skipped[result_model]}", flush=True)
-                        continue
-
-                    rows.extend(chunk_rows)
-                    errors.extend(chunk_errors)
-                    if status == "ok":
-                        log("OK", model, len(chunk_rows) + len(chunk_errors), dur)
-                    else:
-                        log("ERR", model, len(items), dur)
-                        for _, _, _, tb in chunk_errors:
-                            print(tb.rstrip(), file=sys.stderr, flush=True)
-
-                if broke:
-                    stuck = [chunk, *[futs[fut] for fut in pending]]
-                    print(
-                        f"\n!! pool broke (a worker died) -- re-queueing {len(stuck)} unfinished chunk(s).",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    queue.extend(stuck)
-                    break
-        finally:
-            _force_teardown(ex)
-
-    return rows, errors, skipped
-
-
-def rebuild_from_caches(
-    models: list[str],
-    tracks: list[TrackItem],
-    kind: str,
-    opts: dict[str, Any],
-    verbose: bool,
-) -> tuple[list[dict[str, Any]], list[tuple[str, str, str, str]], dict[str, str]]:
-    """Re-score cached pitch estimates and write rows without running inference."""
-    rows: list[dict[str, Any]] = []
-    errors: list[tuple[str, str, str, str]] = []
-    skipped: dict[str, str] = {}
-
-    cache_opts = dict(opts)
-    cache_opts["no_cache"] = False
-
-    for model in models:
-        if model == "pyin":
-            skipped[model] = (
-                "pyin stage-1 output is not persisted; only pyin_smoothed "
-                "PitchData and third-party competitor estimates can be rebuilt from cache."
-            )
-            print(f"[{model}] SKIPPED -- {skipped[model]}", flush=True)
-            continue
-
-        bench = make_benchmarker(kind, cache_opts)
-        bench.model_name = model
-        bench.use_cache = True
-        bench.tracker = make_tracker(model, **cache_opts)
-
-        missing = 0
-        produced = 0
-        for dataset, track_id, wav, annot in tracks:
-            if not is_cached_for_model(bench, model, (dataset, track_id, wav, annot), no_cache=False):
-                missing += 1
-                continue
-            try:
-                row = (
-                    score_cached_pyin_smoothed(bench, wav, annot)
-                    if model == "pyin_smoothed"
-                    else bench.bench_pitch_track(wav, annot)
-                )
-                row["track_id"] = track_id
-                row["dataset"] = dataset
-                row["model"] = model
-                rows.append(row)
-                produced += 1
-                if verbose:
-                    print(
-                        f"[{model}] cache {produced:>4} {dataset:18s} {track_id[:36]:36s} "
-                        f"RPA={row['Raw Pitch Accuracy']:.3f} OA={row['Overall Accuracy']:.3f}",
-                        flush=True,
-                    )
-            except Exception as exc:  # noqa: BLE001 -- report corrupt/incompatible caches
-                tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                errors.append((model, dataset, track_id, tb))
-                print(f"[{model}] {dataset} / {track_id} CACHE ERROR: {exc!r}", file=sys.stderr, flush=True)
-
-        if missing:
-            skipped[model] = f"{missing}/{len(tracks)} selected track(s) did not have a cache"
-        print(
-            f"[{model}] rebuilt {produced}/{len(tracks)} cached row(s)"
-            + (f"; missing {missing}" if missing else ""),
-            flush=True,
-        )
-
-    return rows, errors, skipped
-
-
-def score_cached_pyin_smoothed(
+def bench_pyin_family_rows(
     bench: Any,
     wav_path: str,
     annot_path: str,
+) -> list[dict[str, Any]]:
+    """Run one fresh pYIN detector pass and score both raw and smoothed stages."""
+    import mir_eval
+
+    from app_logic.user.ds.AudioData import AudioData
+
+    ref_times, ref_freqs, fmin, fmax = bench._load_ref(
+        wav_path,
+        annot_path,
+        True,
+        196.0,
+        3000.0,
+    )
+    cfg = bench.config_for(fmin, fmax)
+    rec = bench.recording_for(cfg)
+    if hasattr(bench, "load_resampled_audio"):
+        rec.audio_data = bench.load_resampled_audio(wav_path, cfg.sr)
+    else:
+        rec.audio_data = AudioData(audio_filepath=str(wav_path), config=rec.config)
+
+    stages, timing = bench.detect_pitch_stages(
+        rec,
+        make_smoothed=True,
+        verbose=getattr(bench, "algorithm_verbose", False),
+    )
+    bench.save_pitch_cache(bench.cache_path_for_wav(wav_path), stages=stages, metadata=timing)
+
+    secs = bench._audio_seconds(wav_path)
+    meta = bench._row_meta(wav_path)
+    rows: list[dict[str, Any]] = []
+    for row_model, stage in (
+        ("pyin", PITCH_RAW_STAGE),
+        ("pyin_smoothed", PITCH_SMOOTHED_STAGE),
+    ):
+        if stage not in stages:
+            continue
+        est_times, est_freqs = bench.pitchdata_to_melody(stages[stage], cfg)
+        metrics = {
+            k: float(v)
+            for k, v in mir_eval.melody.evaluate(
+                ref_times,
+                ref_freqs,
+                est_times,
+                est_freqs,
+            ).items()
+        }
+        compute_time = float(timing[stage]["pitch_compute_time"])
+        row = {
+            **metrics,
+            **timing[stage],
+            "from_cache": False,
+            "fmin": float(fmin),
+            "fmax": float(fmax),
+            "model": row_model,
+            "audio_seconds": secs,
+            "realtime_factor": (secs / compute_time) if (compute_time > 0 and secs) else float("nan"),
+        }
+        row.update(meta)
+        rows.append(row)
+    return rows
+
+
+
+def run_cache_chunk(
+    chunk: WorkChunk,
+    kind: str,
+    opts: dict[str, Any],
+    verbose: bool,
+    progress_queue: Any | None = None,
+    progress_total: int = 0,
+) -> tuple[str, str, list[dict[str, Any]], list[tuple[str, str, str, str]], float, str | None]:
+    """Parallel worker for --cache-only: re-score cached estimates, no inference.
+
+    Mirrors ``run_chunk``'s contract so it can be driven by ``process_chunks``.
+    Chunks are pre-filtered to cached tracks in ``build_chunks``, but each track
+    is re-checked here to stay safe against races/corruption."""
+    model, first_progress_index, items = chunk
+    started = time.perf_counter()
+    rows: list[dict[str, Any]] = []
+    errors: list[tuple[str, str, str, str]] = []
+
+    def progress(event: str, index: int, dataset: str, track_id: str, ok: bool | None = None) -> None:
+        if progress_queue is None:
+            return
+        try:
+            progress_queue.put({
+                "event": event,
+                "pid": os.getpid(),
+                "index": index,
+                "total": progress_total,
+                "model": model,
+                "dataset": dataset,
+                "track_id": track_id,
+                "ok": ok,
+            })
+        except (BrokenPipeError, EOFError, OSError):
+            return
+
+    cache_opts = dict(opts)
+    cache_opts["no_cache"] = False
+    try:
+        bench = make_benchmarker(kind, cache_opts)
+        bench.model_name = model
+        bench.use_cache = True
+        bench.algorithm_verbose = bool(opts.get("algorithm_verbose", False))
+        bench.tracker = make_tracker(model, **cache_opts)
+        if bench.tracker is not None:
+            bench.tracker.ensure_available()
+    except MissingDependency as exc:
+        return ("skip", model, rows, errors, time.perf_counter() - started, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        return ("err", model, rows, [(model, "", "", tb)], time.perf_counter() - started, None)
+
+    for i, (dataset, track_id, wav, annot) in enumerate(items, start=1):
+        progress_index = first_progress_index + i - 1
+        progress("start", progress_index, dataset, track_id)
+        if not is_cached_for_model(bench, model, (dataset, track_id, wav, annot), no_cache=False):
+            progress("done", progress_index, dataset, track_id, ok=False)
+            continue
+        try:
+            row = (
+                score_cached_pyin(bench, wav, annot, smooth=PYIN_MODELS[model])
+                if model in PYIN_MODELS
+                else bench.bench_pitch_track(wav, annot)
+            )
+            row["track_id"] = track_id
+            row["dataset"] = dataset
+            row["model"] = model
+            rows.append(row)
+            progress("done", progress_index, dataset, track_id, ok=True)
+            if verbose and progress_queue is None:
+                print(
+                    f"[{model}] cache {i:>4}/{len(items)} {dataset:18s} {track_id[:36]:36s} "
+                    f"RPA={row['Raw Pitch Accuracy']:.3f} OA={row['Overall Accuracy']:.3f}",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 -- isolate corrupt/incompatible caches
+            progress("done", progress_index, dataset, track_id, ok=False)
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            errors.append((model, dataset, track_id, tb))
+            print(f"[{model}] {dataset} / {track_id} CACHE ERROR: {exc!r}", file=sys.stderr, flush=True)
+
+    return ("ok", model, rows, errors, time.perf_counter() - started, None)
+
+
+def score_cached_pyin(
+    bench: Any,
+    wav_path: str,
+    annot_path: str,
+    smooth: bool,
 ) -> dict[str, Any]:
-    """Score cached smoothed Attune PitchData without constructing Recording."""
+    """Score cached Attune PitchData without constructing Recording."""
     import mir_eval
 
     ref_times, ref_freqs, fmin, fmax = bench._load_ref(
@@ -468,7 +469,7 @@ def score_cached_pyin_smoothed(
     )
     cfg = bench.config_for(fmin, fmax)
     cache_path = bench.cache_path_for_wav(wav_path)
-    pitch_data, metadata = bench.load_pitch_data(cache_path, cfg)
+    pitch_data, metadata = bench.load_pitch_data(cache_path, cfg, smooth=smooth)
     est_times, est_freqs = bench.pitchdata_to_melody(pitch_data, cfg)
     metrics = {
         k: float(v)
@@ -489,7 +490,7 @@ def score_cached_pyin_smoothed(
         "from_cache": True,
         "fmin": float(fmin),
         "fmax": float(fmax),
-        "model": "pyin_smoothed",
+        "model": "pyin_smoothed" if smooth else "pyin",
         "audio_seconds": secs,
         "realtime_factor": (secs / compute_time) if (compute_time > 0 and secs) else float("nan"),
     }
@@ -516,20 +517,73 @@ def write_summary(pb: PitchBenchmarker, rows: list[dict[str, Any]], model_order:
     import pandas as pd
 
     full = pb.display_pitch_columns(pd.DataFrame(rows))
-    cols = [*PitchBenchmarker.PITCH_METRICS, PITCH_COMPUTE_COL, PITCH_REALTIME_COL]
-    table = full.groupby("model")[[c for c in cols if c in full.columns]].mean(numeric_only=True)
-    table.insert(0, "Tracks", full.groupby("model").size())
+    metric_cols = [c for c in PitchBenchmarker.PITCH_METRICS if c in full.columns]
+    grouped = full.groupby("model", sort=False)
+    table = grouped[metric_cols].mean(numeric_only=True)
+    table.insert(0, "Tracks", grouped.size())
+    if {PITCH_AUDIO_SECONDS_COL, PITCH_COMPUTE_COL}.issubset(full.columns):
+        totals = grouped[[PITCH_AUDIO_SECONDS_COL, PITCH_COMPUTE_COL]].sum(numeric_only=True)
+        table[PITCH_REALTIME_COL] = (
+            totals[PITCH_AUDIO_SECONDS_COL] / totals[PITCH_COMPUTE_COL]
+        ).where(totals[PITCH_COMPUTE_COL] > 0)
+    elif PITCH_REALTIME_COL in full.columns:
+        table[PITCH_REALTIME_COL] = grouped[PITCH_REALTIME_COL].mean(numeric_only=True)
     table = table.reindex([m for m in model_order if m in table.index] + [m for m in table.index if m not in model_order])
     table.index.name = "model"
 
-    print(f"\n{'=' * 72}\npitch_benchmarks.csv (mean over tracks)\n{'=' * 72}")
+    print(
+        f"\n{'=' * 72}\n"
+        "pitch_benchmarks.csv update (metric means; throughput=sum audio/sum compute)\n"
+        f"{'=' * 72}"
+    )
     with pd.option_context("display.float_format", lambda v: f"{v:.4f}", "display.width", 200):
         print(table.to_string())
 
     out = pb.pitch_summary_csv_path
     out.parent.mkdir(parents=True, exist_ok=True)
-    table.to_csv(out)
-    print(f"\nwrote summary -> {out}")
+    updated_models = [str(model) for model in table.index]
+    preserved_count = 0
+    if out.exists():
+        existing = pd.read_csv(out)
+        if "model" in existing.columns:
+            existing = existing.set_index("model")
+        elif len(existing.columns) > 0:
+            existing = existing.rename(columns={existing.columns[0]: "model"}).set_index("model")
+        else:
+            existing = pd.DataFrame()
+        existing.index = existing.index.astype(str)
+        existing = existing[~existing.index.duplicated(keep="last")]
+        existing.index.name = "model"
+
+        merged = existing.copy()
+        for col in table.columns:
+            if col not in merged.columns:
+                merged[col] = pd.NA
+        preferred_columns = list(table.columns) + [
+            col for col in merged.columns if col not in table.columns
+        ]
+        merged = merged.reindex(columns=preferred_columns)
+        for model, row in table.iterrows():
+            if model not in merged.index:
+                merged.loc[model, :] = pd.NA
+            merged.loc[model, table.columns] = row.to_numpy()
+        preserved_count = len([idx for idx in merged.index if idx not in table.index])
+    else:
+        merged = table
+
+    merged.index.name = "model"
+    merged.to_csv(out)
+    print(
+        f"\nwrote summary -> {out} "
+        f"(updated rows: {', '.join(updated_models)}; preserved {preserved_count})"
+    )
+
+
+def summary_model_order(models: list[str], opts: dict[str, Any]) -> list[str]:
+    order = list(models)
+    if opts.get("emit_pyin_from_smoothed") and "pyin_smoothed" in order and "pyin" not in order:
+        order.insert(order.index("pyin_smoothed"), "pyin")
+    return order
 
 
 def parse_args() -> argparse.Namespace:
@@ -540,8 +594,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--workers",
         type=int,
-        default=max(1, (os.cpu_count() or 4) - 4),
-        help="process pool size (default: cores - 4; BLAS/OpenMP threads are capped to 1 per worker)",
+        default=max(1, os.cpu_count() or 4),
+        help="process pool size (default: all logical CPUs; BLAS/OpenMP threads are capped to 1 per worker)",
     )
     p.add_argument(
         "--benchmarker",
@@ -608,7 +662,7 @@ def parse_args() -> argparse.Namespace:
         "--watchdog",
         type=float,
         default=1200.0,
-        help="seconds with NO chunk finishing before in-flight chunks are treated as stuck (default 1200)",
+        help="seconds with no track/chunk progress before in-flight chunks are treated as stuck (default 1200)",
     )
     p.add_argument(
         "--max-attempts",
@@ -621,15 +675,67 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip model/track pairs with an existing cache; skipped pairs are left out of CSVs",
     )
-    p.add_argument("--no-cache", action="store_true", help="ignore + rewrite competitor estimate caches")
+    p.add_argument("--no-cache", action="store_true", help="ignore + rewrite pitch estimate caches")
     p.add_argument("--confidence", type=float, default=None, help="override per-model voicing threshold")
+    p.add_argument(
+        "--pyin-unv-thresh",
+        type=float,
+        default=None,
+        help=(
+            "override Attune pYIN unvoiced-probability threshold; lower is "
+            f"stricter. Default is {PYIN_DEFAULT_UNV_THRESH:.2f}; Praat's "
+            f"voicing_threshold=0.45 corresponds to {PYIN_PRAAT_MIRROR_UNV_THRESH:.2f} here."
+        ),
+    )
+    p.add_argument(
+        "--mirror-praat-voicing",
+        action="store_true",
+        help=(
+            "set --pyin-unv-thresh to 0.55, the pYIN analogue to Praat's "
+            "voicing_threshold=0.45; stricter than the default 0.90"
+        ),
+    )
+    p.add_argument(
+        "--pyin-volume-gate-ratio",
+        type=float,
+        default=None,
+        help=(
+            "relative RMS gate for pYIN before per-frame normalization; "
+            "frames below ratio * percentile(frame-RMS) are forced unvoiced. "
+            f"Default is {PYIN_DEFAULT_MIN_VOLUME:.2f}; "
+            "use 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--pyin-volume-gate-percentile",
+        type=float,
+        default=None,
+        help=(
+            "frame-RMS percentile used as the pYIN volume-gate reference "
+            f"(default {PYIN_DEFAULT_MAX_VOLUME * 100:.1f}; use 100 for the old max-frame gate)"
+        ),
+    )
     p.add_argument("--step", type=float, default=0.01, dest="step_seconds", help="frame hop seconds (default 0.01)")
     p.add_argument("--crepe-capacity", default="full", choices=["tiny", "small", "medium", "large", "full"])
     p.add_argument("--rmvpe-checkpoint", default=None, help="path to rmvpe.pt")
     p.add_argument("--rmvpe-module", default=None, help="dotted module exposing class RMVPE")
     p.add_argument("--root", default=None, help="CocoChorales dataset root override")
     p.add_argument("--f0-fps", type=float, default=F0_FPS_DEFAULT, help="CocoChorales f0 frame rate")
-    p.add_argument("--quiet-tracks", action="store_true", help="suppress per-track worker progress lines")
+    p.add_argument(
+        "--quiet-tracks",
+        action="store_true",
+        help="suppress legacy per-track worker lines; live progress remains enabled unless --no-progress is set",
+    )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable live per-track progress lines",
+    )
+    p.add_argument(
+        "--algorithm-verbose",
+        action="store_true",
+        help="let pitch/note/mistake algorithms print their own verbose diagnostics inside workers",
+    )
     p.add_argument(
         "--cache-only",
         action="store_true",
@@ -651,10 +757,27 @@ def main() -> int:
     unknown = [model for model in models if model not in ALL_MODELS]
     if unknown:
         raise SystemExit(f"unknown models: {unknown}; choices: {ALL_MODELS}")
+    pyin_unv_thresh = (
+        PYIN_PRAAT_MIRROR_UNV_THRESH
+        if args.mirror_praat_voicing and args.pyin_unv_thresh is None
+        else args.pyin_unv_thresh
+    )
+    pyin_volume_gate_ratio = args.pyin_volume_gate_ratio
+    pyin_volume_gate_percentile = args.pyin_volume_gate_percentile
+    emit_pyin_from_smoothed = (
+        args.no_cache
+        and not args.cache_only
+        and "pyin_smoothed" in models
+        and "pyin" not in models
+    )
 
     opts: dict[str, Any] = {
         "no_cache": args.no_cache,
+        "emit_pyin_from_smoothed": emit_pyin_from_smoothed,
         "confidence": args.confidence,
+        "pyin_unv_thresh": pyin_unv_thresh,
+        "pyin_volume_gate_ratio": pyin_volume_gate_ratio,
+        "pyin_volume_gate_percentile": pyin_volume_gate_percentile,
         "step_seconds": args.step_seconds,
         "crepe_capacity": args.crepe_capacity,
         "rmvpe_checkpoint": args.rmvpe_checkpoint,
@@ -668,6 +791,7 @@ def main() -> int:
         "seed": args.seed,
         "materialize": args.materialize and not args.dry_run,
         "force_materialize": args.force_materialize,
+        "algorithm_verbose": args.algorithm_verbose,
     }
 
     tracks = list_work(args.datasets, args.shard, kind=args.benchmarker, opts=opts)
@@ -679,6 +803,7 @@ def main() -> int:
         kind=args.benchmarker,
         opts=opts,
         skip_cached=args.skip_cached,
+        cache_only=args.cache_only,
     )
 
     total_model_tracks = len(models) * len(tracks)
@@ -689,6 +814,34 @@ def main() -> int:
     print(f"benchmarker: {args.benchmarker}")
     print(f"datasets:   {', '.join(args.datasets)}")
     print(f"models:     {', '.join(models)}")
+    if emit_pyin_from_smoothed:
+        print("companions: pyin rows scored from the same pyin_smoothed detector pass")
+    if any(model in PYIN_MODELS for model in models):
+        effective_pyin_unv = (
+            pyin_unv_thresh
+            if pyin_unv_thresh is not None
+            else PYIN_DEFAULT_UNV_THRESH
+        )
+        source = "override" if pyin_unv_thresh is not None else "default"
+        print(f"pYIN unv:   {effective_pyin_unv:.3f} ({source})")
+        effective_gate = (
+            pyin_volume_gate_ratio
+            if pyin_volume_gate_ratio is not None
+            else PYIN_DEFAULT_MIN_VOLUME
+        )
+        gate_source = "override" if pyin_volume_gate_ratio is not None else "default"
+        effective_gate_percentile = (
+            pyin_volume_gate_percentile
+            if pyin_volume_gate_percentile is not None
+            else PYIN_DEFAULT_MAX_VOLUME * 100
+        )
+        percentile_source = (
+            "override" if pyin_volume_gate_percentile is not None else "default"
+        )
+        print(
+            f"pYIN gate:  {effective_gate:.3f} ({gate_source}) "
+            f"* p{effective_gate_percentile:g} RMS ({percentile_source})"
+        )
     if args.instruments:
         print(f"instruments:{' ' * 3}{', '.join(args.instruments)}")
     if args.ensembles:
@@ -702,9 +855,8 @@ def main() -> int:
     print(f"tracks:     {len(tracks)} corpus tracks | {total_model_tracks} model/track pairs")
     print(f"cache:      {total_cached} cached | {total_selected} selected for this run")
     if args.cache_only:
-        print("mode:       cache-only CSV rebuild; no pitch algorithms will run")
-    else:
-        print(f"chunks:     {len(chunks)} total | batch={batch_size} | watchdog={fmt_dur(args.watchdog)}")
+        print("mode:       cache-only CSV rebuild (parallel); no pitch algorithms will run")
+    print(f"chunks:     {len(chunks)} total | batch={batch_size} | watchdog={fmt_dur(args.watchdog)}")
     for model in models:
         c = counts[model]
         print(f"  - {model:14s} {c['cached']:>4}/{c['total']:<4} cached | {c['selected']:>4} selected")
@@ -742,19 +894,35 @@ def main() -> int:
         return 0
 
     if args.cache_only:
+        print(
+            f"\nre-scoring {total_selected} cached model/track pair(s) across "
+            f"{args.workers} worker(s) at {time.strftime('%Y-%m-%d %H:%M:%S')} ...\n",
+            flush=True,
+        )
         started = time.perf_counter()
-        rows, errors, skipped = rebuild_from_caches(
-            models,
-            tracks,
+        rows, errors, skipped = process_chunks(
+            run_cache_chunk,
+            chunks,
+            workers=args.workers,
+            batch_size=batch_size,
+            watchdog=args.watchdog,
+            max_attempts=args.max_attempts,
             kind=args.benchmarker,
             opts=opts,
             verbose=not args.quiet_tracks,
+            progress=not args.no_progress,
         )
         total = time.perf_counter() - started
+        # Tracks whose cache was missing were dropped from the chunks up front;
+        # surface that here so a partial rebuild is obvious.
+        for model in models:
+            missing = counts[model]["total"] - counts[model]["cached"]
+            if missing and model not in skipped:
+                skipped[model] = f"{missing}/{counts[model]['total']} selected track(s) did not have a cache"
         pb = make_benchmarker(args.benchmarker, opts)
         if rows:
             write_raw_outputs(pb, rows, args.benchmarker)
-            write_summary(pb, rows, models)
+            write_summary(pb, rows, summary_model_order(models, opts))
         print(f"\ndone: rebuilt {len(rows)} cached rows, {len(errors)} cache errors in {fmt_dur(total)}")
         if skipped:
             print("skipped/missing caches:")
@@ -773,6 +941,7 @@ def main() -> int:
     )
     started = time.perf_counter()
     rows, errors, skipped = process_chunks(
+        run_chunk,
         chunks,
         workers=args.workers,
         batch_size=batch_size,
@@ -781,13 +950,14 @@ def main() -> int:
         kind=args.benchmarker,
         opts=opts,
         verbose=not args.quiet_tracks,
+        progress=not args.no_progress,
     )
     total = time.perf_counter() - started
 
     pb = make_benchmarker(args.benchmarker, opts)
     if rows:
         write_raw_outputs(pb, rows, args.benchmarker)
-        write_summary(pb, rows, models)
+        write_summary(pb, rows, summary_model_order(models, opts))
 
     print(f"\ndone: {len(rows)} rows, {len(errors)} track errors, {len(skipped)} skipped model(s) in {fmt_dur(total)}")
     if skipped:

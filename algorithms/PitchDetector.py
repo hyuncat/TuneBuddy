@@ -2,6 +2,7 @@ import numpy as np
 from scipy.signal import find_peaks, iirfilter, sosfilt
 from scipy.stats import beta
 import threading
+import time
 from PyQt6.QtCore import QObject, pyqtSignal
 from tqdm import tqdm
 
@@ -49,6 +50,8 @@ class PitchDetector(QObject):
         self.pda_thread: threading.Thread = None
         self.offline_thread: threading.Thread = None  # for detect_pitches_async
         self.stop_event = threading.Event()
+        self._stream_volume_peak = 0.0
+        self._last_volume_gate_stats: dict[str, float | int] = {}
 
         # block variable for stalling buffer
         self.block = False
@@ -66,11 +69,14 @@ class PitchDetector(QObject):
         # rolling window variables (for detect_pitches)
         self.FRAME_SIZE = config.w1
         self.HOP_SIZE = config.h1
+        self._stream_volume_peak = 0.0
+        self._last_volume_gate_stats = {}
 
     def run(self, start_time: float=None):
         """keep trying to detect pitches while we can"""
         self.stop()
         self.stop_event.clear()
+        self._stream_volume_peak = 0.0
         self.recording.a2p_queue.init_start_time(start_time)
         self.pda_thread = threading.Thread(
             target=self._run, daemon=True
@@ -90,7 +96,7 @@ class PitchDetector(QObject):
                 # x, t = x[0], x[1]
                 pitch = self.detect_pitch(x, t)
                 self.recording.write_pitch_data([pitch], t)
-                # print(f'detected pitch @ {pitch.time}, midi_num: {pitch.candidates[0][0]}, unvoiced_prob: {pitch.unvoiced_prob}')
+                # print(f'detected pitch @ {pitch.time}, midi_num: {pitch.candidate_pitches[0][0]}, unvoiced_prob: {pitch.unvoiced_prob}')
                 self.pitch_detected.emit(pitch.time)
 
             except Exception as e:
@@ -133,24 +139,26 @@ class PitchDetector(QObject):
 
         Args:
             x: the array of audio to perform pitch detection on
-            start_time: for when we run on longer audio and keeping track of the frame
+            start_time: median time of frame (in sec)
         """
+        unvoiced_pitch = Pitch(
+            time=start_time, candidates=[],
+            volume=0.0, unvoiced_prob=1.0,
+            live_distance=None, config=self.config
+        )
         # if frame is empty, return unvoiced pitch
         if np.all(x == 0):
-            return Pitch(time=start_time, candidates=[], 
-                         volume=0.0, unvoiced_prob=1.0, 
-                         distance=None, config=self.config)
-        
+            return unvoiced_pitch
+
         # preprocess audio to center and get rid of low frequency noise
         x, volume = self.preprocess_audio(x)
 
-        # constant/silent frame (volume 0): no periodicity to find -> unvoiced.
-        # Guards the downstream divides (normalize, CMNDF range) that would
-        # otherwise emit NaN pitch candidates and crash the smoother's HMM.
-        if volume == 0 or not np.any(x):
-            return Pitch(time=start_time, candidates=[],
-                         volume=0.0, unvoiced_prob=1.0,
-                         distance=None, config=self.config)
+        # VOLUME GATE: if frame quieter than min volume, return unvoiced
+        self._stream_volume_peak = max(self._stream_volume_peak, float(volume))
+        min_volume = self._stream_volume_peak * max(0.0, float(self.config.min_volume))
+        if volume < min_volume or not np.any(x):
+            unvoiced_pitch.volume = volume
+            return unvoiced_pitch
 
         # compute autocorrelation and modify it to avoid 0-lag peak
         acf, _ = self.autocorrelation_fft(x)
@@ -168,32 +176,75 @@ class PitchDetector(QObject):
         # create + return the final pitch object
         candidates = list(zip(midi_estimates, pitch_probs))
         candidates.sort(key=lambda c: c[1], reverse=True) # sort from most to least probable
-        _note = self.recording.score_data.current_note() if self.recording.score_data else None
-        distance = _note.midi_num[0] - candidates[0][0] if _note and candidates else None
-        # print(f"detected pitch @ {start_time:.2f} sec, midi_num: {candidates[0][0]:.2f}, unvoiced_prob: {unvoiced_prob:.2f}, distance to target: {distance:.2f}")
-        pitch = Pitch(time=start_time, candidates=candidates, 
-                      volume=volume, unvoiced_prob=unvoiced_prob, 
-                      distance=distance, config=self.config)
+        score_note = self.recording.score_data.current_note() if self.recording and self.recording.score_data else None
+        distance = score_note.midi_num[0] - candidates[0][0] if score_note and candidates else None
+        
+        pitch = Pitch(time=start_time, candidates=candidates,
+                      volume=volume, unvoiced_prob=unvoiced_prob,
+                      live_distance=distance, config=self.config)
         return pitch
 
 
     def detect_pitches(
         self,
         x: np.ndarray,
-        show_progress: bool = True,
+        show_progress: bool = False,
         progress_desc: str = "Detecting pitches",
+        verbose: bool = False,
     ) -> list[Pitch]:
         """
         Computes multi-frame pitch detection on an arbitrary length array of audio data.
         Returns a nested list of pitches, each corresponding to the freq estimates (probabilistic)
         for each timestep
         """
+        if len(x) < self.FRAME_SIZE:
+            return []
+
         # get memory efficient frames with np pointer c++ magic
         frames = np.lib.stride_tricks.sliding_window_view(x, self.FRAME_SIZE)[::self.HOP_SIZE]
         n_frames = 1 + (len(x) - self.FRAME_SIZE) // self.HOP_SIZE 
+        volumes = self._frame_volumes(x, n_frames)
+        # min_volume is the ratio (fraction of the reference below which a frame is
+        # gated to unvoiced); max_volume is that reference's percentile, stored as a
+        # fraction (0.95 -> the 95th percentile of frame RMS).
+        gate_ratio = max(0.0, float(self.config.min_volume))
+        gate_percentile = np.clip(
+            float(self.config.max_volume) * 100.0,
+            0.0,
+            100.0,
+        )
+        volume_reference = (
+            float(np.percentile(volumes, gate_percentile))
+            if volumes.size and gate_ratio > 0
+            else 0.0
+        )
+        min_volume = volume_reference * gate_ratio
+        silent_frames = int(np.sum(volumes <= 0.0))
+        gated_frames = int(np.sum((volumes > 0.0) & (volumes < min_volume))) if min_volume > 0 else 0
+        self._last_volume_gate_stats = {
+            "pitch_total_frames": int(n_frames),
+            "pitch_silent_frame_count": silent_frames,
+            "pitch_volume_gate_frame_count": gated_frames,
+            "pitch_volume_gate_min_volume": float(min_volume),
+            "pitch_volume_gate_reference": float(volume_reference),
+            "pitch_volume_gate_ratio": float(gate_ratio),
+            "pitch_volume_gate_percentile": float(gate_percentile),
+        }
 
         pitches = []
         frames_iter = enumerate(frames)
+        start = time.perf_counter()
+        if verbose:
+            print(f"[PitchDetector] detecting {n_frames} frame(s)", flush=True)
+            if min_volume > 0:
+                print(
+                    f"[PitchDetector] volume gate: RMS < {min_volume:.6g} "
+                    f"({gate_ratio:.3f} * p{gate_percentile:g} frame RMS "
+                    f"{volume_reference:.6g}) -> unvoiced; "
+                    f"gated {gated_frames}/{n_frames} non-silent frame(s), "
+                    f"{silent_frames} already silent",
+                    flush=True,
+                )
         if show_progress:
             frames_iter = tqdm(
                 frames_iter,
@@ -204,19 +255,39 @@ class PitchDetector(QObject):
             )
 
         for i, frame in frames_iter:
-
-            start_time = (i*self.HOP_SIZE)/self.SR # elapsed time of the frame
+            start_time = (i * self.HOP_SIZE + 0.5 * self.FRAME_SIZE) / self.SR
             pitch = self.detect_pitch(frame, start_time)
             # offline detection has no live playhead, so detect_pitch's per-frame
             # distance (to the score's *current* note at a fixed cursor) is
             # meaningless here. Leave it None so detected-but-unanalyzed pitches
             # render neutral grey until analyze() assigns alignment distances.
-            pitch.distance = None
+            pitch.live_distance = None
             pitches.append(pitch)
 
+        if verbose:
+            print(
+                f"[PitchDetector] done: {len(pitches)} pitch frame(s) in "
+                f"{time.perf_counter() - start:.2f}s",
+                flush=True,
+            )
         return pitches
 
+    def _frame_volumes(self, audio: np.ndarray, n_frames: int) -> np.ndarray:
+        if n_frames <= 0:
+            return np.empty(0, dtype=float)
 
+        audio = np.asarray(audio, dtype=np.float64)
+        starts = np.arange(n_frames, dtype=np.int64) * self.HOP_SIZE
+        ends = starts + self.FRAME_SIZE
+
+        prefix = np.concatenate(([0.0], np.cumsum(audio, dtype=np.float64)))
+        prefix_sq = np.concatenate(([0.0], np.cumsum(audio * audio, dtype=np.float64)))
+
+        sums = prefix[ends] - prefix[starts]
+        sums_sq = prefix_sq[ends] - prefix_sq[starts]
+        mean = sums / self.FRAME_SIZE
+        variance = (sums_sq / self.FRAME_SIZE) - (mean * mean)
+        return np.sqrt(np.maximum(variance, 0.0))
 
     # METHODS TO IMPLEMENT THE ALGORITHM
     # ---

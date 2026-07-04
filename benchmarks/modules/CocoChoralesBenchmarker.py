@@ -600,7 +600,8 @@ class CocoChoralesBenchmarker(PitchBenchmarker):
             rec,
             cache_path=self.cache_path_for_wav(wav_path),
             smooth=smooth,
-            write_cache=smooth,
+            write_cache=True,
+            verbose=self.algorithm_verbose,
         )
         est_times, est_freqs = self.pitchdata_to_melody(rec.pitch_data, cfg)
         metrics = {

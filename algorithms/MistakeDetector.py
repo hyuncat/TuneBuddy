@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+import time
 
 import numpy as np
 
@@ -26,12 +27,28 @@ class _CostModel:
 
 
 class MistakeDetector:
-    def __init__(self, recording: Recording=None, config: Config=None):
+    # --- ONSET-AWARE ALIGNMENT COST MODEL ---
+    # The onset-aware aligner sets its DP costs to the negative log-priors of a
+    # simple generative mistake model (plus Gaussian onset/pitch penalties), so the
+    # substitution-vs-(insertion+deletion) tradeoff is determined by these stats
+    # rather than hand-tuned magic numbers. `MISTAKE_RATE` and the screwup-type
+    # shares default to the PolyTune injector (16 uniform codes: 1 deletion,
+    # 1 substitution, 2 insertion, 12 timing-only) — change MISTAKE_RATE and the
+    # costs follow. See _alignment_priors() / _align_cost_model().
+    MISTAKE_RATE = 0.25
+    SCREWUP_DELETION_SHARE = 1 / 16
+    SCREWUP_SUBSTITUTION_SHARE = 1 / 16
+    SCREWUP_INSERTION_SHARE = 2 / 16
+    ALIGN_ONSET_SIGMA = 0.20   # sec; stdev of a matched/substituted onset
+    ALIGN_PITCH_SIGMA = 2.0    # semitones; stdev of a substitution's pitch
+
+    def __init__(self, recording: Recording=None, config: Config=None, verbose: bool = False):
         if isinstance(recording, Config) and config is None:
             config = recording
             recording = None
         self.recording = recording
         self.config = recording.config if recording else config
+        self.verbose = verbose
 
         # pitch mistake edit costs
         self.INSERTION_COST = self.config.ins_cost
@@ -45,17 +62,27 @@ class MistakeDetector:
         self.DELETION_COST = self.config.del_cost
         self.TOLERANCE = self.config.pitch_tolerance
 
-    def detect_pitch_mistakes(self, user_string: NoteData, midi_string: NoteData):
+    def detect_pitch_mistakes(
+        self,
+        user_string: NoteData,
+        midi_string: NoteData,
+        verbose: bool | None = None,
+    ):
         """Pitch-only Levenshtein alignment of user vs score notes (returns
         alignment pairs + pitch mistakes). The substitution cost depends ONLY on
         pitch distance, so the minimal-edit path ignores WHEN each note was played.
         This is the original aligner and the A/B baseline for
         detect_pitch_mistakes_onset_aware()."""
-        return self._align(user_string, midi_string, onset_aware=False)
+        return self._align(user_string, midi_string, onset_aware=False, verbose=verbose)
 
-    def detect_pitch_mistakes_onset_aware(self, user_string: NoteData, midi_string: NoteData):
+    def detect_pitch_mistakes_onset_aware(
+        self,
+        user_string: NoteData,
+        midi_string: NoteData,
+        verbose: bool | None = None,
+    ):
         """Onset-aware alignment: same DP, but the costs are the negative log-priors
-        of the configured mistake model (Config.alignment_priors) plus Gaussian
+        of the configured mistake model (_alignment_priors) plus Gaussian
         onset/pitch penalties, instead of the pitch-only magic numbers. A match pays
         only its onset penalty; a substitution adds the wrong-note prior plus
         UNBOUNDED quadratic onset and pitch penalties — so a pairing that is far in
@@ -65,14 +92,27 @@ class MistakeDetector:
         equal-pitch candidates a user note pairs with the score note nearest in
         onset) without hand-tuned costs. A/B against detect_pitch_mistakes
         (pitch-only)."""
-        return self._align(user_string, midi_string, onset_aware=True)
+        return self._align(user_string, midi_string, onset_aware=True, verbose=verbose)
+
+    def _alignment_priors(self) -> tuple[float, float, float, float]:
+        """Per-score-note operation priors (p_correct, p_substitution, p_insertion,
+        p_deletion) for the onset-aware aligner, derived from MISTAKE_RATE and the
+        screwup-type shares. Automated: the aligner's DP costs follow whenever these
+        change (a note is 'correct' unless it was deleted or substituted; insertions
+        are extra notes scored against the same per-note budget)."""
+        lam = max(0.0, min(1.0, float(self.MISTAKE_RATE)))
+        p_del = lam * self.SCREWUP_DELETION_SHARE
+        p_sub = lam * self.SCREWUP_SUBSTITUTION_SHARE
+        p_ins = lam * self.SCREWUP_INSERTION_SHARE
+        p_correct = max(1e-6, 1.0 - p_del - p_sub)
+        return p_correct, p_sub, p_ins, p_del
 
     def _align_cost_model(self) -> _CostModel:
         """Derive the onset-aware DP costs as negative log-priors of the configured
         mistake model, anchored so a correct on-time match costs 0. Automated: the
         substitution/insertion/deletion costs come straight from
-        Config.alignment_priors(), so they track mistake_rate without hand-tuning."""
-        p_correct, p_sub, p_ins, p_del = self.config.alignment_priors()
+        _alignment_priors(), so they track MISTAKE_RATE without hand-tuning."""
+        p_correct, p_sub, p_ins, p_del = self._alignment_priors()
         base = -np.log(max(p_correct, 1e-9))
         nll = lambda p: float(-np.log(max(p, 1e-9)) - base)
         return _CostModel(
@@ -80,8 +120,8 @@ class MistakeDetector:
             c_sub=nll(p_sub),
             c_ins=nll(p_ins),
             c_del=nll(p_del),
-            onset_sigma=max(float(self.config.align_onset_sigma), 1e-3),
-            pitch_sigma=max(float(self.config.align_pitch_sigma), 1e-3),
+            onset_sigma=max(float(self.ALIGN_ONSET_SIGMA), 1e-3),
+            pitch_sigma=max(float(self.ALIGN_PITCH_SIGMA), 1e-3),
         )
 
     def _substitution_cost(self, user_note: Note, midi_note: Note, model: _CostModel | None) -> float:
@@ -100,13 +140,22 @@ class MistakeDetector:
             return model.c_match + onset_pen
         return model.c_sub + onset_pen + 0.5 * (d / model.pitch_sigma) ** 2
 
-    def _align(self, user_string: NoteData, midi_string: NoteData, onset_aware: bool):
+    def _align(
+        self,
+        user_string: NoteData,
+        midi_string: NoteData,
+        onset_aware: bool,
+        verbose: bool | None = None,
+    ):
         """Shared edit-distance core for the pitch-only and onset-aware aligners.
         Builds the DP, traces back, and returns (notes, mistakes). Only the
         operation COSTS differ between the two (pitch-only magic numbers vs the
         onset-aware negative-log-prior model); mistake CLASSIFICATION below stays
         pitch-only — onset never invents a pitch mistake, it only steers which notes
         pair up."""
+        if verbose is None:
+            verbose = self.verbose
+        start = time.perf_counter()
         user_notes = list(user_string.data.values())
         user_notes = [n for n in user_notes if n.midi_num[0] != -1]
 
@@ -119,6 +168,12 @@ class MistakeDetector:
         # setup dp matrix
         N = len(midi_string.times)
         M = len(user_notes)
+        if verbose:
+            print(
+                f"[MistakeDetector] aligning {M} user note(s) to {N} score note(s) "
+                f"(onset_aware={onset_aware})",
+                flush=True,
+            )
 
         mat = np.zeros([N+1, M+1], dtype=np.float64)
         backpointer = np.zeros([N+1, M+1], dtype=np.int64)
@@ -201,6 +256,12 @@ class MistakeDetector:
         # print(f"Done! Took {time.time() - start:.2f} seconds")
         for mistake in mistakes:
             mistake.set_pair_index(len(notes) - 1 - mistakes_to_reverse_position[mistake])
+        if verbose:
+            print(
+                f"[MistakeDetector] done: {len(mistakes)} pitch mistake(s), "
+                f"{len(notes)} aligned pair(s) in {time.perf_counter() - start:.2f}s",
+                flush=True,
+            )
         return notes, mistakes
 
     def detect_timing_mistakes(self, alignment: Alignment | None = None) -> list[Mistake]:

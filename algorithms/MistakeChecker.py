@@ -13,6 +13,10 @@ class MistakeChecker:
     two and re-aligns. Returns brand new NoteData / Alignment (never mutates the
     recording's own data)."""
 
+    # shortest-note factor for the split viability check (used to sit on Config as
+    # mistake_checker_min_note_factor; it's checker-internal, so it's a constant).
+    MIN_NOTE_FACTOR = 0.3
+
     def __init__(self, recording: Recording = None, config: Config = None, verbose: bool = False):
         self.recording = recording
         self.config = recording.config if recording else config
@@ -23,22 +27,33 @@ class MistakeChecker:
         """update the config and all relevant parameters"""
         self.config = config
 
-    def check_mistakes(self, recording: Recording=None) -> tuple[NoteData, Alignment]:
+    def check_mistakes(
+        self,
+        recording: Recording=None,
+        verbose: bool | None = None,
+    ) -> tuple[NoteData, Alignment]:
         """Walk the mistakes, gather note edits, apply them, and re-align.
         Returns the new (NoteData, Alignment)."""
         if recording is not None:
             self.recording = recording
+        old_verbose = self.verbose
+        if verbose is not None:
+            self.verbose = verbose
         if not self.recording or not self.recording.alignment:
+            self.verbose = old_verbose
             return None, None
-        self.pd = self.recording.pitch_data
+        try:
+            self.pd = self.recording.pitch_data
 
-        note_data = self.recording.note_data
-        alignment = self.recording.alignment
-        while True:
-            new_nd, new_alignment, n_edits = self._check_mistakes_once(note_data, alignment)
-            if n_edits == 0 or len(new_alignment.pitch_mistakes) >= len(alignment.pitch_mistakes):
-                return note_data, alignment
-            note_data, alignment = new_nd, new_alignment
+            note_data = self.recording.note_data
+            alignment = self.recording.alignment
+            while True:
+                new_nd, new_alignment, n_edits = self._check_mistakes_once(note_data, alignment)
+                if n_edits == 0 or len(new_alignment.pitch_mistakes) >= len(alignment.pitch_mistakes):
+                    return note_data, alignment
+                note_data, alignment = new_nd, new_alignment
+        finally:
+            self.verbose = old_verbose
 
     def _check_mistakes_once(self, note_data: NoteData, alignment: Alignment) -> tuple[NoteData, Alignment, int]:
         """Apply one non-overlapping correction pass to the supplied state."""
@@ -86,7 +101,7 @@ class MistakeChecker:
         new_alignment = self._realign(new_nd)
         return new_nd, new_alignment, len(edits)
 
-    def mistake_correction_loop(self):
+    def mistake_correction_loop(self, verbose: bool | None = None):
         """Repeatedly apply mistake correction until it stops reducing the mistake
         count, leaving the recording on its best-scoring note_data/alignment.
 
@@ -94,28 +109,39 @@ class MistakeChecker:
         this checker's check_mistakes); a pass that doesn't lower the count is
         rolled back, so a regression never sticks. Called from the Perform tab's
         analyze()."""
+        old_verbose = self.verbose
+        if verbose is not None:
+            self.verbose = verbose
         rec = self.recording
         if not rec or not rec.alignment:
-            print("No active recording or alignment to correct mistakes on.")
+            if self.verbose:
+                print("No active recording or alignment to correct mistakes on.")
+            self.verbose = old_verbose
             return
-        n_mistakes = len(rec.alignment.pitch_mistakes)
-        print(f"initial mistakes: {n_mistakes}")
-        while True:
-            # keep the current (best-so-far) state in case this pass regresses
-            prev_nd = rec.note_data
-            prev_alignment = rec.alignment
+        try:
+            n_mistakes = len(rec.alignment.pitch_mistakes)
+            if self.verbose:
+                print(f"initial mistakes: {n_mistakes}")
+            while True:
+                # keep the current (best-so-far) state in case this pass regresses
+                prev_nd = rec.note_data
+                prev_alignment = rec.alignment
 
-            rec.correct_mistakes()
-            new_n_mistakes = len(rec.alignment.pitch_mistakes)
-            print(f" > mistakes after correction: {new_n_mistakes}")
+                rec.correct_mistakes(verbose=self.verbose)
+                new_n_mistakes = len(rec.alignment.pitch_mistakes)
+                if self.verbose:
+                    print(f" > mistakes after correction: {new_n_mistakes}")
 
-            if new_n_mistakes >= n_mistakes:
-                # correction stopped helping -> revert to the better previous state
-                rec.note_data = prev_nd
-                rec.alignment = prev_alignment
-                print("no improvement after correction, breaking loop")
-                break
-            n_mistakes = new_n_mistakes  # made progress -> raise the baseline
+                if new_n_mistakes >= n_mistakes:
+                    # correction stopped helping -> revert to the better previous state
+                    rec.note_data = prev_nd
+                    rec.alignment = prev_alignment
+                    if self.verbose:
+                        print("no improvement after correction, breaking loop")
+                    break
+                n_mistakes = new_n_mistakes  # made progress -> raise the baseline
+        finally:
+            self.verbose = old_verbose
 
     # --- mistake handlers ---------------------------------------------------
     def handle_deletion(self, mistake: Mistake):
@@ -254,13 +280,21 @@ class MistakeChecker:
         pitches = self.pd.read(start_time=note.start_time, end_time=note.end_time, clean=True)
         target = intended.midi_num[0]
         return sum(1 for p in pitches
-                   if p.candidates and abs(p.candidates[0][0] - target) <= self.config.pitch_tolerance)
+                   if p.value != -1 and abs(p.value - target) <= self.config.pitch_tolerance)
 
     def _min_close_frames(self) -> int:
         """Minimum close pitch frames needed to treat a split as viable."""
-        return self.config.min_note_pitch_frames(
-            self.config.mistake_checker_min_note_factor
-        )
+        seconds = getattr(self.config, "min_note_length", Config.DEFAULT_MIN_NOTE_LENGTH)
+        if self.recording is not None:
+            try:
+                note_data = self.recording.score_data.clipped_note_data(
+                    channel=self.recording.active_instrument
+                )
+                seconds = note_data.get_min_note_length(default=float(seconds), clean=True)
+            except (AttributeError, KeyError, TypeError):
+                pass
+        frame_rate = self.config.sr / self.config.h1
+        return max(1, int(np.ceil(max(0.0, float(seconds) * self.MIN_NOTE_FACTOR) * frame_rate)))
 
     def _split_resembles_score(self, split: list, targets: tuple) -> bool:
         """Accept a split only if each half resembles the score note it would
@@ -279,7 +313,7 @@ class MistakeChecker:
         if len(pitches) < 2:  # need >= 2 frames to place a boundary between them
             return None
 
-        midis = np.array([p.candidates[0][0] for p in pitches])
+        midis = np.array([p.value for p in pitches])
         # cost[k] = sum|midi - target_first| over frames < k  +  sum|midi - target_second| over frames >= k
         left_cost = np.concatenate([[0.0], np.cumsum(np.abs(midis - target_first))])
         right_cost = np.concatenate([np.cumsum(np.abs(midis - target_second)[::-1])[::-1], [0.0]])
@@ -314,7 +348,7 @@ class MistakeChecker:
         end_time = max(inserted.end_time, neighbor.end_time)
 
         pitches = self.pd.read(start_time=start_time, end_time=end_time, clean=True)
-        midis = [p.candidates[0][0] for p in pitches]
+        midis = [p.value for p in pitches]
         midi_num = float(np.median(midis)) if midis else neighbor.midi_num[0]
 
         return Note(
@@ -355,8 +389,8 @@ class MistakeChecker:
         if target is not None:
             target_support = [
                 p for p in pitches
-                if p.candidates
-                and abs(p.candidates[0][0] - target) <= self.config.pitch_tolerance
+                if p.value != -1
+                and abs(p.value - target) <= self.config.pitch_tolerance
             ]
 
         medians = self._median_pitches(target_support or pitches)
@@ -368,10 +402,11 @@ class MistakeChecker:
         medians = [-1, -1, -1]
         cols = [[] for _ in medians]
         for p in pitches:
-            if p is None:
+            if p is None or p.value == -1:
                 continue
-            for i in range(min(len(cols), len(p.candidates))):
-                midi = p.candidates[i][0]
+            cols[0].append(p.value)
+            for i in range(1, min(len(cols), len(p.candidate_pitches))):
+                midi = p.candidate_pitches[i][0]
                 if midi != -1:
                     cols[i].append(midi)
 
@@ -403,7 +438,12 @@ class MistakeChecker:
         midi_notes = self.recording.score_data.clipped_note_data(
             channel=self.recording.active_instrument)
         notes, mistakes = self.recording.mistake_detector.detect_pitch_mistakes(
-            user_string=note_data, midi_string=midi_notes)
+            user_string=note_data, midi_string=midi_notes, verbose=self.verbose)
         alignment = Alignment(self.config)
         alignment.load_alignment(notes, pitch_mistakes=mistakes)
+        if self.verbose:
+            print(
+                f"[check_mistakes] realigned: {len(mistakes)} pitch mistake(s)",
+                flush=True,
+            )
         return alignment

@@ -7,31 +7,36 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QScrollArea, QFrame,
 )
 
+from algorithms.Config import Config
 from app_logic.midi.ScoreData import ScoreData
 from resources.program_map import program_to_name
 from ui.info.MistakeWidget import _svg_icon
 
 
-# note-name <-> MIDI helpers, kept consistent with how MistakeWidget /
-# Note.get_note_name() / MidiAxis display note names: sharps only, octave =
-# midi // 12 - 1, so C4 == MIDI 60.
-NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-_PITCH_CLASS = {name: i for i, name in enumerate(NOTE_NAMES)}
-_NAME_RE = re.compile(r"^\s*([A-Ga-g])(#?)(-?\d+)\s*$")
+# note-name <-> MIDI helpers. Display routes through Config.get_note_name (sharps
+# by default, matching MistakeWidget / Note.get_note_name; octave = midi // 12 - 1,
+# so C4 == MIDI 60). Parsing + the transpose autocomplete additionally accept
+# flats, so 'A#4' and 'Bb4' both resolve to the same pitch.
+_PITCH_CLASS = {
+    "C": 0, "C#": 1, "DB": 1, "D": 2, "D#": 3, "EB": 3, "E": 4, "F": 5,
+    "F#": 6, "GB": 6, "G": 7, "G#": 8, "AB": 8, "A": 9, "A#": 10, "BB": 10, "B": 11,
+}
+_NAME_RE = re.compile(r"^\s*([A-Ga-g])([#bB]?)(-?\d+)\s*$")
 
 
-def midi_to_name(m: int) -> str:
-    """MIDI number -> note name, e.g. 60 -> 'C4'."""
-    return f"{NOTE_NAMES[m % 12]}{m // 12 - 1}"
+def midi_to_name(m: int, prefer_flats: bool = False) -> str:
+    """MIDI number -> note name, e.g. 60 -> 'C4' (or 'Db4' with prefer_flats)."""
+    return Config.get_note_name(m, prefer_flats=prefer_flats)
 
 
 def name_to_midi(name: str) -> int | None:
-    """Note name -> MIDI number, e.g. 'C4' -> 60. Returns None if unparseable."""
+    """Note name -> MIDI number, e.g. 'C4' -> 60, 'Bb3' -> 58. Accepts sharps or
+    flats. Returns None if unparseable."""
     match = _NAME_RE.match(name)
     if not match:
         return None
-    letter, sharp, octave = match.group(1).upper(), match.group(2), int(match.group(3))
-    pc = _PITCH_CLASS.get(letter + sharp)
+    letter, accidental, octave = match.group(1).upper(), match.group(2), int(match.group(3))
+    pc = _PITCH_CLASS.get(letter + accidental.upper())
     if pc is None:
         return None
     return (octave + 1) * 12 + pc
@@ -64,8 +69,13 @@ class SettingsWidget(QWidget):
     transpose_applied = pyqtSignal(int)    # emits the target MIDI for the first note
     full_score_toggled = pyqtSignal(bool)  # True = show full score, False = active instrument only
 
-    # the discretized note bins the range / transpose inputs auto-complete to
-    _NOTE_BIN_NAMES = [midi_to_name(m) for m in range(128)]
+    # the discretized note bins the range / transpose inputs auto-complete to;
+    # black keys appear as both spellings (e.g. 'C#4' and 'Db4'), sharp first.
+    _NOTE_BIN_NAMES = [
+        name
+        for m in range(128)
+        for name in dict.fromkeys((midi_to_name(m), midi_to_name(m, prefer_flats=True)))
+    ]
     _COMBO_STYLE = """
         QComboBox {
             padding-left: 6px;

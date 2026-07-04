@@ -371,17 +371,9 @@ class PerformTab(QWidget):
             return
         print("analyzing... ")
         rec.reset_analysis()  # clear stale notes/alignment/mistakes before recomputing
-
-        rec.detect_transitions()
-        # resize to the stable pitch span => fills in config.min_note_length (a good-enough guess)
-        rec.resize_score(to_span="pitch", include_transitions=False)
         rec.detect_notes()
-        rec.recompute_note_pitches()
-        rec.prune_transition_notes()
-
-        # resize the score to the take's voiced NOTE span in case
-        # some voiced noise got through cracks
-        rec.resize_score(to_span="onset")
+        # rec.recompute_note_pitches()
+        # rec.prune_transition_notes()
 
         rec.detect_mistakes()
         rec.mistake_checker.mistake_correction_loop()
@@ -558,8 +550,6 @@ class PerformTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
-        if self.recording is not None:
-            self.recording.sync_min_note_length_from_score()
         self.score_viewer.clear_clip_selection()
         self.slider.update_range(score_data=self.score_data, recording=self.recording)
         if seek and self.score_data.is_clipped():
@@ -577,8 +567,6 @@ class PerformTab(QWidget):
             self.score_data.clear_clip()
         else:
             self.score_data.set_clip(*clip)
-        if self.recording is not None:
-            self.recording.sync_min_note_length_from_score()
         self._refresh_clip_focus()
         self.guitar_hero.update_view_items()
         if self.recording is not None:
