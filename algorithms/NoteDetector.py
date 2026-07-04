@@ -60,9 +60,6 @@ class TransitionDetector:
 
 
 class NoteDetector(QObject):
-    # < 1 so a note rushed shorter than the score's shortest still gets its own
-    # PELT segment instead of being absorbed into a neighbour.
-    MIN_NOTE_FACTOR = 0.6
 
     def __init__(self, recording: Recording, config: Config=None, parent: QObject=None) -> None:
         super().__init__(parent)
@@ -73,6 +70,7 @@ class NoteDetector(QObject):
         self.PITCH_THRESH = self.config.pitch_thresh
         self.UNV_THRESH = self.config.unv_thresh # unvoiced pitches have unv_prob > sens
         self.verbose = self.config.verbose
+        self.MIN_NOTE_FACTOR = 0.6 # min note detected by note detector is the score's min note length * this
 
     def update_config(self, config: Config):
         """update the config and all relevant parameters"""
@@ -203,77 +201,62 @@ class NoteDetector(QObject):
         """Refines the note boundaries using onset times from a separate onset detector."""
         if note_data is None or not note_data.times or onset_times is None or len(onset_times) == 0:
             return note_data
-        
-        def is_valid(p: Pitch) -> bool:
-            """Returns True if the pitch is valid (voiced and above threshold)."""
-            # 1. does pitch exist, and is it voiced?
-            if (
-                p is None
-                or p.value == -1
-                or p.unvoiced_prob >= self.UNV_THRESH
-                or p.is_transition
-            ):
-                return False
-            return True # congrats man
 
-        MIN_NOTE_SEC = self.config.get_min_note_length()
-        splits = []
+        MIN_NOTE_SEC = self.config.get_min_note_length() * self.MIN_NOTE_FACTOR
+        splits: dict[int, list[float]] = {}
         for onset_time in sorted(onset_times):
             t = float(onset_time)
             if not np.isfinite(t):
                 continue
-            before, after = self.get_note_boundaries(note_data, t)
-            if before is None or after is None or after-before < MIN_NOTE_SEC:
+
+            note = note_data.read_current_note(t) or note_data.read_note(start_time=t)
+            if note is None or not note.start_time < t < note.end_time:
                 continue
-            # reject if the peak is surrounded by transition/unvoiced pitches
-            nearby_pitches = self.recording.pitch_data.read(start_time=before, end_time=after, clean=True)
-            if sum(is_valid(p) for p in nearby_pitches) > len(nearby_pitches) * 0.5:
-                splits.append(t)
-        
-        # split all notes at valid onsets at once
+
+            note_splits = splits.get(note.id, [])
+            last_boundary = note_splits[-1] if note_splits else note.start_time
+            # ignore the onset if it creates splits that are too short
+            if t-last_boundary < MIN_NOTE_SEC or note.end_time-t < MIN_NOTE_SEC:
+                continue
+
+            splits.setdefault(note.id, []).append(t)
+
         if not splits:
             return note_data
 
+        # rebuild the note data with all splits applied
         refined = NoteData()
-        splits = sorted(set(splits))
-        split_i = 0
-
         for note in note_data.read(i=0, j=len(note_data.times)):
-            note_splits = []
-            while split_i < len(splits) and splits[split_i] <= note.start_time:
-                split_i += 1
-            while split_i < len(splits) and splits[split_i] < note.end_time:
-                t = splits[split_i]
-                if (
-                    t - (note_splits[-1] if note_splits else note.start_time) >= MIN_NOTE_SEC
-                    and note.end_time - t >= MIN_NOTE_SEC
-                ):
-                    note_splits.append(t)
-                split_i += 1
+            note_splits = splits.get(note.id)
+            if not note_splits:
+                refined.write_note(Note(
+                    i=len(refined.times),
+                    start_time=note.start_time,
+                    end_time=note.end_time,
+                    midi_num=list(note.midi_num),
+                    velocity=note.velocity,
+                    instrument=note.instrument,
+                ))
+                continue
 
-            boundaries = [note.start_time] + note_splits + [note.end_time]
+            boundaries = [note.start_time, *note_splits, note.end_time]
             for start_time, end_time in zip(boundaries, boundaries[1:]):
                 if end_time <= start_time:
                     continue
+                pitches = self.recording.pitch_data.read(
+                    start_time=start_time,
+                    end_time=end_time,
+                    clean=True,
+                    include_transitions=False,
+                )
+                midi_num = [float(np.median([p.value for p in pitches]))] if pitches else list(note.midi_num)
                 refined.write_note(Note(
                     i=len(refined.times),
                     start_time=start_time,
                     end_time=end_time,
-                    midi_num=list(note.midi_num),
+                    midi_num=midi_num,
                     velocity=note.velocity,
                     instrument=note.instrument,
                 ))
 
         return refined
-
-
-    def get_note_boundaries(self, note_data: NoteData, t: float) -> tuple[float, float]:
-        """Return the closest note boundaries before and after `t`"""
-        note = note_data.read_current_note(t)
-        if note is None:
-            note = note_data.read_note(start_time=t)
-        if note is None:
-            return None, None
-        if note.start_time <= t <= note.end_time:
-            return note.start_time, note.end_time
-        return None, None

@@ -170,14 +170,14 @@ class PitchData:
         with self.lock:
             self.data[i:j] = pitches
 
-    def read(self, start_time: float=0, end_time: float=0, i: int=None, j: int=None, clean=False) -> list[Pitch]:
+    def read(self, start_time: float=0, end_time: float=0, i: int=None, j: int=None, clean=False, include_transitions: bool=True) -> list[Pitch]:
         """returns the array of pitches corresponding to start_time <--> end_time"""
         if not i and not j:
             i = max(0, self.time_to_index(start_time))
             j = min(self.time_to_index(end_time), len(self.data)-1)
 
         if clean:
-            return [p for p in self.data[i:j] if self.is_voiced_pitch(p)]
+            return [p for p in self.data[i:j] if self.is_voiced_pitch(p, include_transitions=include_transitions)]
 
         return self.data[i:j]
     
@@ -188,13 +188,9 @@ class PitchData:
             return None
         return self.data[i]
 
-    def is_voiced_pitch(
-        self,
-        pitch: Pitch | None,
-        include_transitions: bool = True,
-    ) -> bool:
+    def is_voiced_pitch(self, pitch: Pitch, include_transitions: bool=True) -> bool:
         if pitch is not None:
-            pitch.ensure_compatible(self.config)
+            pitch.ensure_compatible(self.config) # patches legacy pitch caches in-place
         return (
             pitch is not None
             and pitch.value != -1
@@ -202,10 +198,7 @@ class PitchData:
             and (include_transitions or not getattr(pitch, "is_transition", False))
         )
 
-    def get_voiced_range(
-        self,
-        include_transitions: bool = True,
-    ) -> tuple[float, float] | None:
+    def get_voiced_range(self, include_transitions: bool=True) -> tuple[float, float]:
         """Return the app-time range covered by voiced pitch frames."""
         first = None
         last = None
