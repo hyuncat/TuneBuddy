@@ -93,15 +93,19 @@ class MidiPlayer(QObject):
         play_anchor = time.perf_counter() - start_time / speed
 
         for i in range(start_idx, len(msg_times)):
-            # stop handling : if stop event is set, break look and exit playback
+            current_time = msg_times[i]
+
+            # wait until it's time for this message before playing it.
+            while not self.thread_stop_event.is_set():
+                now = (time.perf_counter() - play_anchor) * speed
+                if now >= current_time:
+                    break
+                time.sleep(0.001)
+
             if self.thread_stop_event.is_set():
-                # self.midi_synth.pause()
                 break
 
-            # iterate through the messages and play them
-            current_time = msg_times[i]
             messages = midi_data.messages[current_time]
-
             for msg in messages:
                 if msg.is_meta:
                     self.midi_synth.handle_midi(msg)
@@ -113,19 +117,8 @@ class MidiPlayer(QObject):
                 # leaves a hanging note. A note_off on a silent note is a no-op.
                 if enabled or msg.type == "note_off":
                     self.midi_synth.handle_midi(msg)
-                
-            # compute time to sleep until next msg
-            if i+1 <= len(msg_times)-1:
-                next_time = msg_times[i+1]
 
-                while not self.thread_stop_event.is_set():
-                    now = (time.perf_counter() - play_anchor) * speed
-                    if now >= next_time:
-                        break
-                    time.sleep(0.001)
-
-            elif i == len(msg_times)-1:
-                self.stop()
+        self.stop()
 
     def stop(self):
         """stop playback, setting thread_stop_event"""
