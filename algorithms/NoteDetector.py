@@ -79,14 +79,19 @@ class NoteDetector(QObject):
         self.UNV_THRESH = self.config.unv_thresh # unvoiced pitches have unv_prob > sens
         self.verbose = self.config.verbose
 
-    def get_pitch_runs(self, pitches: list[Pitch]) -> list[list[Pitch]]:
+    def get_pitch_runs(
+        self,
+        pitches: list[Pitch],
+        include_transitions: bool = False,
+    ) -> list[list[Pitch]]:
         """Returns a list of consecutive voiced pitch runs.
-        Splits notes when we've seen enough unvoiced frames.
+        Splits notes when we've seen enough unvoiced frames. Transition frames
+        may stay in the run for PELT; they are useful boundary evidence.
         """
         all_runs = []
         run = []
         MIN_RUN_FRAMES = max(1, round(0.5 * self.config.get_min_note_length(type="frames"))) # in frames
-        MIN_GAP_FRAMES = max(1, round(self.config.min_gap_length * (self.config.sr/self.config.h1))) # in frames
+        MIN_GAP_FRAMES = max(1, round(0.5 * self.config.get_min_note_length(type="frames"))) # in frames
         n_gap_frames = 0
 
         def append_run():
@@ -99,7 +104,12 @@ class NoteDetector(QObject):
             run = []
 
         for p in pitches:
-            is_voiced = p and p.value != -1 and p.unvoiced_prob < self.UNV_THRESH and not p.is_transition
+            is_voiced = (
+                p
+                and p.value != -1
+                and p.unvoiced_prob < self.UNV_THRESH
+                and (include_transitions or not p.is_transition)
+            )
             if is_voiced:
                 if run and n_gap_frames >= MIN_GAP_FRAMES:
                     append_run()
@@ -116,14 +126,22 @@ class NoteDetector(QObject):
             append_run()
         return all_runs
 
-    def detect_notes(self, pitches: list[Pitch], model: str="l2") -> NoteData:
+    def detect_notes(
+        self,
+        pitches: list[Pitch],
+        model: str="l2",
+        exclude_transitions: bool=False,
+    ) -> NoteData:
         """Offline note detection - splits into runs of voiced pitches, then uses
         PELT to find breakpoints between notes. Merges notes that are too close together
         within pitch_thresh semitones."""
         if self.verbose:
             print(f"[NoteDetector] detecting notes (model={model})", flush=True)
 
-        pitch_runs = self.get_pitch_runs(pitches)
+        pitch_runs = self.get_pitch_runs(
+            pitches,
+            include_transitions=not exclude_transitions,
+        )
 
         if not pitch_runs:
             if self.verbose:

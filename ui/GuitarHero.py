@@ -557,25 +557,31 @@ class GuitarHero(QWidget):
         # --- update PITCHES ---
         xs, ys, brushes = [], [], []
         for p in user_pitches:
-            for c in p.candidate_pitches:
-                xs.append(p.time)
-                ys.append(c[0]) # pitch value
-                # high-slope transition frames (slides between notes) are always
-                # neutral grey: their pitch is mid-slide, so we never score them by
-                # distance — even post-analyze where _update_pitch_distances has
-                # given them a (meaningless) live_distance.
-                if getattr(p, "is_transition", False):
-                    brushes.append(self.rest_brush)
-                    break
+            if not p.candidate_pitches:
+                continue
+            # high-slope transition frames (slides between notes) are always
+            # neutral grey: their pitch is mid-slide, so we never score them by
+            # distance — even post-analyze where _update_pitch_distances has
+            # given them a (meaningless) live_distance.
+            if getattr(p, "is_transition", False):
+                brush = self.rest_brush
+            else:
                 # after analyze() pitches carry an alignment-based distance; color
                 # by that. while recording (or pre-analysis) it's None, so fall
                 # back to the live per-frame distance coloring.
                 ad = getattr(p, "aligned_distance", None)
                 if ad is not None:
-                    brushes.append(self.get_align_distance_brush(ad))
+                    brush = self.get_align_distance_brush(ad)
                 else:
-                    brushes.append(self.get_distance_brush(getattr(p, "live_distance", None)))
-                break
+                    brush = self.get_distance_brush(getattr(p, "live_distance", None))
+            # polyphonic frames carry SIMULTANEOUS pitches -> draw them all;
+            # mono candidates are competing hypotheses -> draw only the best
+            cands = (p.candidate_pitches if getattr(p, "polyphonic", False)
+                     else p.candidate_pitches[:1])
+            for midi_num, _salience in cands:
+                xs.append(p.time)
+                ys.append(midi_num)
+                brushes.append(brush)
                     
         # get_alpha = lambda p: int(50 + 205*(1 - p.candidate_pitches[0][1]))
         # alphas = np.asarray([get_alpha(p) for p in user_pitches], dtype=np.float32)

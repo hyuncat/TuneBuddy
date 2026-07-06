@@ -170,7 +170,8 @@ class PitchData:
         with self.lock:
             self.data[i:j] = pitches
 
-    def read(self, start_time: float=0, end_time: float=0, i: int=None, j: int=None, clean=False, include_transitions: bool=True) -> list[Pitch]:
+    def read(self, start_time: float=0, end_time: float=0, i: int=None, j: int=None, 
+             clean=False, include_transitions: bool=True) -> list[Pitch]:
         """returns the array of pitches corresponding to start_time <--> end_time"""
         if not i and not j:
             i = max(0, self.time_to_index(start_time))

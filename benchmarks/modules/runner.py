@@ -5,7 +5,7 @@ from __future__ import annotations
 Extracted verbatim from ``benchmarks/scripts/benchmark_pitch.py`` so the pitch
 and note runners share one implementation of:
 
-  - ``ProgressRenderer`` -- the live ``[i/N] <method>: <title> [/]`` lines,
+  - ``ProgressRenderer`` -- live ``[i/N] <method>: <title> [/]`` lines,
   - ``process_chunks`` -- fresh ``ProcessPoolExecutor`` per batch (no in-place
     worker recycling), a no-progress watchdog that re-queues stuck chunks, and
     BrokenProcessPool recovery,
@@ -75,9 +75,9 @@ def _force_teardown(ex: ProcessPoolExecutor) -> None:
 class ProgressRenderer:
     SPINNER = "|/-\\"
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, live: bool = False) -> None:
         self.enabled = enabled
-        self.is_tty = enabled and sys.stdout.isatty()
+        self.is_tty = enabled and live and sys.stdout.isatty()
         self.active: dict[int, dict[str, Any]] = {}
         self.live_lines = 0
         self.last_render = 0.0
@@ -108,10 +108,10 @@ class ProgressRenderer:
         return changed
 
     def _handle(self, event: dict[str, Any]) -> None:
-        pid = int(event.get("pid", 0) or 0)
+        index = int(event.get("index", 0) or 0)
         if event.get("event") == "start":
-            self.active[pid] = {
-                "index": int(event.get("index", 0) or 0),
+            self.active[index] = {
+                "index": index,
                 "total": int(event.get("total", 0) or 0),
                 "model": str(event.get("model", "")),
                 "track_id": str(event.get("track_id", "")),
@@ -120,8 +120,8 @@ class ProgressRenderer:
             return
 
         if event.get("event") == "done":
-            item = self.active.pop(pid, None) or {
-                "index": int(event.get("index", 0) or 0),
+            item = self.active.pop(index, None) or {
+                "index": index,
                 "total": int(event.get("total", 0) or 0),
                 "model": str(event.get("model", "")),
                 "track_id": str(event.get("track_id", "")),
@@ -179,7 +179,12 @@ def process_chunks(
     opts: dict[str, Any],
     verbose: bool,
     progress: bool,
+    progress_live: bool = True,
+    on_result: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str, str, str]], dict[str, str]]:
+    """``on_result`` (if given) is called on the MAIN process with each finished
+    chunk's rows, so callers can persist results incrementally instead of only
+    after the whole run."""
     rows: list[dict[str, Any]] = []
     errors: list[tuple[str, str, str, str]] = []
     skipped: dict[str, str] = {}
@@ -190,7 +195,7 @@ def process_chunks(
     started = time.perf_counter()
     manager = multiprocessing.Manager() if progress else None
     progress_queue = manager.Queue() if manager is not None else None
-    renderer = ProgressRenderer(enabled=progress)
+    renderer = ProgressRenderer(enabled=progress, live=progress_live)
 
     def chunk_key(chunk: WorkChunk) -> str:
         model, _, items = chunk
@@ -288,6 +293,8 @@ def process_chunks(
                         if status == "skip":
                             rows.extend(chunk_rows)
                             errors.extend(chunk_errors)
+                            if on_result is not None and chunk_rows:
+                                on_result(chunk_rows)
                             skipped[result_model] = skip_msg or "dependency unavailable"
                             renderer.close()
                             log("SKIP", result_model, len(items), dur)
@@ -296,6 +303,8 @@ def process_chunks(
 
                         rows.extend(chunk_rows)
                         errors.extend(chunk_errors)
+                        if on_result is not None and chunk_rows:
+                            on_result(chunk_rows)
                         if status == "ok":
                             if not progress:
                                 log("OK", model, len(chunk_rows) + len(chunk_errors), dur)

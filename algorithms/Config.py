@@ -34,6 +34,21 @@ class Config:
     min_volume: float = 0.05  # remove any frame < min_volume * max_volume reference
     max_volume: float = 0.95  # %th percentile (as a fraction) of frame RMS used as the loud reference
 
+    # --- POLYPHONIC (NMF) PITCH DETECTION PARAMETERS ---
+    # poly=True routes a new Recording to PolyPitchDetector + PolyPitchData
+    # (A/B flag; see algorithms/PolyPitchDetector.py for the algorithm + refs)
+    poly: bool = True
+    poly_max_voices: int = 4          # max simultaneous pitches kept per frame
+    poly_n_harmonics: int = 10        # partials per harmonic-comb template
+    poly_harmonic_decay: float = 0.8  # k-th partial amplitude = decay**(k-1)
+    poly_bins_per_semitone: int = 1   # dictionary pitch-grid resolution
+    poly_nmf_iters: int = 30          # max multiplicative updates per frame (early-stops)
+    poly_sparsity: float = 0.05       # L1 penalty on activations (fewer, stronger voices)
+    poly_salience_thresh: float = 0.15  # keep pitches >= thresh * strongest activation
+    poly_min_salience: float = 0.01   # absolute floor, as a share of frame spectral mass
+    poly_f0_presence: float = 0.05    # candidate's f0 region must hold >= this share of
+                                      # its strongest partial's energy (sub-octave ghost filter)
+
     # --- NOTE DETECTION PARAMETERS ---
     pitch_thresh: float = 0.25  # in semitones, min diff b/w 2 notes to consider them distinct
     min_note_length: float = 0.03  # in sec

@@ -29,7 +29,7 @@ from app_logic.Alignment import Mistake  # noqa: E402
 from app_logic.NoteData import Note, NoteData  # noqa: E402
 from app_logic.user.ds.AudioData import AudioData  # noqa: E402
 from benchmarks.modules.mistake.MistakeInjector import MistakeInjector, TruthEvent  # noqa: E402
-from benchmarks.modules.note.NoteBenchmarker import NoteBenchmarker, OneInstrumentScoreData  # noqa: E402
+from benchmarks.note.NoteBenchmarker import NoteBenchmarker, OneInstrumentScoreData  # noqa: E402
 from benchmarks.modules.pitch.PitchBenchmarker import PathLike, PitchBenchmarker  # noqa: E402
 
 MistakeMode: TypeAlias = Literal["symbolic", "audio"]

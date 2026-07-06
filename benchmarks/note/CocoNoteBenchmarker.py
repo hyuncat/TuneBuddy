@@ -5,17 +5,15 @@ from __future__ import annotations
 Runs the note-detector comparison (see ``NoteBenchmarker``) on materialized
 CocoChorales stems. Unlike the etude benchmark it does NOT synthesize its own
 audio: the reference is the stem's ``stems_midi`` file and the pitch track is
-loaded from the shared ``pyin_smooth`` pitch cache the pitch benchmark already
-produced. Pitch detection is therefore never re-run and never timed — the rows
-carry only the note detector's own compute time and Audio(s)/Compute(s).
+loaded from the shared ``pyin_smooth`` cache the pitch benchmark already
+produced — pitch detection is never re-run and never timed.
 
-The class multiply-inherits the note-method matrix from ``NoteBenchmarker`` and
-the CocoChorales data plumbing (manifest / materialization / f0 / cache layout)
+Multiply-inherits the note methods from ``NoteBenchmarker`` and the
+CocoChorales data plumbing (manifest / materialization / f0 / cache layout)
 from ``CocoChoralesBenchmarker``; both share ``PitchBenchmarker`` so the MRO is
 linear (CocoNote -> Note -> Coco -> Pitch).
 """
 
-import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -23,25 +21,10 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-def _bootstrap_repo_root() -> Path:
-    for candidate in Path(__file__).resolve().parents:
-        if (candidate / "app.py").is_file() and (candidate / "benchmarks").is_dir():
-            return candidate
-    raise RuntimeError("could not locate Attune repo root")
-
-
-_BOOTSTRAP_ROOT = _bootstrap_repo_root()
-if str(_BOOTSTRAP_ROOT) not in sys.path:
-    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
-
-from benchmarks.paths import ensure_repo_on_path  # noqa: E402
-
-ensure_repo_on_path()
-
-from app_logic.user.ds.Recording import Recording  # noqa: E402
-from benchmarks.modules.CocoChoralesBenchmarker import CocoChoralesBenchmarker, CocoStemRecord  # noqa: E402
-from benchmarks.modules.note.NoteBenchmarker import NoteBenchmarker, OneInstrumentScoreData  # noqa: E402
-from benchmarks.modules.pitch.PitchBenchmarker import PathLike  # noqa: E402
+from app_logic.user.ds.Recording import Recording
+from benchmarks.modules.CocoChoralesBenchmarker import CocoChoralesBenchmarker, CocoStemRecord
+from benchmarks.modules.pitch.PitchBenchmarker import PathLike
+from benchmarks.note.NoteBenchmarker import NoteBenchmarker, OneInstrumentScoreData
 
 
 class CocoNoteBenchmarker(NoteBenchmarker, CocoChoralesBenchmarker):
@@ -92,6 +75,15 @@ class CocoNoteBenchmarker(NoteBenchmarker, CocoChoralesBenchmarker):
         """Whether the pyin_smooth pitch cache (the note detector's input) exists."""
         return self.has_pitch_cache(self.cache_path_for_wav(wav_path), smooth=True)
 
+    def note_cache_dir(self, primary_path: PathLike, reference_path: PathLike) -> Path:
+        """<root>/note_data/, mirroring the flat <root>/pitch_data/ cache."""
+        return self.cache_path_for_wav(primary_path).parent.parent
+
+    def note_cache_track_id(self, primary_path: PathLike) -> str:
+        """The flat unique id the pitch cache uses (split__track__stem) — the
+        wav stem alone ("1_violin") repeats across every coco track."""
+        return self.track_id_for_wav(primary_path)
+
     # ------------------------------------------------------- recording assembly
     def _prepare_note_recording(
         self,
@@ -103,9 +95,8 @@ class CocoNoteBenchmarker(NoteBenchmarker, CocoChoralesBenchmarker):
         """Assemble a Recording from the cached pyin_smooth pitches + stems_midi.
 
         The waveform is only loaded when the method actually needs it (external
-        transcribers, spectral onsets) or when the pitch cache is missing and the
-        track has to be pitch-detected from scratch. Change-point methods run on
-        the cached pitch track alone."""
+        transcribers, spectral onsets) or when the pitch cache is missing and
+        the track has to be pitch-detected from scratch."""
         wav_path = Path(primary_path)
         midi_path = Path(reference_path)
 
@@ -125,18 +116,13 @@ class CocoNoteBenchmarker(NoteBenchmarker, CocoChoralesBenchmarker):
             write_cache=True,
             verbose=self.algorithm_verbose,
         )
-        self.prepare_for_note_detection(
-            recording,
-            resize_score_to_pitch=(align == "resize"),
-            detect_transitions=True,
-        )
-        ref_iv, ref_pi = self.notedata_to_intervals(
-            recording.score_data.clipped_note_data(channel=recording.active_instrument),
-            recording.config,
-        )
+        self.prepare_for_note_detection(recording, resize_score_to_pitch=(align == "resize"))
+        ref_iv, ref_pi = self._reference_intervals(recording)
         return recording, ref_iv, ref_pi, self._audio_seconds(wav_path)
 
     # ------------------------------------------------------------- row metadata
     def note_row_meta(self, wav_path: PathLike) -> dict[str, Any]:
-        """Split / ensemble / instrument / voice for grouping the raw CSVs."""
-        return self.meta_for_wav(wav_path)
+        """Split / ensemble / instrument / voice for the raw CSVs. f0_voice is a
+        pitch-benchmark key (0-based f0-pickle column), meaningless against the
+        stems_midi reference, so it is dropped here."""
+        return {k: v for k, v in self.meta_for_wav(wav_path).items() if k != "f0_voice"}

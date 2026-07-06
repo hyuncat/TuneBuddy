@@ -22,10 +22,11 @@ _EXPORTS = {
         "benchmarks.modules.CocoChoralesBenchmarker",
         "CocoChoralesBenchmarker",
     ),
-    "NoteBenchmarker": ("benchmarks.modules.note.NoteBenchmarker", "NoteBenchmarker"),
-    "BenchmarkNoteDetector": (
-        "benchmarks.modules.note.NoteDetectionBaselines",
-        "BenchmarkNoteDetector",
+    "NoteBenchmarker": ("benchmarks.note.NoteBenchmarker", "NoteBenchmarker"),
+    "CocoNoteBenchmarker": ("benchmarks.note.CocoNoteBenchmarker", "CocoNoteBenchmarker"),
+    "RupturesDetector": (
+        "benchmarks.note.algorithms.RupturesDetector",
+        "RupturesDetector",
     ),
     "MistakeBenchmarker": ("benchmarks.modules.mistake.MistakeBenchmarker", "MistakeBenchmarker"),
     "MistakeInjector": ("benchmarks.modules.mistake.MistakeInjector", "MistakeInjector"),
@@ -44,7 +45,8 @@ __all__ = [
     "PitchBenchmarker",
     "CocoChoralesBenchmarker",
     "NoteBenchmarker",
-    "BenchmarkNoteDetector",
+    "CocoNoteBenchmarker",
+    "RupturesDetector",
     "MistakeBenchmarker",
     "MistakeInjector",
 ]

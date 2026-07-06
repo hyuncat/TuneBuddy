@@ -732,6 +732,11 @@ def parse_args() -> argparse.Namespace:
         help="disable live per-track progress lines",
     )
     p.add_argument(
+        "--append-progress",
+        action="store_true",
+        help="print only final per-track completion lines instead of live spinner redraws",
+    )
+    p.add_argument(
         "--algorithm-verbose",
         action="store_true",
         help="let pitch/note/mistake algorithms print their own verbose diagnostics inside workers",
@@ -911,6 +916,7 @@ def main() -> int:
             opts=opts,
             verbose=not args.quiet_tracks,
             progress=not args.no_progress,
+            progress_live=not args.append_progress,
         )
         total = time.perf_counter() - started
         # Tracks whose cache was missing were dropped from the chunks up front;
@@ -951,6 +957,7 @@ def main() -> int:
         opts=opts,
         verbose=not args.quiet_tracks,
         progress=not args.no_progress,
+        progress_live=not args.append_progress,
     )
     total = time.perf_counter() - started
 

@@ -30,13 +30,19 @@ class Recording:
 
         # algorithms!!
         from algorithms.PitchDetector import PitchDetector
+        from algorithms.PolyPitchDetector import PolyPitchDetector
         from algorithms.PitchSmoother import PitchSmoother
         from algorithms.NoteDetector import NoteDetector, TransitionDetector
         from app_logic.user.ds.OnsetData import OnsetDetector, OnsetData
         from algorithms.MistakeDetector import MistakeDetector
         from algorithms.MistakeChecker import MistakeChecker
 
-        self.pitch_detector = PitchDetector(recording=self)
+        # config.poly A/B flag: NMF multi-f0 detector + columnar poly store
+        # instead of the pYIN chain (see algorithms/PolyPitchDetector.py)
+        self.pitch_detector = (
+            PolyPitchDetector(recording=self) if self.config.poly
+            else PitchDetector(recording=self)
+        )
         self.pitch_smoother = PitchSmoother(recording=self)
         self.note_detector = NoteDetector(recording=self)
         self.transition_detector = TransitionDetector(recording=self)
@@ -45,7 +51,7 @@ class Recording:
 
         # essential data variables
         self.audio_data = AudioData(config=self.config)
-        self.pitch_data = PitchData(config=self.config)
+        self.pitch_data = self._new_pitch_data()
         self.note_data = NoteData()
         self.onset_data = OnsetData(config=self.config)
         self.onset_detector = OnsetDetector(recording=self)
@@ -109,7 +115,7 @@ class Recording:
         self.audio_filepath = path
         self.unsaved_changes = False
         self.loaded_from_cache = False
-        self.pitch_data = PitchData(config=self.config)
+        self.pitch_data = self._new_pitch_data()
         self.reset_analysis()
         if load_cache:
             self.load_cache(score_filepath=score_filepath, recording_name=recording_name)
@@ -162,8 +168,15 @@ class Recording:
     def cleanup(self):
         """Re-init essential data structures. Called before load_score() in app."""
         self.audio_data = AudioData(config=self.config)
-        self.pitch_data = PitchData(config=self.config)
+        self.pitch_data = self._new_pitch_data()
         self.reset_analysis()
+
+    def _new_pitch_data(self):
+        """Pitch store matching the configured detector (config.poly A/B flag)."""
+        if getattr(self.config, "poly", False):
+            from app_logic.user.ds.PolyPitchData import PolyPitchData
+            return PolyPitchData(config=self.config)
+        return PitchData(config=self.config)
 
     def reset_analysis(self):
         """Re-init analysis-derived data structures. Called before re-analyze() in app."""
