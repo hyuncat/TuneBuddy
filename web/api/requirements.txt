@@ -1,0 +1,34 @@
+# Trimmed for the /analyze API only — reuses algorithms/ and app_logic/ as-is,
+# so this is exactly their transitive dependency set (checked via grep over
+# algorithms/ and app_logic/ imports), plus FastAPI itself. Deliberately
+# excludes what the desktop app needs but /analyze doesn't: PyQt6-WebEngine*
+# (score rendering, playback), pyqtgraph/pyqtdarktheme (GUI widgets),
+# pyfluidsynth (MIDI playback), sounddevice (live mic capture), and all the
+# Jupyter/mkdocs/notebook tooling from the root requirements.txt.
+#
+# Known wart: PyQt6 is still required here because algorithms/PitchDetector.py
+# and algorithms/NoteDetector.py subclass QObject for their (unused, on this
+# code path) Qt signals. It imports and runs fine headless with no
+# QApplication, but it's a heavy, GUI-flavored dependency to drag onto a
+# server for classes that don't need any of Qt's actual GUI machinery — worth
+# decoupling later (e.g. plain callables instead of pyqtSignal) if this
+# becomes annoying to deploy.
+
+fastapi
+uvicorn[standard]
+python-multipart
+
+numpy==1.26.4
+scipy==1.16.2
+librosa==0.10.2
+soundfile==0.13.1
+pydub==0.25.1
+music21==9.7.1
+mido==1.3.3
+ruptures==1.1.9
+hmmlearn==0.3.3
+tqdm==4.67.1
+
+PyQt6==6.10.1
+PyQt6-Qt6==6.10.1
+PyQt6_sip==13.10.2
