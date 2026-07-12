@@ -49,10 +49,12 @@
   }
 </script>
 
-<main>
-  <h1>Attune</h1>
+<div class="toolbar">
+  <span class="app-title">Attune</span>
+</div>
 
-  <section>
+<main>
+  <section class="panel">
     <h2>Analyze a recording</h2>
     <UploadForm onResult={handleAnalysisResult} onNoteData={handleNoteData} {pitchTolerance} />
     {#if noteData}
@@ -64,9 +66,9 @@
     <ResultsView {analysisResult} {noteData} bind:pitchTolerance />
   </section>
 
-  <section>
+  <section class="panel">
     <h2>ScoreViewer verification</h2>
-    <button onclick={loadTestScore}>Load test score (ScoreViewer verification)</button>
+    <button class="btn" onclick={loadTestScore}>Load test score (ScoreViewer verification)</button>
     <div class="viewer-frame">
       <ScoreViewer bind:this={scoreViewer} />
     </div>
@@ -74,20 +76,58 @@
 </main>
 
 <style>
+  .toolbar {
+    background: var(--bg-surface-raised);
+    border-bottom: 1px solid var(--border);
+    padding: 0.6rem 1.5rem;
+  }
+  .app-title {
+    font-weight: 700;
+    font-size: 1.1rem;
+    letter-spacing: 0.02em;
+  }
   main {
-    font-family: system-ui, sans-serif;
-    padding: 2rem;
+    padding: 1.5rem;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+  .panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.5rem;
+  }
+  .panel h2 {
+    margin-top: 0;
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.5rem;
   }
   .viewer-frame {
     margin-top: 1rem;
     height: 400px;
-    border: 1px solid #ccc;
-  }
-  section {
-    margin-bottom: 2rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
   }
   .result-summary {
     margin-top: 0.75rem;
-    font-family: system-ui, sans-serif;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+  }
+  .btn {
+    background: var(--bg-surface-raised);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+  }
+  .btn:hover {
+    border-color: var(--accent);
   }
 </style>

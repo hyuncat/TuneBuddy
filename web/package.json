@@ -11,6 +11,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "sync-verovio": "node scripts/sync-verovio.mjs"
+    "sync-verovio": "node scripts/sync-verovio.mjs",
+    "sync-icons": "node scripts/sync-icons.mjs"
   }
 }

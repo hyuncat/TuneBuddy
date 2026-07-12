@@ -96,8 +96,8 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: system-ui, sans-serif;
-    color: #666;
+    color: var(--text-secondary, #999);
+    background: var(--bg-surface, #242427);
   }
   iframe {
     width: 100%;

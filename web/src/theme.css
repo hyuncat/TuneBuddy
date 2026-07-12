@@ -1,0 +1,45 @@
+/* Dark theme matching the desktop app (qdarktheme.load_stylesheet("dark") +
+   app-specific colors pulled directly from the widget source). Values with a
+   citation are exact, taken from the Python source, not guessed:
+     - accent: ToleranceWidget._ACCENT = "#8ab4f8"
+     - toggle-on: ToggleSwitch's checked track color "#3daee9"
+     - disabled-fg: MistakeWidget._OVERRIDE_FG = QColor(105, 113, 119)
+     - overlay-bg: GuitarHero.plot.setBackground((20, 20, 25))
+   Everything else (window/surface/border/text) is a reasonable dark palette
+   built around those anchors - qdarktheme's exact generated stylesheet isn't
+   available to copy verbatim, so this approximates it rather than matches
+   pixel-for-pixel. */
+
+:root {
+  --bg-window: #1a1a1e;
+  --bg-surface: #242427;
+  --bg-surface-raised: #2c2c30;
+  --border: #3a3a3e;
+  --text: #e8e8ea;
+  --text-secondary: #a9adb3;
+  --text-disabled: rgb(105, 113, 119);
+  --accent: #8ab4f8;
+  --toggle-on: #3daee9;
+  --overlay-bg: rgb(20, 20, 25);
+  --danger: #ff5555;
+  --success: #27ae60;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg-window);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+input,
+button,
+select {
+  font-family: inherit;
+  color: inherit;
+}

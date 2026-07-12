@@ -4,12 +4,8 @@
   import NoteOverlay from "./NoteOverlay.svelte";
 
   const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+  const ICONS = "/icons"; // synced from resources/icons via npm run sync-icons
 
-  // analysisResult/noteData: owned by the parent (App.svelte), which needs
-  // noteData for the score viewer too. pitchTolerance is $bindable since
-  // UploadForm needs its current value at Analyze-time (see project notes on
-  // why /analyze accepts an optional tolerance); timingTolerance has no such
-  // upstream consumer so it's local-only state below.
   let {
     analysisResult = null,
     noteData = null,
@@ -17,13 +13,15 @@
   } = $props();
 
   let timingTolerance = $state(0.25);
+  // ui/info/MistakeWidget.py's mode dropdown: one tree, swapped between the
+  // pitch and timing mistake lists rather than one combined chronological
+  // list.
+  let mode = $state("pitch"); // "pitch" | "timing"
 
   let realignedPairs = $state(null);
   let realignError = $state("");
   let realigning = $state(false);
 
-  // Stale against a new recording until re-realigned - reset whenever a
-  // fresh analysisResult comes in.
   let lastAnalysisResult = null;
   $effect(() => {
     if (analysisResult !== lastAnalysisResult) {
@@ -55,10 +53,8 @@
 
   function handleTimingToleranceChange(e) {
     timingTolerance = parseFloat(e.target.value);
-    // No /realign here: timing-mistake reclassification is a pure
-    // client-side threshold check over the existing pairs, no re-alignment
-    // involved (unlike pitch tolerance, which is baked into the alignment's
-    // own DP cost matrix - see project notes).
+    // No /realign: timing-mistake reclassification is a pure client-side
+    // threshold check over the existing pairs (see project notes).
   }
 
   let currentPairs = $derived(realignedPairs ?? analysisResult?.alignment?.pairs ?? null);
@@ -88,70 +84,55 @@
     );
   });
 
-  // Combined, time-sorted list for display. A pair can appear once for pitch
-  // and up to twice for timing (onset + duration) - each is its own row.
-  let allMistakes = $derived(
-    [...pitchMistakes, ...timingMistakes].sort((a, b) => {
+  let visibleMistakes = $derived(
+    (mode === "timing" ? timingMistakes : pitchMistakes).slice().sort((a, b) => {
       const ta = a.scoreNote?.startTime ?? a.userNote?.startTime ?? 0;
       const tb = b.scoreNote?.startTime ?? b.userNote?.startTime ?? 0;
       return ta - tb;
     })
   );
 
-  const MISTAKE_LABEL = {
-    deletion: "Missing note",
-    insertion: "Extra note",
-    substitution: "Wrong pitch",
-    early: "Early",
-    late: "Late",
-    short: "Too short",
-    long: "Too long",
-  };
+  // Override ("dismiss this mistake"): client-side only, since there's no
+  // persistence layer for the web app yet. Keyed by mode+pairIndex+type since
+  // a pair can appear in both an onset AND duration timing mistake.
+  let overridden = $state(new Set());
+  function overrideKey(m) {
+    return `${mode}:${m.pairIndex}:${m.type}`;
+  }
+  function toggleOverride(m) {
+    const key = overrideKey(m);
+    const next = new Set(overridden);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    overridden = next;
+  }
+
+  const TIMING_LABELS = { long: "Too long", short: "Too short", early: "Early", late: "Late" };
+
+  // Type-column icon + tooltip for a pitch mistake - mirrors
+  // MistakeWidget._type_icon_and_tip exactly, including the flat/sharp rule.
+  function typeIcon(m) {
+    if (m.type === "insertion") return { src: `${ICONS}/plus.svg`, tip: "Insertion (extra note played)" };
+    if (m.type === "deletion") return { src: `${ICONS}/minus.svg`, tip: "Deletion (note missed)" };
+    const user = m.userNote?.midiNum?.[0] ?? 0;
+    const target = m.scoreNote?.midiNum?.[0] ?? 0;
+    return user < target
+      ? { src: `${ICONS}/flatsign.svg`, tip: "Substitution (played flat)" }
+      : { src: `${ICONS}/sharpsign.svg`, tip: "Substitution (played sharp)" };
+  }
+
+  function formatTime(seconds) {
+    // mirrors MistakeWidget._format_time
+    if (seconds < 60) return seconds.toFixed(2);
+    const minutes = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${minutes}:${String(secs).padStart(2, "0")}`;
+  }
 
   function mistakeTime(m) {
     return m.scoreNote?.startTime ?? m.userNote?.startTime ?? null;
   }
-
-  function mistakeDetail(m) {
-    if (m.type === "substitution") {
-      return `played ${noteName(m.userNote.midiNum[0])}, expected ${noteName(m.scoreNote.midiNum[0])}`;
-    }
-    if (m.type === "deletion") {
-      return `expected ${noteName(m.scoreNote.midiNum[0])}`;
-    }
-    if (m.type === "insertion") {
-      return `played ${noteName(m.userNote.midiNum[0])}`;
-    }
-    return m.info ?? "";
-  }
 </script>
-
-{#if noteData}
-  <div class="tolerance-controls">
-    <label class="tolerance-control">
-      Pitch tolerance (semitones): {pitchTolerance.toFixed(2)}
-      <input
-        type="range"
-        min="0.05"
-        max="5"
-        step="0.05"
-        value={pitchTolerance}
-        oninput={handlePitchToleranceChange}
-      />
-    </label>
-    <label class="tolerance-control">
-      Timing tolerance (seconds): {timingTolerance.toFixed(2)}
-      <input
-        type="range"
-        min="0.02"
-        max="1"
-        step="0.02"
-        value={timingTolerance}
-        oninput={handleTimingToleranceChange}
-      />
-    </label>
-  </div>
-{/if}
 
 {#if analysisResult}
   {#if realigning}
@@ -164,85 +145,195 @@
     <NoteOverlay
       scoreNotes={scoreNotesForActiveInstrument}
       userNotes={analysisResult.note_data}
+      pairs={currentPairs}
       pitchMistakes={pitchMistakes}
+      pitchFrames={analysisResult.pitch_data?.pitches}
+      {pitchTolerance}
     />
   {/if}
 
-  <ul class="mistake-list">
-    {#if allMistakes.length === 0}
-      <li class="mistake-item clean">No mistakes at the current tolerance.</li>
-    {/if}
-    {#each allMistakes as m}
-      <li class="mistake-item {m.type}">
-        <span class="mistake-type">{MISTAKE_LABEL[m.type] ?? m.type}</span>
-        <span class="mistake-time">{mistakeTime(m)?.toFixed(2) ?? "?"}s</span>
-        <span class="mistake-detail">{mistakeDetail(m)}</span>
-      </li>
-    {/each}
-  </ul>
+  <div class="mistake-widget">
+    <div class="mistake-header">
+      <span>Mistakes:</span>
+      <select bind:value={mode}>
+        <option value="pitch">Pitch</option>
+        <option value="timing">Timing</option>
+      </select>
+    </div>
+    <table class="mistake-table">
+      <thead>
+        {#if mode === "pitch"}
+          <tr><th>#</th><th>Time</th><th>Type</th><th>Intended</th><th>Actual</th><th><img src="{ICONS}/pencil.svg" alt="Override" class="header-icon" title="Override the user mistake" /></th></tr>
+        {:else}
+          <tr><th>#</th><th>Time</th><th>Type</th><th>Note</th><th>Amount</th><th><img src="{ICONS}/pencil.svg" alt="Override" class="header-icon" title="Override the user mistake" /></th></tr>
+        {/if}
+      </thead>
+      <tbody>
+        {#if visibleMistakes.length === 0}
+          <tr><td colspan="6" class="clean">No mistakes at the current tolerance.</td></tr>
+        {/if}
+        {#each visibleMistakes as m, idx}
+          {@const isOverridden = overridden.has(overrideKey(m))}
+          <tr class:overridden={isOverridden}>
+            <td>{idx}</td>
+            <td>{mistakeTime(m) != null ? formatTime(mistakeTime(m)) : "—"}</td>
+            {#if mode === "pitch"}
+              {@const icon = typeIcon(m)}
+              <td class="icon-cell"><img src={icon.src} alt={m.type} title={icon.tip} class="type-icon" /></td>
+              <td>{m.type === "insertion" ? "—" : noteName(m.scoreNote?.midiNum?.[0])}</td>
+              <td>{m.type === "deletion" ? "—" : noteName(m.userNote?.midiNum?.[0])}</td>
+            {:else}
+              <td>{TIMING_LABELS[m.type] ?? m.type}</td>
+              <td>{noteName(m.scoreNote?.midiNum?.[0])}</td>
+              <td>{m.info}</td>
+            {/if}
+            <td class="icon-cell">
+              <button class="override-btn" onclick={() => toggleOverride(m)} title={isOverridden ? "Undo override" : "Override (dismiss this mistake)"}>
+                <img src="{ICONS}/{isOverridden ? 'undo-2' : 'trash-2'}.svg" alt={isOverridden ? "Undo" : "Dismiss"} class="type-icon" />
+              </button>
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
+{/if}
+
+{#if noteData}
+  {#if mode === "timing"}
+    <div class="tolerance-widget">
+      <img src="{ICONS}/circle-help.svg" alt="" class="help-icon" title="How far off +/- the user's note can vary from the score in timing." />
+      <span class="label">Tolerance (s):</span>
+      <input
+        type="range"
+        min="0.02"
+        max="1"
+        step="0.02"
+        value={timingTolerance}
+        oninput={handleTimingToleranceChange}
+        class="tolerance-slider"
+      />
+      <span class="value-box">{timingTolerance.toFixed(2)}</span>
+    </div>
+  {:else}
+    <div class="tolerance-widget">
+      <img src="{ICONS}/circle-help.svg" alt="" class="help-icon" title="How close to the intended note (in semitones) the user can play to be counted correct." />
+      <span class="label">Tolerance:</span>
+      <input
+        type="range"
+        min="0.05"
+        max="5"
+        step="0.05"
+        value={pitchTolerance}
+        oninput={handlePitchToleranceChange}
+        class="tolerance-slider"
+      />
+      <span class="value-box">{pitchTolerance.toFixed(2)}</span>
+    </div>
+  {/if}
 {/if}
 
 <style>
-  .tolerance-controls {
+  .tolerance-widget {
     display: flex;
-    flex-direction: column;
+    align-items: center;
     gap: 0.5rem;
-    margin-top: 0.75rem;
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
   }
-  .tolerance-control {
-    display: block;
-    font-family: system-ui, sans-serif;
-    font-size: 0.9rem;
+  .help-icon {
+    width: 14px;
+    height: 14px;
+    opacity: 0.7;
   }
-  .tolerance-control input {
-    display: block;
-    width: 100%;
-    max-width: 400px;
+  .label {
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .tolerance-slider {
+    flex: 1;
+    max-width: 320px;
+    accent-color: var(--accent);
+  }
+  .value-box {
+    display: inline-block;
+    min-width: 40px;
+    padding: 2px 6px;
+    text-align: center;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-family: monospace;
   }
   .status {
-    font-family: system-ui, sans-serif;
-    color: #555;
+    color: var(--text-secondary);
   }
   .error {
-    color: #c0392b;
-    font-family: system-ui, sans-serif;
+    color: var(--danger);
   }
-  .mistake-list {
-    list-style: none;
-    margin: 0.75rem 0 0;
-    padding: 0;
-    max-width: 500px;
-    font-family: system-ui, sans-serif;
+  .mistake-widget {
+    margin-top: 1rem;
+    max-width: 520px;
+  }
+  .mistake-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.4rem;
     font-size: 0.9rem;
   }
-  .mistake-item {
-    display: flex;
-    gap: 0.6rem;
-    padding: 0.35rem 0.5rem;
-    border-bottom: 1px solid #eee;
+  .mistake-header select {
+    background: var(--bg-surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 6px;
   }
-  .mistake-item.clean {
-    color: #27ae60;
+  .mistake-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
   }
-  .mistake-type {
+  .mistake-table th {
+    background: var(--bg-surface-raised);
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
     font-weight: 600;
-    min-width: 100px;
   }
-  .mistake-time {
-    color: #888;
-    min-width: 45px;
+  .mistake-table td {
+    text-align: center;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
   }
-  .mistake-item.substitution .mistake-type,
-  .mistake-item.insertion .mistake-type {
-    color: #e67e22;
+  .mistake-table td.clean {
+    color: var(--success);
   }
-  .mistake-item.deletion .mistake-type {
-    color: #c0392b;
+  .icon-cell img {
+    width: 18px;
+    height: 18px;
+    vertical-align: middle;
   }
-  .mistake-item.early .mistake-type,
-  .mistake-item.late .mistake-type,
-  .mistake-item.short .mistake-type,
-  .mistake-item.long .mistake-type {
-    color: #8e44ad;
+  .header-icon {
+    width: 14px;
+    height: 14px;
+    vertical-align: middle;
+  }
+  .override-btn {
+    background: none;
+    border: none;
+    padding: 2px;
+    cursor: pointer;
+    line-height: 0;
+  }
+  /* mirrors MistakeWidget._OVERRIDE_BG/_OVERRIDE_FG: a translucent dark tint
+     over the row plus dimmed text, so a dismissed mistake reads as "set
+     aside" rather than disappearing. */
+  tr.overridden td {
+    background: rgba(0, 0, 0, 0.45);
+    color: var(--text-disabled);
   }
 </style>

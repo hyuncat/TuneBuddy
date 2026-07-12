@@ -101,7 +101,7 @@
     Recording
     <input type="file" accept={AUDIO_ACCEPT} onchange={handleAudioChange} />
   </label>
-  <button type="submit" disabled={!scoreFile || !audioFile || status === "loading"}>
+  <button type="submit" class="btn" disabled={!scoreFile || !audioFile || status === "loading"}>
     {status === "loading" ? "Analyzing..." : "Analyze"}
   </button>
   {#if status === "error"}
@@ -114,7 +114,6 @@
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
-    font-family: system-ui, sans-serif;
     max-width: 400px;
   }
   label {
@@ -122,8 +121,28 @@
     flex-direction: column;
     gap: 0.25rem;
     font-size: 0.9rem;
+    color: var(--text-secondary);
+  }
+  input[type="file"] {
+    color: var(--text);
+  }
+  .btn {
+    background: var(--bg-surface-raised);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+    align-self: flex-start;
+  }
+  .btn:hover:not(:disabled) {
+    border-color: var(--accent);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .error {
-    color: #c0392b;
+    color: var(--danger);
   }
 </style>
