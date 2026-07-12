@@ -18,6 +18,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # This file lives at web/api/analyze_api.py; make the Attune project root (two
 # levels up) importable regardless of the working directory it's launched from.
@@ -25,6 +26,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from algorithms.Config import Config  # noqa: E402
+from algorithms.MistakeDetector import MistakeDetector  # noqa: E402
 from app_logic.JsonHandler import JsonHandler  # noqa: E402
 from app_logic.midi.ScoreData import ScoreData  # noqa: E402
 from app_logic.user.ds.Recording import Recording  # noqa: E402
@@ -134,6 +137,70 @@ async def note_data(score: UploadFile = File(...)) -> dict:
             str(channel): handler._note_data_to_payload(nd)
             for channel, nd in score_data.note_datas.items()
         },
+    }
+
+
+class RealignRequest(BaseModel):
+    # Same array shape /analyze's "note_data" and /notedata's per-channel
+    # note_data already return - the client sends back exactly what it
+    # already has, no reshaping on either side.
+    user_notes: list
+    score_notes: list
+    pitch_tolerance: float
+
+
+@app.post("/realign")
+async def realign(payload: RealignRequest) -> dict:
+    """Re-run pitch-mistake alignment at a new pitch tolerance, without
+    re-uploading audio or re-running pitch/note detection. This calls the
+    real MistakeDetector.detect_pitch_mistakes() - the same production path
+    Recording.detect_mistakes() uses by default (onset_aware=False) - rather
+    than a JS reimplementation: pitch tolerance is baked into the alignment's
+    own DP cost matrix (see algorithms/MistakeDetector.py's
+    _substitution_cost), so a tolerance change can genuinely change which
+    notes pair with which, not just relabel a fixed pairing. Reusing the
+    real algorithm here means zero risk of a hand-ported version silently
+    producing a different (wrong) alignment than the desktop app would.
+
+    Only pitch tolerance goes through this endpoint - timing-mistake
+    reclassification (early/late/short/long) is a simple fixed-pairs
+    threshold check with no re-alignment involved, so that stays purely
+    client-side against /analyze's existing pairs.
+    """
+    handler = JsonHandler()
+    try:
+        user_nd = handler._note_data_from_payload(payload.user_notes)
+        score_nd = handler._note_data_from_payload(payload.score_notes)
+    except (IndexError, TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Malformed note data: {e}")
+
+    config = Config(pitch_tolerance=payload.pitch_tolerance)
+    detector = MistakeDetector(config=config)
+    try:
+        aligned_pairs, _mistakes = detector.detect_pitch_mistakes(
+            user_string=user_nd, midi_string=score_nd
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Realignment failed: {e}")
+
+    # Index maps built from the SAME ordering (NoteData.times) the client's
+    # original arrays used, so returned indices resolve correctly against
+    # data the client already holds - reuses the identical helpers
+    # JsonHandler._alignment_to_payload uses for /analyze's own pairs, so
+    # indexing behavior can't drift between the two endpoints.
+    user_notes_full = [user_nd.data[t] for t in user_nd.times]
+    score_notes_full = [score_nd.data[t] for t in score_nd.times]
+    user_maps = JsonHandler._note_index_maps(user_notes_full)
+    score_maps = JsonHandler._note_index_maps(score_notes_full)
+
+    return {
+        "pairs": [
+            [
+                JsonHandler._lookup_note_index(u, user_maps),
+                JsonHandler._lookup_note_index(s, score_maps),
+            ]
+            for u, s in aligned_pairs
+        ]
     }
 
 

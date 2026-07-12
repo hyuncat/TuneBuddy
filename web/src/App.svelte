@@ -1,17 +1,55 @@
 <script>
   import ScoreViewer from "./ScoreViewer.svelte";
   import UploadForm from "./UploadForm.svelte";
+  import { realign, debounce } from "./realign.js";
+
+  const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
   let scoreViewer;
   let analysisResult = $state(null);
   let noteData = $state(null);
 
+  let pitchTolerance = $state(0.5);
+  let realignedPairs = $state(null);
+  let realignError = $state("");
+  let realigning = $state(false);
+
   function handleAnalysisResult(data) {
     analysisResult = data;
+    realignedPairs = null; // stale against the new recording until re-realigned
   }
 
   function handleNoteData(data) {
     noteData = data;
+  }
+
+  // 5A verification only: proves /realign genuinely re-aligns as pitch
+  // tolerance changes, not just that the request succeeds. The actual
+  // mistake list/tolerance UI is a later step - this just wires the data
+  // layer and shows it's live.
+  const debouncedRealign = debounce(async (tolerance) => {
+    if (!analysisResult || !noteData) return;
+    const activeInstrument = String(analysisResult.recording.active_instrument);
+    const scoreNotes = noteData.note_data[activeInstrument];
+    realigning = true;
+    try {
+      const result = await realign(analysisResult.note_data, scoreNotes, tolerance, API_BASE_URL);
+      realignedPairs = result.pairs;
+      realignError = "";
+    } catch (err) {
+      realignError = err instanceof Error ? err.message : String(err);
+    } finally {
+      realigning = false;
+    }
+  }, 250);
+
+  function handleToleranceChange(e) {
+    pitchTolerance = parseFloat(e.target.value);
+    debouncedRealign(pitchTolerance);
+  }
+
+  function unmatchedCount(pairs) {
+    return pairs.filter(([u, s]) => u === null || s === null).length;
   }
 
   // Minimal valid MusicXML (a single whole note, C4) - just enough to prove
@@ -66,8 +104,31 @@
       <p class="result-summary">
         Got {analysisResult.pitch_data.pitches.length} pitch frames,
         {analysisResult.note_data.length} user notes,
-        {analysisResult.alignment.pairs.length} aligned pairs.
+        {analysisResult.alignment.pairs.length} aligned pairs
+        ({unmatchedCount(analysisResult.alignment.pairs)} unmatched at the
+        server's default tolerance).
       </p>
+      <label class="tolerance-control">
+        Pitch tolerance (semitones): {pitchTolerance.toFixed(2)}
+        <input
+          type="range"
+          min="0.05"
+          max="5"
+          step="0.05"
+          value={pitchTolerance}
+          oninput={handleToleranceChange}
+        />
+      </label>
+      {#if realigning}
+        <p class="result-summary">Realigning...</p>
+      {:else if realignError}
+        <p class="error">{realignError}</p>
+      {:else if realignedPairs}
+        <p class="result-summary">
+          Realigned: {realignedPairs.length} pairs,
+          {unmatchedCount(realignedPairs)} unmatched at tolerance {pitchTolerance.toFixed(2)}.
+        </p>
+      {/if}
     {/if}
   </section>
 
@@ -96,5 +157,19 @@
   .result-summary {
     margin-top: 0.75rem;
     font-family: system-ui, sans-serif;
+  }
+  .tolerance-control {
+    display: block;
+    margin-top: 0.75rem;
+    font-family: system-ui, sans-serif;
+    font-size: 0.9rem;
+  }
+  .tolerance-control input {
+    display: block;
+    width: 100%;
+    max-width: 400px;
+  }
+  .error {
+    color: #c0392b;
   }
 </style>
