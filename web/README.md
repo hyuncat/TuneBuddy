@@ -25,7 +25,7 @@ requirements; see "Running the backend" below for the full commands):
 
 ```bash
 source venv/bin/activate
-uvicorn web.api.main:app --reload --app-dir .
+uvicorn web.api.analyze_api:app --reload --app-dir .
 ```
 
 - Health check: `http://localhost:8000/health`
@@ -72,7 +72,7 @@ import `algorithms/` and `app_logic/`, which live at the root):
 python3.14 -m venv venv
 source venv/bin/activate
 pip install -r web/api/requirements.txt
-uvicorn web.api.main:app --reload --app-dir .
+uvicorn web.api.analyze_api:app --reload --app-dir .
 ```
 
 On Windows, activate with `venv\Scripts\activate` instead of the `source`
@@ -162,7 +162,7 @@ content yet — it'll be replaced once the actual upload UI (task #4) exists.
 ```
 web/
 ├── api/                   # FastAPI backend (the /analyze endpoint)
-│   ├── main.py
+│   ├── analyze_api.py
 │   └── requirements.txt
 ├── scripts/
 │   └── sync-verovio.mjs   # copies resources/verovio -> web-resources/verovio

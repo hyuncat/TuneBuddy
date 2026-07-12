@@ -10,7 +10,7 @@ the same JsonHandler used for the desktop app's local `.json.xz` cache.
 
 Run (from the Attune project root):
     pip install -r web/api/requirements.txt
-    uvicorn web.api.main:app --reload --app-dir .
+    uvicorn web.api.analyze_api:app --reload --app-dir .
 """
 import sys
 import tempfile
@@ -19,7 +19,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-# This file lives at web/api/main.py; make the Attune project root (two
+# This file lives at web/api/analyze_api.py; make the Attune project root (two
 # levels up) importable regardless of the working directory it's launched from.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
