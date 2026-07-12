@@ -4,7 +4,11 @@
   // itself - that's a separate concern (results view, not built yet).
   import { getNoteData } from "./noteDataCache.js";
 
-  let { onResult, onNoteData } = $props();
+  // pitchTolerance: current value of the (now-earlier-visible) tolerance
+  // slider, owned by the parent so it's settable before Analyze is ever
+  // clicked - sent along so the first alignment already reflects it, instead
+  // of always starting from Config's fixed 0.5 default regardless of the UI.
+  let { onResult, onNoteData, pitchTolerance } = $props();
 
   const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -55,6 +59,9 @@
     const formData = new FormData();
     formData.append("score", scoreFile);
     formData.append("audio", audioFile);
+    if (pitchTolerance != null) {
+      formData.append("pitch_tolerance", String(pitchTolerance));
+    }
 
     try {
       // Deliberately NOT setting a Content-Type header: the browser sets

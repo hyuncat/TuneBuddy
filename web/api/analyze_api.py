@@ -16,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -59,7 +59,18 @@ def health() -> dict:
 
 
 @app.post("/analyze")
-async def analyze(score: UploadFile = File(...), audio: UploadFile = File(...)) -> dict:
+async def analyze(
+    score: UploadFile = File(...),
+    audio: UploadFile = File(...),
+    pitch_tolerance: float | None = Form(None),
+) -> dict:
+    """`pitch_tolerance`, if given, overrides Config's 0.5-semitone default for
+    this analysis's alignment step - lets a user who already adjusted the
+    tolerance control before ever clicking Analyze (matching the desktop
+    app's on_tolerance_applied/reanalyze_if_analyzed behavior - tolerance is
+    settable the moment a recording exists, not gated on analysis having run
+    yet) get a first alignment that already reflects it, instead of always
+    starting at the fixed default regardless of the UI."""
     #checking filetype
     score_suffix = await check_upload_file(score, SUPPORTED_SCORE_EXTENSIONS)
     # AudioData.load_data only special-cases .m4a (via pydub); everything else
@@ -79,7 +90,12 @@ async def analyze(score: UploadFile = File(...), audio: UploadFile = File(...)) 
             score_data = ScoreData()
             score_data.load(str(score_path))
 
-            rec = Recording(score_data=score_data)
+            # update_config() runs before MistakeDetector(recording=self) is
+            # constructed in Recording.__init__, and MistakeDetector reads
+            # recording.config at construction time - so a custom Config here
+            # reaches the alignment step correctly (verified, not assumed).
+            config = Config(pitch_tolerance=pitch_tolerance) if pitch_tolerance is not None else None
+            rec = Recording(score_data=score_data, config=config)
             rec.load_audio(str(audio_path), score_filepath=str(score_path), load_cache=False)
             rec.detect_pitches()
 
