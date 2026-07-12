@@ -98,7 +98,43 @@ async def analyze(score: UploadFile = File(...), audio: UploadFile = File(...)) 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
+    # Mistake classification now happens client-side, against whatever
+    # tolerance is currently set in the UI - the client needs the raw
+    # alignment (which user note maps to which score note) to redo that
+    # itself, not mistakes pre-filtered at whatever tolerance this server-side
+    # Config happened to use. JsonHandler's own payload shape is shared with
+    # the desktop app's local .json.xz cache format and deliberately left
+    # unmodified - this trims only the API response.
+    payload["alignment"] = {"pairs": payload["alignment"]["pairs"]}
     return payload
+
+
+@app.post("/notedata")
+async def note_data(score: UploadFile = File(...)) -> dict:
+    """Parse an uploaded score and return its note-by-note data, per
+    instrument channel. No GET counterpart by design - the client caches this
+    response itself (keyed by a hash of the score file's content) rather than
+    the server persisting it behind an id; see project notes on why. Index i
+    in note_data[channel] corresponds to index i in /analyze's alignment pairs
+    for that same channel (both walk NoteData.times, which is kept sorted) -
+    verified against app_logic/NoteData.py, not assumed.
+    """
+    score_data = await _parse_uploaded_score(score)
+    # _note_data_to_payload doesn't touch JsonHandler's own recording state,
+    # so a handler with no Recording attached is fine here - reusing it avoids
+    # a second implementation of the same note serialization drifting out of
+    # sync with the desktop app's cache format.
+    handler = JsonHandler()
+    return {
+        "title": score_data.title,
+        "bpm": score_data.bpm,
+        "active_instrument": score_data.active_instrument,
+        "instruments": sorted(int(ch) for ch in score_data.instruments),
+        "note_data": {
+            str(channel): handler._note_data_to_payload(nd)
+            for channel, nd in score_data.note_datas.items()
+        },
+    }
 
 
 #Helper function to check file extension (refactored for both score and audio to use the same call)
@@ -114,3 +150,20 @@ async def check_upload_file(file: UploadFile, allowed_extensions: set[str]) -> s
             ),
         )
     return suffix
+
+#helper method for converting an uploaded score file into a ScoreData object, with validation and cleanup - refactored for both analyze and notedata endpoints to use the same call
+async def _parse_uploaded_score(score: UploadFile) -> ScoreData:
+    """Validate + parse an uploaded score file into a ScoreData object.
+    ScoreData.load() extracts everything it needs into the object graph, so
+    the temp file is safe to clean up before returning - nothing reads from
+    the path afterward."""
+    score_suffix = await check_upload_file(score, SUPPORTED_SCORE_EXTENSIONS)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        score_path = Path(tmpdir) / f"score{score_suffix}"
+        score_path.write_bytes(await score.read())
+        score_data = ScoreData()
+        try:
+            score_data.load(str(score_path))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return score_data

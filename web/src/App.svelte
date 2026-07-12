@@ -1,7 +1,18 @@
 <script>
   import ScoreViewer from "./ScoreViewer.svelte";
+  import UploadForm from "./UploadForm.svelte";
 
   let scoreViewer;
+  let analysisResult = $state(null);
+  let noteData = $state(null);
+
+  function handleAnalysisResult(data) {
+    analysisResult = data;
+  }
+
+  function handleNoteData(data) {
+    noteData = data;
+  }
 
   // Minimal valid MusicXML (a single whole note, C4) - just enough to prove
   // ScoreViewer's iframe wiring end-to-end. Not from the real pipeline (that's
@@ -38,10 +49,35 @@
 
 <main>
   <h1>Attune</h1>
-  <button onclick={loadTestScore}>Load test score (ScoreViewer verification)</button>
-  <div class="viewer-frame">
-    <ScoreViewer bind:this={scoreViewer} />
-  </div>
+
+  <section>
+    <h2>Analyze a recording</h2>
+    <UploadForm onResult={handleAnalysisResult} onNoteData={handleNoteData} />
+    {#if noteData}
+      <!-- placeholder pending the real results view (task #5) -->
+      <p class="result-summary">
+        Score note data: "{noteData.title}", {noteData.instruments.length} instrument(s),
+        {Object.values(noteData.note_data).reduce((n, notes) => n + notes.length, 0)} score notes.
+      </p>
+    {/if}
+    {#if analysisResult}
+      <!-- mistake classification now happens client-side (task #5); this just
+           proves the raw alignment pairs came back, not pre-filtered mistakes -->
+      <p class="result-summary">
+        Got {analysisResult.pitch_data.pitches.length} pitch frames,
+        {analysisResult.note_data.length} user notes,
+        {analysisResult.alignment.pairs.length} aligned pairs.
+      </p>
+    {/if}
+  </section>
+
+  <section>
+    <h2>ScoreViewer verification</h2>
+    <button onclick={loadTestScore}>Load test score (ScoreViewer verification)</button>
+    <div class="viewer-frame">
+      <ScoreViewer bind:this={scoreViewer} />
+    </div>
+  </section>
 </main>
 
 <style>
@@ -53,5 +89,12 @@
     margin-top: 1rem;
     height: 400px;
     border: 1px solid #ccc;
+  }
+  section {
+    margin-bottom: 2rem;
+  }
+  .result-summary {
+    margin-top: 0.75rem;
+    font-family: system-ui, sans-serif;
   }
 </style>
