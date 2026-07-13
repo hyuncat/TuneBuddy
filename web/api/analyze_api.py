@@ -12,6 +12,7 @@ Run (from the Attune project root):
     pip install -r web/api/requirements.txt
     uvicorn web.api.analyze_api:app --reload --app-dir .
 """
+import base64
 import sys
 import tempfile
 from pathlib import Path
@@ -63,6 +64,7 @@ async def analyze(
     score: UploadFile = File(...),
     audio: UploadFile = File(...),
     pitch_tolerance: float | None = Form(None),
+    active_instrument: int | None = Form(None),
 ) -> dict:
     """`pitch_tolerance`, if given, overrides Config's 0.5-semitone default for
     this analysis's alignment step - lets a user who already adjusted the
@@ -70,7 +72,14 @@ async def analyze(
     app's on_tolerance_applied/reanalyze_if_analyzed behavior - tolerance is
     settable the moment a recording exists, not gated on analysis having run
     yet) get a first alignment that already reflects it, instead of always
-    starting at the fixed default regardless of the UI."""
+    starting at the fixed default regardless of the UI.
+
+    `active_instrument`, if given, overrides ScoreData's own default channel
+    pick (get_default_instrument()) - mirrors SettingsWidget's Instrument
+    selector, which sets score_data.active_instrument directly. Set before
+    Recording(score_data=...) is constructed, since Recording.__init__ copies
+    it once at construction time (verified against Recording.py, not
+    assumed) - setting it after would silently no-op."""
     #checking filetype
     score_suffix = await check_upload_file(score, SUPPORTED_SCORE_EXTENSIONS)
     # AudioData.load_data only special-cases .m4a (via pydub); everything else
@@ -89,6 +98,13 @@ async def analyze(
         try:
             score_data = ScoreData()
             score_data.load(str(score_path))
+            if active_instrument is not None:
+                if active_instrument not in score_data.note_datas:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown instrument channel {active_instrument}.",
+                    )
+                score_data.active_instrument = active_instrument
 
             # update_config() runs before MistakeDetector(recording=self) is
             # constructed in Recording.__init__, and MistakeDetector reads
@@ -114,6 +130,8 @@ async def analyze(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
@@ -144,6 +162,12 @@ async def note_data(score: UploadFile = File(...)) -> dict:
     # a second implementation of the same note serialization drifting out of
     # sync with the desktop app's cache format.
     handler = JsonHandler()
+    # Full-score MusicXML (same export ScoreViewer.py feeds Verovio via
+    # runJavaScript) so the center column can render the actual uploaded
+    # score, not a placeholder - fetched once here and cached client-side
+    # alongside the rest of /notedata's response (see noteDataCache.js),
+    # not repeated in /analyze's response.
+    musicxml_b64 = base64.b64encode(score_data.to_musicxml_bytes()).decode("ascii")
     return {
         "title": score_data.title,
         "bpm": score_data.bpm,
@@ -153,6 +177,7 @@ async def note_data(score: UploadFile = File(...)) -> dict:
             str(channel): handler._note_data_to_payload(nd)
             for channel, nd in score_data.note_datas.items()
         },
+        "musicxml_b64": musicxml_b64,
     }
 
 

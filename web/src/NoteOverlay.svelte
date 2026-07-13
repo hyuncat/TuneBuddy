@@ -218,11 +218,11 @@
 </svg>
 
 <p class="legend">
-  <span class="swatch" style="background:{hsl(120)}"></span> correct
-  <span class="swatch" style="background:{hsl(60)}"></span> off-pitch
-  <span class="swatch" style="background:{hsl(0)}"></span> way off
-  <span class="swatch" style="background:{INSERTION_COLOR}"></span> extra note
-  <span class="swatch" style="background:{DELETION_COLOR}"></span> missed note
+  <span class="legend-item"><span class="swatch" style="background:{hsl(120)}"></span>correct</span>
+  <span class="legend-item"><span class="swatch" style="background:{hsl(60)}"></span>off-pitch</span>
+  <span class="legend-item"><span class="swatch" style="background:{hsl(0)}"></span>way off</span>
+  <span class="legend-item"><span class="swatch" style="background:{INSERTION_COLOR}"></span>extra note</span>
+  <span class="legend-item"><span class="swatch" style="background:{DELETION_COLOR}"></span>missed note</span>
 </p>
 
 <style>
@@ -245,9 +245,16 @@
     font-size: 0.8rem;
     color: var(--text-secondary);
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 0.4rem;
+    row-gap: 0.3rem;
+    column-gap: 0.7rem;
     margin-top: 0.5rem;
+  }
+  .legend-item {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
   }
   .swatch {
     display: inline-block;

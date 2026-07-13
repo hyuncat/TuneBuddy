@@ -1,133 +1,141 @@
 <script>
+  // Ports app.py's QMainWindow layout: Toolbar (top) -> horizontal splitter
+  // [left: RecordingTree + SettingsWidget | center: ScoreViewer + GuitarHero
+  // (Perform tab's vertical splitter) | right: MistakeWidget + ToleranceWidget]
+  // -> transport row -> StatusBar. Practice tab (live pitch-matching) is out
+  // of scope (upload-only, no live recording), so only Perform's layout is
+  // ported - there's nothing to put in a second tab.
   import ScoreViewer from "./ScoreViewer.svelte";
-  import UploadForm from "./UploadForm.svelte";
+  import NoteOverlay from "./NoteOverlay.svelte";
   import ResultsView from "./ResultsView.svelte";
+  import Toolbar from "./Toolbar.svelte";
+  import RecordingTree from "./RecordingTree.svelte";
+  import SettingsPanel from "./SettingsPanel.svelte";
+  import TransportBar from "./TransportBar.svelte";
+  import StatusBar from "./StatusBar.svelte";
+  import { session } from "./sessionState.svelte.js";
 
   let scoreViewer;
-  let analysisResult = $state(null);
-  let noteData = $state(null);
-  let pitchTolerance = $state(0.5);
 
-  function handleAnalysisResult(data) {
-    analysisResult = data;
+  function base64ToBytes(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
   }
 
-  function handleNoteData(data) {
-    noteData = data;
-  }
-
-  // Minimal valid MusicXML (a single whole note, C4) - just enough to prove
-  // ScoreViewer's iframe wiring end-to-end. Not from the real pipeline (that's
-  // ScoreData.to_musicxml_bytes() server-side, not built yet) - this is a
-  // throwaway verification fixture, not app content.
-  const TEST_MUSICXML = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
-<score-partwise version="4.0">
-  <part-list>
-    <score-part id="P1"><part-name>Music</part-name></score-part>
-  </part-list>
-  <part id="P1">
-    <measure number="1">
-      <attributes>
-        <divisions>1</divisions>
-        <key><fifths>0</fifths></key>
-        <time><beats>4</beats><beat-type>4</beat-type></time>
-        <clef><sign>G</sign><line>2</line></clef>
-      </attributes>
-      <note>
-        <pitch><step>C</step><octave>4</octave></pitch>
-        <duration>4</duration>
-        <type>whole</type>
-      </note>
-    </measure>
-  </part>
-</score-partwise>`;
-
-  function loadTestScore() {
-    const bytes = new TextEncoder().encode(TEST_MUSICXML);
-    scoreViewer.loadScore(bytes);
-  }
+  // Loads the real uploaded score into Verovio the moment /notedata returns
+  // it (musicxml_b64 - see analyze_api.py), independent of Analyze ever
+  // running, mirroring the desktop app's score-independent score loading.
+  let lastLoadedMusicXml = null;
+  $effect(() => {
+    const b64 = session.noteData?.musicxml_b64;
+    if (b64 && b64 !== lastLoadedMusicXml && scoreViewer?.isReady()) {
+      lastLoadedMusicXml = b64;
+      scoreViewer.loadScore(base64ToBytes(b64));
+    }
+  });
 </script>
 
-<div class="toolbar">
-  <span class="app-title">Attune</span>
+<div class="app-shell">
+  <Toolbar />
+
+  <div class="main-splitter">
+    <aside class="left-column">
+      <RecordingTree />
+      <SettingsPanel />
+    </aside>
+
+    <section class="center-column">
+      <div class="score-pane">
+        <ScoreViewer bind:this={scoreViewer} />
+      </div>
+      <div class="overlay-pane">
+        {#if session.analysisResult && session.scoreNotesActive}
+          <NoteOverlay
+            scoreNotes={session.scoreNotesActive}
+            userNotes={session.analysisResult.note_data}
+            pairs={session.currentPairs}
+            pitchMistakes={session.pitchMistakes}
+            pitchFrames={session.analysisResult.pitch_data?.pitches}
+            pitchTolerance={session.pitchTolerance}
+          />
+        {:else}
+          <div class="overlay-placeholder">
+            Upload a score and a recording, then click Analyze to see the
+            pitch overlay here.
+          </div>
+        {/if}
+      </div>
+    </section>
+
+    <aside class="right-column">
+      <ResultsView />
+    </aside>
+  </div>
+
+  <TransportBar />
+  <StatusBar />
 </div>
 
-<main>
-  <section class="panel">
-    <h2>Analyze a recording</h2>
-    <UploadForm onResult={handleAnalysisResult} onNoteData={handleNoteData} {pitchTolerance} />
-    {#if noteData}
-      <p class="result-summary">
-        Score note data: "{noteData.title}", {noteData.instruments.length} instrument(s),
-        {Object.values(noteData.note_data).reduce((n, notes) => n + notes.length, 0)} score notes.
-      </p>
-    {/if}
-    <ResultsView {analysisResult} {noteData} bind:pitchTolerance />
-  </section>
-
-  <section class="panel">
-    <h2>ScoreViewer verification</h2>
-    <button class="btn" onclick={loadTestScore}>Load test score (ScoreViewer verification)</button>
-    <div class="viewer-frame">
-      <ScoreViewer bind:this={scoreViewer} />
-    </div>
-  </section>
-</main>
-
 <style>
-  .toolbar {
-    background: var(--bg-surface-raised);
-    border-bottom: 1px solid var(--border);
-    padding: 0.6rem 1.5rem;
+  .app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
   }
-  .app-title {
-    font-weight: 700;
-    font-size: 1.1rem;
-    letter-spacing: 0.02em;
+  .main-splitter {
+    flex: 1;
+    display: flex;
+    min-height: 0;
   }
-  main {
-    padding: 1.5rem;
-    max-width: 900px;
-    margin: 0 auto;
-  }
-  .panel {
+  .left-column {
+    width: 240px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border);
     background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 1.5rem;
+    min-width: 180px;
+    max-width: 320px;
   }
-  .panel h2 {
-    margin-top: 0;
-    font-size: 0.95rem;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    color: var(--text-secondary);
+  .center-column {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .score-pane {
+    flex: 1;
+    min-height: 200px;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 0.5rem;
   }
-  .viewer-frame {
-    margin-top: 1rem;
-    height: 400px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    overflow: hidden;
+  .overlay-pane {
+    flex: 1;
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
+    padding: 8px;
+    overflow: auto;
   }
-  .result-summary {
-    margin-top: 0.75rem;
+  .overlay-placeholder {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 2rem;
     color: var(--text-secondary);
-    font-size: 0.9rem;
-  }
-  .btn {
-    background: var(--bg-surface-raised);
-    color: var(--text);
+    background: var(--overlay-bg);
     border: 1px solid var(--border);
     border-radius: 4px;
-    padding: 0.4rem 0.8rem;
-    cursor: pointer;
   }
-  .btn:hover {
-    border-color: var(--accent);
+  .right-column {
+    width: 296px;
+    flex-shrink: 0;
+    border-left: 1px solid var(--border);
+    background: var(--bg-surface);
+    min-width: 240px;
+    max-width: 420px;
   }
 </style>
