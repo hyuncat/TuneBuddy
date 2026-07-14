@@ -12,14 +12,15 @@
 </div>
 
 <style>
+  /* QStatusBar background is genuinely distinct (#2a2b2e), and its QLabel
+     children aren't dimmed - full-strength text like everywhere else. */
   .status-bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 3px 10px;
-    background: var(--bg-surface-raised);
-    border-top: 1px solid var(--border);
+    background: var(--bg-statusbar);
     font-size: 0.78rem;
-    color: var(--text-secondary);
+    color: var(--text);
   }
 </style>

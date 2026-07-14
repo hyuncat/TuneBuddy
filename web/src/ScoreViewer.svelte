@@ -97,7 +97,7 @@
     align-items: center;
     justify-content: center;
     color: var(--text-secondary, #999);
-    background: var(--bg-surface, #242427);
+    background: var(--bg-window, #202124);
   }
   iframe {
     width: 100%;

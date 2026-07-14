@@ -1,28 +1,75 @@
-/* Dark theme matching the desktop app (qdarktheme.load_stylesheet("dark") +
-   app-specific colors pulled directly from the widget source). Values with a
-   citation are exact, taken from the Python source, not guessed:
-     - accent: ToleranceWidget._ACCENT = "#8ab4f8"
+/* Dark theme matching the desktop app. Values below are extracted directly
+   from qdarktheme.load_stylesheet("dark") (PyQtDarkTheme 0.1.7, the exact
+   package/version app.py loads) - generated once via
+   `python -c "import qdarktheme; print(qdarktheme.load_stylesheet('dark'))"`
+   and translated from its rgba(...) values to hex, not guessed. A few
+   app-specific colors are pulled directly from widget source instead, where
+   the app overrides the theme's own default:
      - toggle-on: ToggleSwitch's checked track color "#3daee9"
-     - disabled-fg: MistakeWidget._OVERRIDE_FG = QColor(105, 113, 119)
      - overlay-bg: GuitarHero.plot.setBackground((20, 20, 25))
-   Everything else (window/surface/border/text) is a reasonable dark palette
-   built around those anchors - qdarktheme's exact generated stylesheet isn't
-   available to copy verbatim, so this approximates it rather than matches
-   pixel-for-pixel. */
+   Qt has no "secondary/muted text" concept - QLabel text is full-strength
+   var(--text) unless the widget is actually :disabled (which gets
+   --text-disabled). Where this app dims non-disabled text for visual
+   hierarchy, that's a deliberate web-only deviation, not a theme value. */
 
 :root {
-  --bg-window: #1a1a1e;
-  --bg-surface: #242427;
-  --bg-surface-raised: #2c2c30;
-  --border: #3a3a3e;
-  --text: #e8e8ea;
-  --text-secondary: #a9adb3;
+  /* QWidget base bg/text (rgba(32,33,36,1) / rgba(228,231,235,1)) */
+  --bg-window: #202124;
+  --text: #e4e7eb;
+  /* QWidget:disabled color */
   --text-disabled: rgb(105, 113, 119);
-  --accent: #8ab4f8;
+
+  /* QToolBar background - deliberately lighter than the window, not the
+     same "surface" gray QLineEdit/QComboBox use */
+  --bg-toolbar: #333333;
+  /* QLineEdit/QComboBox background AND the one border color qdarktheme
+     reuses everywhere (QGroupBox/QMenu/QComboBox/QLineEdit/QPushButton) */
+  --bg-surface: #3f4042;
+  --border: #3f4042;
+  /* QMenu / QToolTip background */
+  --bg-menu: #292a2d;
+  /* QStatusBar background */
+  --bg-statusbar: #2a2b2e;
+  /* QToolBar > QToolButton hover / QStatusBar QWidget hover */
+  --bg-hover: #44464a;
+  /* QToolBar > QToolButton pressed|checked / QStatusBar QWidget pressed */
+  --bg-pressed: #4f5054;
+  /* QAbstractItemView::item selected (tree/list rows), QComboBox item selected */
+  --bg-item-selected: #004875;
+  /* ...selected but the view isn't focused/active */
+  --bg-item-selected-inactive: #393d41;
+  /* ...hovered but not selected */
+  --bg-item-hover: #292d2e;
+
+  /* selection-background-color / QPushButton text color / QSlider filled
+     track+handle / QComboBox+QLineEdit focus border */
+  --accent: #8ab4f7;
+  /* QPushButton hover/pressed backgrounds (a translucent accent tint, not a
+     flat gray) */
+  --accent-hover-bg: #1e2b3c;
+  --accent-pressed-bg: #2e465e;
+  /* QSlider::add-page (the unfilled portion of the track) - a dark blue,
+     not neutral gray */
+  --slider-track-unfilled: #36568c;
+  --slider-handle-hover: #7fa6e4;
+  /* QScrollBar::handle */
+  --scrollbar-handle: #414242;
+  --scrollbar-handle-hover: #5e5e5e;
+  /* QTableView background/gridline - genuinely black, not the surface gray */
+  --bg-table: #000000;
+  --table-gridline: #58595c;
+  /* QHeaderView::section background (same gray as --border, named
+     separately since it's a distinct semantic use) */
+  --bg-header: #3f4042;
+
   --toggle-on: #3daee9;
   --overlay-bg: rgb(20, 20, 25);
   --danger: #ff5555;
   --success: #27ae60;
+
+  /* Deliberate web-only deviation (see file header) - used sparingly for
+     helper/caption text, not for anything that maps to a real QLabel. */
+  --text-secondary: #a9adb3;
 }
 
 * {
@@ -42,4 +89,21 @@ button,
 select {
   font-family: inherit;
   color: inherit;
+}
+
+/* QScrollBar: 7px, flat handle, no arrow buttons - applied globally since
+   several panels (RecordingTree, mistake table, results column) scroll. */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-handle);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-handle-hover);
 }

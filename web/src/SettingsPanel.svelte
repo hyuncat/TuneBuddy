@@ -75,12 +75,14 @@
 </div>
 
 <style>
+  /* The scroll area content sits on the base QWidget background, not the
+     input-family gray. */
   .settings-panel {
     display: flex;
     flex-direction: column;
     gap: 6px;
     padding: 8px;
-    background: var(--bg-surface);
+    background: var(--bg-window);
     border-top: 1px solid var(--border);
     font-size: 0.8rem;
   }
@@ -89,39 +91,60 @@
     align-items: center;
     gap: 4px;
   }
+  /* QLabel isn't dimmed - full-strength text, same as everything else */
   .row label {
-    color: var(--text-secondary);
+    color: var(--text);
     width: 62px;
     flex-shrink: 0;
   }
+  /* QLineEdit/QComboBox: bg #3f4042, 4px radius, accent focus border */
   .row input,
   .row select {
     flex: 1;
     min-width: 0;
-    background: var(--bg-window);
+    background: var(--bg-surface);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 3px;
-    padding: 2px 4px;
+    border-radius: 4px;
+    padding: 3px 4px;
+  }
+  .row input:focus,
+  .row select:focus {
+    outline: none;
+    border-color: var(--accent);
   }
   .row input:disabled,
   .row select:disabled {
     color: var(--text-disabled);
   }
   .sep {
-    color: var(--text-secondary);
+    color: var(--text);
   }
+  /* QPushButton (icon-only, 28x28): bordered, transparent at rest,
+     accent-tinted hover/pressed. */
   .apply-btn {
-    background: none;
-    border: none;
-    padding: 2px;
+    width: 24px;
+    height: 24px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px;
     cursor: pointer;
-    line-height: 0;
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .apply-btn:hover:not(:disabled) {
+    background: var(--accent-hover-bg);
+  }
+  .apply-btn:active:not(:disabled) {
+    background: var(--accent-pressed-bg);
   }
   .apply-btn:disabled {
-    opacity: 0.4;
+    border-color: transparent;
     cursor: default;
+    opacity: 0.4;
   }
   .apply-btn img {
     width: 16px;

@@ -89,13 +89,18 @@
     display: flex;
     min-height: 0;
   }
+  /* QMainWindow::separator is 4px, in the shared border-gray (a static
+     approximation here - no drag interaction, just the real handle width
+     and color instead of a 1px pane border). Panes themselves are plain
+     QWidgets, so they take the base window background, not the
+     input-family surface gray. */
   .left-column {
     width: 240px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    border-right: 1px solid var(--border);
-    background: var(--bg-surface);
+    border-right: 4px solid var(--border);
+    background: var(--bg-window);
     min-width: 180px;
     max-width: 320px;
   }
@@ -108,7 +113,7 @@
   .score-pane {
     flex: 1;
     min-height: 200px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 4px solid var(--border);
   }
   .overlay-pane {
     flex: 1;
@@ -133,8 +138,8 @@
   .right-column {
     width: 296px;
     flex-shrink: 0;
-    border-left: 1px solid var(--border);
-    background: var(--bg-surface);
+    border-left: 4px solid var(--border);
+    background: var(--bg-window);
     min-width: 240px;
     max-width: 420px;
   }

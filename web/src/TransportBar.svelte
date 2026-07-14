@@ -35,26 +35,38 @@
 {/if}
 
 <style>
+  /* self.transport_widget is a plain QWidget (not a QToolBar/QStatusBar), so
+     it takes the base QWidget background - same color as the rest of the
+     window, not a distinct "raised" panel. The hairline top border is a
+     minimal web-only affordance since the real app gets its visual
+     separation for free from the splitter/tab edge above this row. */
   .transport-bar {
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
-    background: var(--bg-surface-raised);
+    background: var(--bg-window);
     border-top: 1px solid var(--border);
   }
+  /* play/record are real QPushButtons (icon-only, fixed 26x26): transparent
+     at rest, accent-tinted hover/pressed, bordered in the shared gray. */
   .icon-btn {
     width: 26px;
     height: 26px;
     padding: 4px;
-    background: var(--bg-surface);
+    background: transparent;
     border: 1px solid var(--border);
-    border-radius: 3px;
-    cursor: default;
+    border-radius: 4px;
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+  }
+  .icon-btn:hover:not(:disabled) {
+    background: var(--accent-hover-bg);
+  }
+  .icon-btn:active:not(:disabled) {
+    background: var(--accent-pressed-bg);
   }
   .icon-btn img {
     width: 100%;
@@ -64,28 +76,50 @@
   }
   .time-label {
     min-width: 100px;
-    color: var(--text-secondary);
+    color: var(--text);
     font-family: monospace;
     font-size: 0.85rem;
   }
+  /* QSlider: 4px groove, filled portion in accent, unfilled in a dark blue
+     (not neutral gray) - accent-color alone can't express the two-tone
+     track, so the groove/thumb are hand-styled instead of relying on it. */
   .transport-slider {
     flex: 1;
-    accent-color: var(--accent);
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--slider-track-unfilled);
   }
+  .transport-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 8px;
+    border-radius: 8px;
+    background: var(--accent);
+  }
+  .transport-slider:disabled {
+    opacity: 0.5;
+  }
+  /* QPushButton: border in the shared gray, accent-colored TEXT (not
+     white), transparent at rest, accent-tinted hover/pressed backgrounds. */
   .analyze-btn {
-    background: var(--bg-surface);
-    color: var(--text);
+    background: transparent;
+    color: var(--accent);
     border: 1px solid var(--border);
     border-radius: 4px;
-    padding: 5px 14px;
+    padding: 4px 8px;
     cursor: pointer;
     flex-shrink: 0;
   }
   .analyze-btn:hover:not(:disabled) {
-    border-color: var(--accent);
+    background: var(--accent-hover-bg);
+  }
+  .analyze-btn:active:not(:disabled) {
+    background: var(--accent-pressed-bg);
   }
   .analyze-btn:disabled {
-    opacity: 0.5;
+    color: var(--text-disabled);
     cursor: default;
   }
   .error {

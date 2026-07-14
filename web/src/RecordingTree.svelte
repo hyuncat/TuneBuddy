@@ -44,11 +44,15 @@
 </div>
 
 <style>
+  /* QTreeWidget has no background override of its own - it's the base
+     QWidget color. Item text isn't dimmed by kind (RecordingTree.py sets no
+     per-kind color/font); only indentation (14px) distinguishes a recording
+     from its parent score. */
   .recording-tree {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    background: var(--bg-surface);
+    background: var(--bg-window);
     padding: 4px 0;
     font-size: 0.85rem;
   }
@@ -58,7 +62,7 @@
     background: none;
     border: none;
     font: inherit;
-    color: inherit;
+    color: var(--text);
     text-align: left;
     padding: 4px 10px;
     cursor: pointer;
@@ -68,14 +72,15 @@
   }
   .recording-item {
     padding-left: 24px;
-    color: var(--text-secondary);
   }
-  .tree-item:hover {
-    background: var(--bg-surface-raised);
+  /* QAbstractItemView::item:!selected:hover */
+  .tree-item:hover:not(.selected) {
+    background: var(--bg-item-hover);
   }
+  /* QAbstractItemView::item:selected */
   .tree-item.selected {
-    background: var(--accent);
-    color: var(--bg-window);
+    background: var(--bg-item-selected);
+    color: var(--text);
   }
   .empty {
     color: var(--text-secondary);

@@ -109,29 +109,34 @@
 {/if}
 
 <style>
+  /* QToolBar: bg #333333 (lighter than the window), 1px padding, bold text,
+     2px spacing between items - all real values, not approximated. */
   .toolbar {
     display: flex;
     align-items: center;
     gap: 2px;
-    background: var(--bg-surface-raised);
-    border-bottom: 1px solid var(--border);
-    padding: 4px 8px;
+    background: var(--bg-toolbar);
+    padding: 1px;
     font-size: 0.85rem;
+    font-weight: 700;
   }
   .tb-item {
     position: relative;
   }
+  /* QToolBar > QToolButton: transparent, 3px padding, 4px radius */
   .tb-button {
     background: none;
-    border: 1px solid transparent;
+    border: none;
     color: var(--text);
-    border-radius: 3px;
+    border-radius: 4px;
     padding: 4px 10px;
     cursor: pointer;
   }
   .tb-button:hover:not(:disabled) {
-    border-color: var(--border);
-    background: var(--bg-surface);
+    background: var(--bg-hover);
+  }
+  .tb-button:active:not(:disabled) {
+    background: var(--bg-pressed);
   }
   .tb-button:disabled {
     color: var(--text-disabled);
@@ -142,6 +147,9 @@
     inset: 0;
     z-index: 10;
   }
+  /* QMenu: bg #292a2d, 8px vertical padding, 1px border in the shared
+     border-gray, items get 4px/28px padding and highlight to the same gray
+     on hover/selection. */
   .tb-menu {
     position: absolute;
     top: 100%;
@@ -149,84 +157,89 @@
     z-index: 11;
     display: flex;
     flex-direction: column;
-    background: var(--bg-surface);
+    background: var(--bg-menu);
     border: 1px solid var(--border);
     border-radius: 4px;
-    min-width: 120px;
-    padding: 2px;
+    min-width: 140px;
+    padding: 8px 0;
+    font-weight: 400;
   }
   .tb-menu button {
     background: none;
     border: none;
     color: var(--text);
     text-align: left;
-    padding: 5px 10px;
+    padding: 4px 28px 4px 12px;
     cursor: pointer;
-    border-radius: 3px;
   }
   .tb-menu button:hover:not(:disabled) {
-    background: var(--bg-surface-raised);
+    background: var(--border);
   }
   .tb-menu button:disabled {
     color: var(--text-disabled);
     cursor: default;
   }
   .tb-separator {
-    width: 1px;
+    width: 2px;
     align-self: stretch;
-    margin: 2px 6px;
+    margin: 6px;
     background: var(--border);
   }
   .tb-spacer {
     flex: 1;
   }
+  /* QLineEdit/QAbstractSpinBox: bg #3f4042 (the shared surface/border gray),
+     4px radius, focus ring in accent. */
   .tempo-spinbox {
     width: 52px;
     background: var(--bg-surface);
     color: var(--text-disabled);
     border: 1px solid var(--border);
-    border-radius: 3px;
-    padding: 2px 4px;
+    border-radius: 4px;
+    padding: 3px 4px;
     text-align: right;
+    font-weight: 400;
   }
   .tb-label {
-    color: var(--text-secondary);
+    color: var(--text);
     white-space: nowrap;
     padding: 0 4px;
   }
+  /* ui/info/ToggleSwitch.py, ported exactly: a QCheckBox custom-painted at a
+     fixed 46x26, 2px margin to the track, off-track #777777 (not the theme's
+     neutral gray), a solid white knob at any state, on-track "#3daee9". */
   .toggle-switch input {
     display: none;
   }
-  .toggle-track {
+  .toggle-switch {
     display: inline-block;
-    width: 32px;
-    height: 18px;
-    border-radius: 9px;
-    background: var(--border);
     position: relative;
+    width: 46px;
+    height: 26px;
     vertical-align: middle;
+    opacity: 0.7;
+  }
+  .toggle-track {
+    position: absolute;
+    inset: 2px;
+    border-radius: 11px;
+    background: #777777;
   }
   .toggle-track::after {
     content: "";
     position: absolute;
     top: 2px;
     left: 2px;
-    width: 14px;
-    height: 14px;
+    width: 18px;
+    height: 18px;
     border-radius: 50%;
-    background: var(--text-secondary);
+    background: white;
   }
   .toggle-switch input:checked + .toggle-track {
     background: var(--toggle-on);
-    opacity: 0.5;
   }
   .toggle-switch input:checked + .toggle-track::after {
-    left: 16px;
-    background: var(--text);
-  }
-  .toggle-switch {
-    cursor: default;
-    opacity: 0.7;
+    left: 22px;
   }
   .upload-error {
     color: var(--danger);

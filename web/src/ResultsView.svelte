@@ -153,26 +153,42 @@
     opacity: 0.7;
   }
   .label {
-    color: var(--text-secondary);
+    color: var(--text);
     white-space: nowrap;
   }
+  /* QSlider: 4px groove, dark-blue unfilled track, pill-shaped accent
+     handle - accent-color can't express the two-tone track, so this is
+     hand-styled rather than relying on the browser default. */
   .tolerance-slider {
     flex: 1;
     max-width: 320px;
-    accent-color: var(--accent);
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--slider-track-unfilled);
   }
+  .tolerance-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 8px;
+    border-radius: 8px;
+    background: var(--accent);
+    cursor: pointer;
+  }
+  /* QLineEdit */
   .value-box {
     display: inline-block;
     min-width: 40px;
-    padding: 2px 6px;
+    padding: 3px 6px;
     text-align: center;
     background: var(--bg-surface);
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: 4px;
     font-family: monospace;
   }
   .status {
-    color: var(--text-secondary);
+    color: var(--text);
   }
   .error {
     color: var(--danger);
@@ -188,32 +204,40 @@
     margin-bottom: 0.4rem;
     font-size: 0.9rem;
   }
+  /* QComboBox */
   .mistake-header select {
     background: var(--bg-surface);
     color: var(--text);
     border: 1px solid var(--border);
-    border-radius: 3px;
-    padding: 2px 6px;
+    border-radius: 4px;
+    padding: 3px 6px;
   }
+  .mistake-header select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  /* QTableView: genuinely black background + a distinct gridline color -
+     not the general surface gray. */
   .mistake-table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.85rem;
-    background: var(--bg-surface);
+    background: var(--bg-table);
     border: 1px solid var(--border);
   }
+  /* QHeaderView::section: bg #3f4042, left-aligned, not dimmed */
   .mistake-table th {
-    background: var(--bg-surface-raised);
-    color: var(--text-secondary);
+    background: var(--bg-header);
+    color: var(--text);
     text-align: center;
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--table-gridline);
     font-weight: 600;
   }
   .mistake-table td {
     text-align: center;
     padding: 4px 6px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--table-gridline);
   }
   .mistake-table td.clean {
     color: var(--success);
@@ -231,10 +255,15 @@
   .override-btn {
     background: none;
     border: none;
+    border-radius: 3px;
     padding: 2px;
     cursor: pointer;
     line-height: 0;
   }
+  .override-btn:hover {
+    background: var(--bg-hover);
+  }
+  /* MistakeWidget._OVERRIDE_BG / _OVERRIDE_FG, exact */
   tr.overridden td {
     background: rgba(0, 0, 0, 0.45);
     color: var(--text-disabled);
