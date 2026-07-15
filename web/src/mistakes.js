@@ -121,3 +121,26 @@ export function noteName(midiNum) {
   const octave = Math.floor(n / 12) - 1;
   return `${SHARP_NOTE_NAMES[pitchClass]}${octave}`;
 }
+
+// Inverse of noteName(): parses a letter name ("G3", "F#5", or "Bb3" - flats
+// accepted for input even though noteName() only ever emits sharps) back to
+// a MIDI number. Returns null for anything unparseable, so callers can
+// distinguish "invalid input" from a valid MIDI 0.
+const LETTER_SEMITONES = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+export function noteNameToMidi(name) {
+  const match = /^([A-Ga-g])([#b]?)(-?\d+)$/.exec(String(name ?? "").trim());
+  if (!match) return null;
+  const [, letter, accidental, octaveStr] = match;
+  let semitone = LETTER_SEMITONES[letter.toUpperCase()];
+  if (accidental === "#") semitone += 1;
+  else if (accidental === "b") semitone -= 1;
+  return (parseInt(octaveStr, 10) + 1) * 12 + semitone;
+}
+
+// Config.fmin/fmax are in Hz, not MIDI - this is the same A440-equal-temperament
+// formula Config/PitchDetector use, parameterized by the current tuning
+// reference (ToleranceWidget-adjacent SettingsWidget's Tuning field) instead
+// of hardcoding 440.
+export function midiToHz(midiNum, tuning = 440) {
+  return tuning * Math.pow(2, (midiNum - 69) / 12);
+}

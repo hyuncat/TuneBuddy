@@ -5,12 +5,11 @@
   // Text-only buttons, no icons - the desktop toolbar itself uses none
   // (confirmed: no QIcon/.svg/.png references in Toolbar.py).
   //
-  // Settings/Save/Clip/Playback/Tempo/Metronome have no backend behind them
-  // yet (no persistence layer, no clip selection, no MIDI playback - task
-  // #3) so they're rendered disabled with a tooltip explaining why, rather
-  // than either hiding them (breaking the structural match) or faking
-  // functionality that doesn't exist.
+  // Settings/Save/Clip have no backend behind them (no persistence layer,
+  // no clip selection) so stay disabled with a tooltip. Playback/Tempo/
+  // Metronome are real now (playback.svelte.js).
   import { session } from "./sessionState.svelte.js";
+  import { playback } from "./playback.svelte.js";
 
   const SCORE_ACCEPT = ".mid,.midi,.mxl,.musicxml,.xml,.mei";
   const AUDIO_ACCEPT = ".wav,.wave,.flac,.ogg,.aif,.aiff,.m4a";
@@ -41,7 +40,28 @@
     closeMenus();
   }
 
-  let tempoDisplay = $derived(session.noteData?.bpm ?? 120);
+  // Toolbar.py's populate_instrument_menu skips the metronome channel from
+  // this list - it gets its own switch instead.
+  let instrumentChannels = $derived(
+    (session.noteData?.instruments ?? []).filter((ch) => ch !== session.noteData?.metronome_channel)
+  );
+
+  // mirrors app.py's on_tempo_changed: rejected while playing (the desktop
+  // reverts the spinbox; here it's just disabled while playing, simpler and
+  // equally effective since there's no separate "commit" step to reject).
+  let tempoValue = $state(120);
+  let lastBpmSource = null;
+  $effect(() => {
+    if (session.noteData && session.noteData !== lastBpmSource) {
+      lastBpmSource = session.noteData;
+      tempoValue = session.noteData.bpm ?? 120;
+    }
+  });
+
+  function handleTempoChange(e) {
+    tempoValue = parseInt(e.target.value, 10) || 120;
+    playback.setTempo(tempoValue);
+  }
 </script>
 
 <div class="toolbar">
@@ -75,10 +95,33 @@
       class="tb-button"
       onclick={() => (playbackMenuOpen = !playbackMenuOpen)}
       disabled={!session.noteData}
-      title="Playback selection requires MIDI playback, which isn't wired up yet"
     >
       Playback
     </button>
+    {#if playbackMenuOpen}
+      <div class="tb-backdrop" onclick={closeMenus}></div>
+      <div class="tb-menu">
+        <label class="tb-check">
+          <input
+            type="checkbox"
+            checked={playback.userAudioOn}
+            onchange={(e) => playback.setUserAudioOn(e.target.checked)}
+          />
+          User
+        </label>
+        <div class="tb-menu-sep"></div>
+        {#each instrumentChannels as ch}
+          <label class="tb-check">
+            <input
+              type="checkbox"
+              checked={!playback.mutedChannels.has(ch)}
+              onchange={() => playback.toggleChannelMute(ch)}
+            />
+            Channel {ch}
+          </label>
+        {/each}
+      </div>
+    {/if}
   </div>
 
   <div class="tb-spacer"></div>
@@ -88,15 +131,19 @@
     type="number"
     min="20"
     max="400"
-    value={tempoDisplay}
-    disabled
-    title="Tempo control requires playback, which isn't wired up yet"
-    readonly
+    value={tempoValue}
+    oninput={handleTempoChange}
+    disabled={playback.isPlaying}
+    title={playback.isPlaying ? "Tempo can't change while playing" : "Playback tempo (doesn't affect analysis)"}
   />
   <span class="tb-label">BPM</span>
   <span class="tb-label">Metronome</span>
-  <label class="toggle-switch" title="Metronome requires playback, which isn't wired up yet">
-    <input type="checkbox" checked disabled />
+  <label class="toggle-switch">
+    <input
+      type="checkbox"
+      checked={playback.metronomeOn}
+      onchange={(e) => playback.setMetronomeOn(e.target.checked)}
+    />
     <span class="toggle-track"></span>
   </label>
 </div>
@@ -179,6 +226,25 @@
     color: var(--text-disabled);
     cursor: default;
   }
+  /* QCheckBox as used inside the Playback menu (Toolbar.py wraps each in a
+     QWidgetAction container, 2px/2px/10px/2px margins - approximated here
+     with padding). */
+  .tb-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px 4px 12px;
+    cursor: pointer;
+    color: var(--text);
+  }
+  .tb-check:hover {
+    background: var(--border);
+  }
+  .tb-menu-sep {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 0;
+  }
   .tb-separator {
     width: 2px;
     align-self: stretch;
@@ -193,12 +259,19 @@
   .tempo-spinbox {
     width: 52px;
     background: var(--bg-surface);
-    color: var(--text-disabled);
+    color: var(--text);
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 3px 4px;
     text-align: right;
     font-weight: 400;
+  }
+  .tempo-spinbox:disabled {
+    color: var(--text-disabled);
+  }
+  .tempo-spinbox:focus {
+    outline: none;
+    border-color: var(--accent);
   }
   .tb-label {
     color: var(--text);
@@ -217,7 +290,7 @@
     width: 46px;
     height: 26px;
     vertical-align: middle;
-    opacity: 0.7;
+    cursor: pointer;
   }
   .toggle-track {
     position: absolute;

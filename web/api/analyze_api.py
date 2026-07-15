@@ -65,6 +65,9 @@ async def analyze(
     audio: UploadFile = File(...),
     pitch_tolerance: float | None = Form(None),
     active_instrument: int | None = Form(None),
+    fmin: float | None = Form(None),
+    fmax: float | None = Form(None),
+    tuning: float | None = Form(None),
 ) -> dict:
     """`pitch_tolerance`, if given, overrides Config's 0.5-semitone default for
     this analysis's alignment step - lets a user who already adjusted the
@@ -79,7 +82,14 @@ async def analyze(
     selector, which sets score_data.active_instrument directly. Set before
     Recording(score_data=...) is constructed, since Recording.__init__ copies
     it once at construction time (verified against Recording.py, not
-    assumed) - setting it after would silently no-op."""
+    assumed) - setting it after would silently no-op.
+
+    `fmin`/`fmax` (Hz) and `tuning` (Hz) mirror SettingsWidget's Range and
+    Tuning fields, feeding PitchDetector's search bounds via Config. Range in
+    particular is a real accuracy lever, not just a display concern -
+    narrowing it to the piece's actual pitch span (the client defaults it to
+    the score's own range, not the wide general-purpose default) measurably
+    reduces PYIN octave-error candidates."""
     #checking filetype
     score_suffix = await check_upload_file(score, SUPPORTED_SCORE_EXTENSIONS)
     # AudioData.load_data only special-cases .m4a (via pydub); everything else
@@ -106,11 +116,22 @@ async def analyze(
                     )
                 score_data.active_instrument = active_instrument
 
-            # update_config() runs before MistakeDetector(recording=self) is
-            # constructed in Recording.__init__, and MistakeDetector reads
-            # recording.config at construction time - so a custom Config here
-            # reaches the alignment step correctly (verified, not assumed).
-            config = Config(pitch_tolerance=pitch_tolerance) if pitch_tolerance is not None else None
+            # update_config() runs before PitchDetector/MistakeDetector are
+            # constructed in Recording.__init__, and both read recording.config
+            # at construction time - so a custom Config here reaches both the
+            # PYIN search range (PitchDetector reads fmin/fmax/tuning to set
+            # tau_min/tau_max) and the alignment step correctly (verified
+            # against Recording.py/PitchDetector.py, not assumed).
+            config_kwargs = {}
+            if pitch_tolerance is not None:
+                config_kwargs["pitch_tolerance"] = pitch_tolerance
+            if fmin is not None:
+                config_kwargs["fmin"] = fmin
+            if fmax is not None:
+                config_kwargs["fmax"] = fmax
+            if tuning is not None:
+                config_kwargs["tuning"] = tuning
+            config = Config(**config_kwargs) if config_kwargs else None
             rec = Recording(score_data=score_data, config=config)
             rec.load_audio(str(audio_path), score_filepath=str(score_path), load_cache=False)
             rec.detect_pitches()
@@ -178,6 +199,14 @@ async def note_data(score: UploadFile = File(...)) -> dict:
             for channel, nd in score_data.note_datas.items()
         },
         "musicxml_b64": musicxml_b64,
+        # lets the client mute/exclude the metronome click track by default
+        # and drive its own Metronome toggle, mirroring Toolbar.py's
+        # metronome_toggled/populate_instrument_menu (which skips this
+        # channel from the per-instrument checkbox list and gives it its
+        # own switch instead). Each note already carries its own MIDI
+        # program in note_data[channel][i][5] (Note.instrument, set from
+        # MidiData.instruments - a real GM program number, not guessed).
+        "metronome_channel": score_data.metronome_channel,
     }
 
 

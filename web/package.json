@@ -4,6 +4,7 @@
   "type": "module",
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.2.0",
+    "concurrently": "^10.0.3",
     "svelte": "^5.56.4",
     "vite": "^8.1.4"
   },
@@ -12,6 +13,12 @@
     "build": "vite build",
     "preview": "vite preview",
     "sync-verovio": "node scripts/sync-verovio.mjs",
-    "sync-icons": "node scripts/sync-icons.mjs"
+    "sync-icons": "node scripts/sync-icons.mjs",
+    "sync-synth": "node scripts/sync-synth.mjs",
+    "backend": "cd .. && venv/bin/uvicorn web.api.analyze_api:app --app-dir . --port 8000",
+    "dev:all": "concurrently -n backend,frontend -c blue,green \"npm run backend\" \"npm run dev\""
+  },
+  "dependencies": {
+    "js-synthesizer": "^1.13.0"
   }
 }

@@ -11,11 +11,20 @@
   //     ALIGN_MAX_MULT = 4.0)
   //   - dashed white lines connecting matched/substituted pairs
   //     (GuitarHero.match_lines)
-  // Not live/animated: there's no MIDI playback yet (task #3) to drive a
-  // moving cursor, so this renders a finished result once.
+  //   - a solid green playhead line at the current playback time
+  //     (GuitarHero.timeline, pg.InfiniteLine, colors['timeline'] =
+  //     mkPen(0, 255, 0, 255))
   import { noteFromArray } from "./mistakes.js";
 
-  let { scoreNotes, userNotes, pairs, pitchMistakes, pitchTolerance, pitchFrames = null } = $props();
+  let {
+    scoreNotes,
+    userNotes,
+    pairs,
+    pitchMistakes,
+    pitchTolerance,
+    pitchFrames = null,
+    currentTime = null,
+  } = $props();
 
   // --- GuitarHero.MidiBackground, ported exactly ---
   const LETTER_RGB = {
@@ -215,6 +224,10 @@
   {#each pitchPoints as p}
     <circle cx={xPos(p.time)} cy={yPos(p.midi)} r={PITCH_DOT_RADIUS} fill={p.color} />
   {/each}
+
+  {#if currentTime != null && currentTime >= minTime && currentTime <= maxTime}
+    <line x1={xPos(currentTime)} y1="0" x2={xPos(currentTime)} y2={HEIGHT} class="playhead" />
+  {/if}
 </svg>
 
 <p class="legend">
@@ -237,6 +250,11 @@
     stroke: rgba(255, 255, 255, 0.55);
     stroke-width: 1.5;
     stroke-dasharray: 4, 3;
+  }
+  /* GuitarHero.timeline: solid green, above everything else in the plot */
+  .playhead {
+    stroke: rgb(0, 255, 0);
+    stroke-width: 1.5;
   }
   .user-note {
     opacity: 0.95;

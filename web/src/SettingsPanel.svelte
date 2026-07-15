@@ -1,12 +1,11 @@
 <script>
   // Ports ui/info/SettingsWidget.py's row structure exactly: Instrument,
   // Range, Tuning, Transpose, each a label + control(s) + checkmark Apply
-  // button. Only Instrument is wired to something real (score_data has
-  // multiple channels, and /analyze already accepts active_instrument -
-  // see analyze_api.py). Range/Tuning/Transpose map to Config.fmin/fmax/
-  // tuning and ScoreData.transpose_offset server-side, but nothing in this
-  // app sends them yet, so they're present for structural parity and
-  // disabled rather than half-wired.
+  // button. Instrument, Range, and Tuning are wired to something real
+  // (score_data has multiple channels; Range/Tuning feed Config.fmin/fmax/
+  // tuning, which PitchDetector reads directly - see analyze_api.py).
+  // Transpose maps to ScoreData.transpose_offset server-side, but nothing
+  // sends it yet, so it stays disabled rather than half-wired.
   import { session } from "./sessionState.svelte.js";
 
   const ICONS = "/icons";
@@ -23,6 +22,30 @@
     if (pendingInstrument != null) {
       session.setSelectedInstrument(pendingInstrument);
     }
+  }
+
+  // Range defaults to the score's own pitch span (see sessionState's
+  // computeDefaultRange) the moment a score loads or the instrument
+  // changes - these mirror that committed value until the user edits and
+  // applies their own.
+  let pendingLow = $state(session.lowNoteName);
+  let pendingHigh = $state(session.highNoteName);
+  $effect(() => {
+    pendingLow = session.lowNoteName;
+    pendingHigh = session.highNoteName;
+  });
+
+  function applyRange() {
+    session.setRange(pendingLow.trim(), pendingHigh.trim());
+  }
+
+  let pendingTuning = $state(session.tuning);
+  $effect(() => {
+    pendingTuning = session.tuning;
+  });
+
+  function applyTuning() {
+    session.setTuning(parseFloat(pendingTuning));
   }
 </script>
 
@@ -47,19 +70,22 @@
 
   <div class="row">
     <label for="range-low">Range:</label>
-    <input id="range-low" type="text" placeholder="G3" disabled title="Not yet wired to the backend" />
+    <input id="range-low" type="text" placeholder="G3" bind:value={pendingLow} />
     <span class="sep">—</span>
-    <input type="text" placeholder="E7" disabled title="Not yet wired to the backend" />
-    <button class="apply-btn" disabled title="Apply frequency range">
+    <input type="text" placeholder="E7" bind:value={pendingHigh} />
+    <button class="apply-btn" onclick={applyRange} title="Apply frequency range">
       <img src="{ICONS}/check.svg" alt="Apply" />
     </button>
   </div>
+  {#if session.rangeError}
+    <p class="field-error">{session.rangeError}</p>
+  {/if}
 
   <div class="row">
     <label for="tuning-input">Tuning:</label>
-    <input id="tuning-input" type="text" value="440" disabled title="Not yet wired to the backend" />
+    <input id="tuning-input" type="text" bind:value={pendingTuning} />
     <span class="sep">Hz</span>
-    <button class="apply-btn" disabled title="Apply tuning">
+    <button class="apply-btn" onclick={applyTuning} title="Apply tuning">
       <img src="{ICONS}/check.svg" alt="Apply" />
     </button>
   </div>
@@ -119,6 +145,11 @@
   }
   .sep {
     color: var(--text);
+  }
+  .field-error {
+    color: var(--danger);
+    font-size: 0.75rem;
+    margin: -2px 0 0;
   }
   /* QPushButton (icon-only, 28x28): bordered, transparent at rest,
      accent-tinted hover/pressed. */

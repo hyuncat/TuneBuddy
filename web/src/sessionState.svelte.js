@@ -9,7 +9,8 @@
 // so a singleton is simpler than threading context through every component.
 import { getNoteData } from "./noteDataCache.js";
 import { realign, debounce } from "./realign.js";
-import { classifyPitchMistakes, classifyTimingMistakes } from "./mistakes.js";
+import { classifyPitchMistakes, classifyTimingMistakes, noteName, noteNameToMidi, midiToHz } from "./mistakes.js";
+import { playback } from "./playback.svelte.js";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -29,6 +30,34 @@ function createSessionState() {
   let pitchTolerance = $state(0.5);
   let timingTolerance = $state(0.25);
   let mode = $state("pitch"); // "pitch" | "timing" - mirrors MistakeWidget's mode dropdown
+
+  // Range/Tuning (SettingsWidget) - these bound the server-side PYIN pitch
+  // detector's search range (Config.fmin/fmax) and reference pitch
+  // (Config.tuning), not just a mistake-classification display concern.
+  // Narrowing fmin/fmax to the piece's actual range is a real accuracy win
+  // (fewer octave-error candidates for PYIN to confuse itself with), which
+  // is why these default to the SCORE's own range instead of the wide
+  // general-purpose "G3"-"E7" span the desktop app's blank-state default
+  // uses - re-derived per instrument, since a different line can have a
+  // very different range.
+  //
+  // No padding beyond the score's exact min/max note, matching
+  // ui/info/SettingsWidget.py's populate_range_from_score() precisely (a
+  // straight min/max over the channel's midi_num values, no headroom).
+  // Padding was tried and reverted: it doesn't match any tested desktop
+  // behavior, and any value close to 12 semitones re-admits octave-alias
+  // candidates right back into PYIN's search window - exactly the
+  // confusion range-narrowing exists to prevent. Desktop's own answer to
+  // "a real mistake falls outside the range" isn't a buffer, it's that
+  // Range stays a user-adjustable control with an Apply-and-redetect loop
+  // (see app.py's on_range_applied) - the same escape hatch this web port
+  // already has via setRange()/runAnalyze().
+  const DEFAULT_LOW = "G3";
+  const DEFAULT_HIGH = "E7";
+  let lowNoteName = $state(DEFAULT_LOW);
+  let highNoteName = $state(DEFAULT_HIGH);
+  let tuning = $state(440);
+  let rangeError = $state("");
 
   let realignedPairs = $state(null);
   let realignError = $state("");
@@ -63,6 +92,35 @@ function createSessionState() {
     if (analysisResult) return analysisResult.recording.active_instrument;
     if (noteData) return noteData.active_instrument;
     return null;
+  }
+
+  // Scans the given channel's raw note arrays (note_data[channel][i][3] is
+  // the chord-aware midiNum array - see JsonHandler._note_to_payload) for
+  // its exact pitch span - a straight min/max, no padding, matching
+  // populate_range_from_score() exactly. Not a mistake-analysis path, so it
+  // works directly off the raw payload rather than noteFromArray().
+  function computeDefaultRange(channel) {
+    if (!noteData) return null;
+    const rawNotes = noteData.note_data[String(channel)];
+    if (!rawNotes || rawNotes.length === 0) return null;
+    let min = Infinity;
+    let max = -Infinity;
+    for (const n of rawNotes) {
+      for (const m of n[3]) {
+        if (m != null && m >= 0) {
+          if (m < min) min = m;
+          if (m > max) max = m;
+        }
+      }
+    }
+    if (min === Infinity) return null;
+    return { low: noteName(min), high: noteName(max) };
+  }
+
+  function applyDefaultRangeForActiveInstrument() {
+    const range = computeDefaultRange(activeInstrument());
+    lowNoteName = range?.low ?? DEFAULT_LOW;
+    highNoteName = range?.high ?? DEFAULT_HIGH;
   }
 
   function scoreNotesForActiveInstrument() {
@@ -126,6 +184,8 @@ function createSessionState() {
     try {
       noteData = await getNoteData(file, API_BASE_URL);
       statusMessage = `Loaded ${file.name}`;
+      playback.loadNoteData(noteData);
+      applyDefaultRangeForActiveInstrument();
     } catch (err) {
       noteDataError = err instanceof Error ? err.message : String(err);
       statusMessage = "Failed to load score.";
@@ -135,6 +195,7 @@ function createSessionState() {
   function pickAudio(file) {
     audioFile = file;
     statusMessage = file ? `Recording set: ${file.name}` : "";
+    playback.loadUserAudio(file);
   }
 
   async function runAnalyze() {
@@ -152,6 +213,11 @@ function createSessionState() {
     if (selectedInstrument != null) {
       formData.append("active_instrument", String(selectedInstrument));
     }
+    const lowMidi = noteNameToMidi(lowNoteName);
+    const highMidi = noteNameToMidi(highNoteName);
+    if (lowMidi != null) formData.append("fmin", String(midiToHz(lowMidi, tuning)));
+    if (highMidi != null) formData.append("fmax", String(midiToHz(highMidi, tuning)));
+    formData.append("tuning", String(tuning));
 
     try {
       const response = await fetch(`${API_BASE_URL}/analyze`, {
@@ -187,6 +253,28 @@ function createSessionState() {
 
   function setSelectedInstrument(channel) {
     selectedInstrument = channel;
+    applyDefaultRangeForActiveInstrument();
+  }
+
+  function setRange(low, high) {
+    const lowMidi = noteNameToMidi(low);
+    const highMidi = noteNameToMidi(high);
+    if (lowMidi == null || highMidi == null) {
+      rangeError = `Couldn't parse "${lowMidi == null ? low : high}" as a note name (e.g. G3, F#4, Bb2).`;
+      return;
+    }
+    if (lowMidi >= highMidi) {
+      rangeError = "Low note must be below the high note.";
+      return;
+    }
+    rangeError = "";
+    lowNoteName = low;
+    highNoteName = high;
+  }
+
+  function setTuning(hz) {
+    if (!Number.isFinite(hz) || hz <= 0) return;
+    tuning = hz;
   }
 
   return {
@@ -212,6 +300,10 @@ function createSessionState() {
     get visibleMistakes() { return visibleMistakes; },
     get activeInstrument() { return activeInstrument(); },
     get selectedInstrument() { return selectedInstrument; },
+    get lowNoteName() { return lowNoteName; },
+    get highNoteName() { return highNoteName; },
+    get tuning() { return tuning; },
+    get rangeError() { return rangeError; },
 
     pickScore,
     pickAudio,
@@ -219,6 +311,8 @@ function createSessionState() {
     setPitchTolerance,
     setTimingTolerance,
     setSelectedInstrument,
+    setRange,
+    setTuning,
     overrideKey,
     toggleOverride,
   };

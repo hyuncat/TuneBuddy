@@ -14,6 +14,12 @@ export default defineConfig({
   publicDir: "web-resources",
   server: {
     port,
-    strictPort: true,
+    // Falls back to the next free port instead of hard-failing when 5173 is
+    // taken - a real, permanent condition on at least one dev machine this
+    // runs on (another project holds 5173). The dev preview harness works
+    // around this itself by setting PORT before launch; strictPort:false
+    // makes a plain `npm run dev`/`dev:all` in a regular terminal resilient
+    // to the same collision without that harness.
+    strictPort: false,
   },
 });

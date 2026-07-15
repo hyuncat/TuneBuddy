@@ -3,28 +3,61 @@
   // record button, time label, slider, Analyze button - a persistent
   // full-width row below the main splitter, not inside a tab.
   //
-  // Play/record/slider are stubs: they drive live MIDI/audio playback
-  // (task #3, not built yet), so there's nothing to wire them to. Analyze
-  // is real - moved here from the old standalone upload panel, since on the
-  // desktop app it's the last control in this same row, not a separate form.
+  // Play/slider drive real MIDI playback (playback.svelte.js). Record stays
+  // a stub - live audio capture is out of scope for this upload-only web
+  // app, not something task #3 covers. Analyze is real - moved here from
+  // the old standalone upload panel, since on the desktop app it's the
+  // last control in this same row, not a separate form.
   import { session } from "./sessionState.svelte.js";
+  import { playback } from "./playback.svelte.js";
 
   const ICONS = "/icons";
 
   let canAnalyze = $derived(
     !!session.scoreFile && !!session.audioFile && session.analyzeStatus !== "loading"
   );
+  let canPlay = $derived(!!session.noteData && !playback.loading);
+
+  // mirrors app.py's update_time_label's format_time exactly: "MM:SS.s"
+  function formatTime(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${String(mins).padStart(2, "0")}:${secs.toFixed(1).padStart(4, "0")}`;
+  }
+
+  function togglePlay() {
+    if (playback.isPlaying) playback.pause();
+    else playback.play();
+  }
+
+  function handleSeek(e) {
+    playback.seek(parseFloat(e.target.value));
+  }
 </script>
 
 <div class="transport-bar">
-  <button class="icon-btn" disabled title="Playback isn't wired up yet">
-    <img src="{ICONS}/play.png" alt="Play" />
+  <button
+    class="icon-btn"
+    onclick={togglePlay}
+    disabled={!canPlay}
+    title={playback.error || (playback.loading ? "Loading soundfont..." : "Play/pause")}
+  >
+    <img src="{ICONS}/{playback.isPlaying ? 'pause' : 'play'}.png" alt={playback.isPlaying ? "Pause" : "Play"} />
   </button>
-  <button class="icon-btn" disabled title="Recording isn't wired up yet">
+  <button class="icon-btn" disabled title="Recording isn't supported in the web version (upload-only)">
     <img src="{ICONS}/record.png" alt="Record" />
   </button>
-  <span class="time-label">00:00.0 / 00:00.0</span>
-  <input class="transport-slider" type="range" min="0" max="100" value="0" disabled />
+  <span class="time-label">{formatTime(playback.currentTime)} / {formatTime(playback.duration)}</span>
+  <input
+    class="transport-slider"
+    type="range"
+    min="0"
+    max={playback.duration || 0}
+    step="0.05"
+    value={playback.currentTime}
+    oninput={handleSeek}
+    disabled={!canPlay}
+  />
   <button class="analyze-btn" onclick={() => session.runAnalyze()} disabled={!canAnalyze}>
     {session.analyzeStatus === "loading" ? "Analyzing..." : "Analyze"}
   </button>
@@ -32,6 +65,9 @@
 
 {#if session.analyzeStatus === "error"}
   <p class="error">{session.analyzeError}</p>
+{/if}
+{#if playback.error}
+  <p class="error">Playback: {playback.error}</p>
 {/if}
 
 <style>
@@ -72,6 +108,8 @@
     width: 100%;
     height: 100%;
     object-fit: contain;
+  }
+  .icon-btn:disabled img {
     opacity: 0.5;
   }
   .time-label {

@@ -14,8 +14,19 @@
   import TransportBar from "./TransportBar.svelte";
   import StatusBar from "./StatusBar.svelte";
   import { session } from "./sessionState.svelte.js";
+  import { playback } from "./playback.svelte.js";
 
   let scoreViewer;
+
+  // Drives the score cursor from the real playback clock - mirrors
+  // app.py's time_changed, which calls ScoreViewer.set_playback_time on
+  // every WallClock tick. playback.svelte.js polls at the same 10Hz
+  // cadence WallClock itself uses.
+  $effect(() => {
+    if (scoreViewer?.isReady()) {
+      scoreViewer.setPlaybackTime(playback.currentTime);
+    }
+  });
 
   function base64ToBytes(b64) {
     const binary = atob(b64);
@@ -59,6 +70,7 @@
             pitchMistakes={session.pitchMistakes}
             pitchFrames={session.analysisResult.pitch_data?.pitches}
             pitchTolerance={session.pitchTolerance}
+            currentTime={playback.currentTime}
           />
         {:else}
           <div class="overlay-placeholder">
