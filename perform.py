@@ -232,6 +232,7 @@ class PerformTab(QWidget):
         self.mistake_widget.selected.connect(self.on_mistake_selected)
         self.mistake_widget.cleared.connect(self.guitar_hero.clear_highlight)
         self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
+        self.mistake_widget.mode_changed.connect(self.guitar_hero.set_mistake_mode)
 
     # --- HOST-DRIVEN STATE ---
     def set_active_recording(self, rec: Recording):

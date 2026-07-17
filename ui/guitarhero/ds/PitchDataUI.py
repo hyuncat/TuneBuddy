@@ -35,6 +35,9 @@ class PitchDataUI(pg.ScatterPlotItem):
         self.distance_brushes = Colors.pitch_brushes(
             Colors.LIVE_CORRECT_THRESH, Colors.LIVE_MAX_DIST)
         self.volume_brushes = Colors.volume_brushes()
+        # knocked-back twins of the pooled brushes, made on demand for the
+        # hovered note (see hover_brush)
+        self._hover_brushes: dict[int, object] = {}
         # adaptive post-analysis ramp; rebuilt per-recording (set_tolerance).
         # Mutated in place so palette refs (GuitarHero.colors) never go stale.
         self.align_distance_brushes: list = []
@@ -79,8 +82,11 @@ class PitchDataUI(pg.ScatterPlotItem):
         return self.pitch_data.read(start_time, end_time, clean=True)
 
     # --- drawing ---
-    def update_view(self, start_time: float, end_time: float, mode: str = "pitch"):
-        """Redraw the dots for the given time window, colored per `mode`."""
+    def update_view(self, start_time: float, end_time: float, mode: str = "pitch",
+                    hover: tuple[float, float] | None = None):
+        """Redraw the dots for the given time window, colored per `mode`. `hover`
+        is the hovered note's time span, whose frames are knocked back so the
+        note being pointed at reads apart from the rest of the track."""
         volume_mode = mode == "volume"
         vmin_db, vmax_db = (None, None)
         if volume_mode and not self.live:
@@ -92,19 +98,24 @@ class PitchDataUI(pg.ScatterPlotItem):
                 continue
             xs.append(p.time)
             ys.append(p.value)  # primary pitch value
-            if volume_mode:
-                frac = Colors.volume_frac(getattr(p, "volume", 0.0), vmin_db, vmax_db)
-                brushes.append(self.get_volume_brush(frac))
-            elif getattr(p, "is_transition", False):
-                brushes.append(self.rest_brush)
-            else:
-                ad = getattr(p, "aligned_distance", None)
-                if ad:
-                    brushes.append(self.get_align_distance_brush(ad))
-                else:
-                    brushes.append(self.get_distance_brush(getattr(p, "live_distance", None)))
+            brush = self._brush_for(p, volume_mode, vmin_db, vmax_db)
+            if hover is not None and hover[0] <= p.time <= hover[1]:
+                brush = self.hover_brush(brush)
+            brushes.append(brush)
 
         self.setData(x=xs, y=ys, brush=brushes)
+
+    def _brush_for(self, p: Pitch, volume_mode: bool, vmin_db, vmax_db):
+        """The brush a frame draws with, before any hover knock-back."""
+        if volume_mode:
+            frac = Colors.volume_frac(getattr(p, "volume", 0.0), vmin_db, vmax_db)
+            return self.get_volume_brush(frac)
+        if getattr(p, "is_transition", False):
+            return self.rest_brush
+        ad = getattr(p, "aligned_distance", None)
+        if ad:
+            return self.get_align_distance_brush(ad)
+        return self.get_distance_brush(getattr(p, "live_distance", None))
 
     def setData(self, *args, **kwargs):
         # ScatterPlotItem.setData flushes old points via self.clear(); flag the
@@ -139,6 +150,17 @@ class PitchDataUI(pg.ScatterPlotItem):
         """Pooled brush for a 0..1 volume fraction."""
         idx = int(max(0.0, min(1.0, frac)) * (len(self.volume_brushes) - 1))
         return self.volume_brushes[idx]
+
+    def hover_brush(self, brush):
+        """The knocked-back twin of a pooled brush (see Colors.hover_brush),
+        pooled in turn. Keyed by COLOR, not by brush identity, so a ramp rebuilt
+        in place (set_tolerance) can never hand back a stale twin."""
+        key = brush.color().rgba()
+        twin = self._hover_brushes.get(key)
+        if twin is None:
+            twin = Colors.hover_brush(brush)
+            self._hover_brushes[key] = twin
+        return twin
 
     def _review_vol_range(self) -> tuple[float, float] | tuple[None, None]:
         """The take's (min_dBFS, max_dBFS) from PitchData.volume_range_db,

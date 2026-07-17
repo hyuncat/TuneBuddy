@@ -332,6 +332,13 @@ class Alignment:
             return self.match_score.get(score_note.start_time)
         return None
 
+    def mistakes_for(self, user_note: Note, mode: str = "pitch") -> list[Mistake]:
+        """Every mistake `mode` ("pitch" | "timing") flags this USER note for.
+        The two kinds live in two lists, so each mode sees only its own: a note
+        played in tune but late is flagged in timing mode and nowhere else."""
+        mistakes = self.timing_mistakes if mode == "timing" else self.pitch_mistakes
+        return [m for m in mistakes if self._same_note(m.user_note, user_note)]
+
     def reapply_overrides(self, overridden_mistake_indices: set[int]):
         self.reset_overrides()
         for index in overridden_mistake_indices:

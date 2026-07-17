@@ -8,6 +8,7 @@ import qdarktheme
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.user.ds.Recording import Recording
 from app_logic.user.NoteInfo import NoteInfo
+from app_logic.NoteData import Note
 from app_logic.Alignment import Alignment
 from ui.Colors import Colors
 from ui.guitarhero.MidiBackground import MidiBackground, MidiAxis
@@ -86,11 +87,14 @@ class GuitarHero(QWidget):
         self.init_view()
         self.init_legend()
 
-        # left-clicking a detected user note pops up its per-note characteristics
+        # left-clicking a detected user note selects it: highlight + seek + a popup
+        # of its characteristics, whose arrow keys then walk the take (_step_note)
         self.note_popup: NotePopupGH | None = None
+        self._popup_note: Note | None = None
         self.plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
         # hovering a detected user note shows a clickable (pointing-hand) cursor
-        self._hover_cursor_on = False
+        # and knocks that note's own pitch dots back
+        self._hovered_note: Note | None = None
         self.plot.scene().sigMouseMoved.connect(self._on_plot_hover)
 
     # --- INIT STUFF ---
@@ -204,6 +208,7 @@ class GuitarHero(QWidget):
         # this recording's pitch-mistake tolerance
         self.user_pitches.load_pitchdata(
             recording.pitch_data, tolerance=recording.config.pitch_tolerance)
+        self._popup_note = self._hovered_note = None  # they belong to the old take
         self.clear_highlight()
         self.update_view_items()
 
@@ -222,9 +227,7 @@ class GuitarHero(QWidget):
             2.2 alignment loaded
             2.3 pitch detected
         """
-        PAD = 1
-        xmin, xmax = self.plot.viewRange()[0]
-        x_range = (xmin-PAD, xmax+PAD)
+        x_range = self._view_window()
 
         # analysis / tempo changes rebuild the underlying data objects behind
         # the views, so re-assert each item's data ref before redrawing
@@ -235,12 +238,24 @@ class GuitarHero(QWidget):
         self.alignment_ui.load_alignment(self.alignment)
 
         self.bg.update_gridlines(x_range, self.score_data.beats if self.score_data else None)
-        self.user_pitches.update_view(*x_range, mode=self.color_mode)
+        self.update_pitches()
         self.user_notes.update_view(*x_range)
         self.midi_notes.update_view(*x_range, clip=self._active_clip_window())
         self._sync_alignment()
         self.alignment_ui.update_view(*x_range)
         self.update_clip_overlay()
+
+    def _view_window(self) -> tuple[float, float]:
+        """The visible time window, padded so items straddling an edge still draw."""
+        PAD = 1
+        xmin, xmax = self.plot.viewRange()[0]
+        return xmin - PAD, xmax + PAD
+
+    def update_pitches(self):
+        """Redraw just the pitch dots — the only layer a hover changes, so a
+        mouse move over the notes doesn't cost a full rebuild of every item."""
+        self.user_pitches.update_view(*self._view_window(), mode=self.color_mode,
+                                      hover=self._hover_span())
 
     def _active_score_note_data(self):
         """The active instrument's current NoteData, or None."""
@@ -268,7 +283,7 @@ class GuitarHero(QWidget):
 
     # ---------- NOTE INFO POPUP ----------
     def _on_plot_clicked(self, ev):
-        """Left-click on a detected user note -> per-note characteristics popup."""
+        """Left-click on a detected user note -> select it (see select_note)."""
         if ev.button() != Qt.MouseButton.LeftButton or ev.double():
             return
         if self.recording is None or not self.recording.note_data.times:
@@ -279,13 +294,39 @@ class GuitarHero(QWidget):
         if note is None:
             return
         ev.accept()
+        self.select_note(note, QCursor.pos())
 
-        if self.note_popup is not None:
-            self.note_popup.close()
-            self.note_popup.deleteLater()
+    def select_note(self, note: Note, global_pos=None):
+        """Make `note` the selected one: point at it (and the score note it was
+        aligned to), pan to its onset (which drags the shared slider along, since
+        the host follows plot_moved), and fill the popup with its characteristics.
+        `global_pos` opens the popup there; the arrow keys pass none, so the popup
+        stays put as the plot moves under it."""
+        self._popup_note = note
         note.info = NoteInfo.analyze(self.recording, note)
-        self.note_popup = NotePopupGH(note.info, parent=self)
-        self.note_popup.popup_at(QCursor.pos())
+        self.alignment_ui.highlight_user_note(note)
+        self.move_plot(note.start_time)
+        popup = self._note_popup()
+        popup.set_info(note.info)
+        if global_pos is not None:
+            popup.popup_at(global_pos)
+
+    def _note_popup(self) -> NotePopupGH:
+        """The one note popup, built on first use. Reused across notes so the
+        arrow keys can cycle through it instead of reopening one per note."""
+        if self.note_popup is None:
+            self.note_popup = NotePopupGH(parent=self)
+            self.note_popup.stepped.connect(self._step_note)
+            self.note_popup.closed.connect(self.clear_highlight)
+        return self.note_popup
+
+    def _step_note(self, step: int):
+        """An arrow key in the popup: select the neighboring detected note."""
+        if self.recording is None:
+            return
+        note = self.recording.note_data.step_note(self._popup_note, step)
+        if note is not None:
+            self.select_note(note)
 
     def _user_note_at(self, t: float, midi: float):
         """The user note under a click at (time, midi), or None. Bars are drawn
@@ -300,6 +341,11 @@ class GuitarHero(QWidget):
         return best
 
     # ---------- MISTAKE HIGHLIGHTING (delegates to AlignmentUI) ----------
+    def set_mistake_mode(self, mode: str):
+        """Host-driven (the MistakeWidget's Pitch/Timing dropdown): which kind of
+        mistake reddens the pointer box (see AlignmentUI.set_mode)."""
+        self.alignment_ui.set_mode(mode)
+
     def highlight_mistake(self, mistake):
         """Pan to and highlight the note(s) involved in a mistake."""
         self._sync_alignment()
@@ -371,18 +417,28 @@ class GuitarHero(QWidget):
         self._rebuild_legend()
         self.update_view_items()
 
-    # ---------- HOVER CURSOR ----------
+    # ---------- HOVER ----------
     def _on_plot_hover(self, scene_pos):
-        """Show a pointing-hand cursor while hovering a detected user note (they're
-        left-clickable for the characteristics popup)."""
-        over = False
+        """Hovering a detected user note marks it as pointed-at: a pointing-hand
+        cursor (they're left-clickable for the characteristics popup) and its own
+        pitch dots knocked back, so you can see which frames the note is made of.
+        Only a CHANGE of note repaints, so sweeping the plot stays cheap."""
+        note = None
         if self.recording is not None and self.recording.note_data.times:
             view_pt = self.plot.getViewBox().mapSceneToView(scene_pos)
-            over = self._user_note_at(view_pt.x(), view_pt.y()) is not None
-        if over != self._hover_cursor_on:
-            self.plot.viewport().setCursor(
-                Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor)
-            self._hover_cursor_on = over
+            note = self._user_note_at(view_pt.x(), view_pt.y())
+        if note is self._hovered_note:
+            return
+        self._hovered_note = note
+        self.plot.viewport().setCursor(
+            Qt.CursorShape.PointingHandCursor if note is not None
+            else Qt.CursorShape.ArrowCursor)
+        self.update_pitches()
+
+    def _hover_span(self) -> tuple[float, float] | None:
+        """The hovered note's time span (whose dots are knocked back), or None."""
+        note = self._hovered_note
+        return (note.start_time, note.end_time) if note is not None else None
 
 
 

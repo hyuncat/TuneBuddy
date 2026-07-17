@@ -64,12 +64,7 @@ class NoteInfo:
         mistakes from the alignment, if analyze() has produced them."""
         onset_mistake = duration_mistake = None
         alignment = getattr(recording, "alignment", None)
-        for m in (alignment.timing_mistakes if alignment else []):
-            if m.user_note is not note:
-                # alignment normally holds the same Note objects as note_data;
-                # fall back to onset identity in case a rebuild copied them
-                if m.user_note is None or abs(m.user_note.start_time - note.start_time) > 1e-9:
-                    continue
+        for m in (alignment.mistakes_for(note, "timing") if alignment else []):
             if m.type in ("early", "late"):
                 onset_mistake = m.type
             elif m.type in ("long", "short"):

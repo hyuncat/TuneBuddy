@@ -126,6 +126,19 @@ class NoteData:
         
         return min_length if min_length != float('inf') else default
 
+    def step_note(self, note: Note, step: int, clean: bool=True) -> Note:
+        """The note `step` places after `note` in onset order (negative steps walk
+        backwards), or None past either end / if `note` isn't in here. Backs the
+        arrow-key walk through a take (see GuitarHero's note popup); it clamps
+        rather than wraps, so the ends of the take are a dead stop."""
+        notes = self.read(i=0, j=len(self.times), clean=clean)
+        try:
+            i = notes.index(note)
+        except ValueError:
+            return None
+        j = i + step
+        return notes[j] if 0 <= j < len(notes) else None
+
     def notes_by_id(self) -> dict[int, Note]:
         """Current notes keyed by their stable id (notes without one are
         skipped). Used to relink alignment refs after a score NoteData is

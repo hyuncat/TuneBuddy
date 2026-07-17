@@ -193,12 +193,20 @@ class Attune(QMainWindow):
         self.show()  # run the show :)
 
     def init_shortcuts(self):
-        """Window-level keyboard shortcuts."""
-        save_action = QAction(self)
-        save_action.setShortcut(QKeySequence.StandardKey.Save)
-        save_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        save_action.triggered.connect(self.save_active_recording)
-        self.addAction(save_action)
+        """Window-level keyboard shortcuts, dispatched to the active tab like the
+        transport buttons they stand in for."""
+        self._add_shortcut(QKeySequence.StandardKey.Save, self.save_active_recording)
+        # Space arms/stops recording from anywhere in the window. A text field
+        # being edited (renaming a take, the tuning box) takes the key back for
+        # itself — Qt offers it the shortcut first — so typing a space still works.
+        self._add_shortcut(QKeySequence(Qt.Key.Key_Space), self.toggle_recording)
+
+    def _add_shortcut(self, key, slot):
+        action = QAction(self)
+        action.setShortcut(key)
+        action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        action.triggered.connect(slot)
+        self.addAction(action)
 
     def init_slider_layout(self):
         """Initialize the shared transport row: play/pause, record, time label,

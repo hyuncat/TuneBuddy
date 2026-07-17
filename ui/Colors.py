@@ -38,6 +38,9 @@ class Colors:
     # annotated noteheads, so every score color is knocked back 10%. The
     # GuitarHero plot has no such constraint and uses them full strength.
     SCORE_DIM = 0.9
+    # ...except the hovered note's pitch dots, knocked back 20% to pick the
+    # frames belonging to that note out of the surrounding track.
+    HOVER_DIM = 0.8
 
     # --- role colors (legends, score noteheads, alignment overlays) ---
     MISTAKE_RGB = {
@@ -48,6 +51,14 @@ class Colors:
     }
     CURRENT_RGB = (0, 110, 154)  # the score's playback cursor (never dimmed)
     TRANSITION_RGB = (140, 140, 140)  # unvoiced / transition frames
+    # the GuitarHero pointer box, keyed by what it points AT. Clean takes the
+    # score cursor's own blue: pointing at a note nothing flagged means "you are
+    # here", the same thing it means on the score, so it must not read as an error.
+    HIGHLIGHT_RGB = {
+        'clean': CURRENT_RGB,
+        'mistake': (255, 80, 80),
+        'overridden': (80, 255, 80),
+    }
 
     # --- pitch-distance ramps (bucketed brushes along PLASMA_ANCHORS) ---
     DISTANCE_STEP = 0.05        # semitones per bucket
@@ -125,11 +136,21 @@ class Colors:
         }
 
     @staticmethod
-    def highlight_style(overridden: bool) -> tuple:
-        """(brush, pen) for the mistake highlight box: green when the mistake is
-        overridden, red when it stands. Deliberately outside the plasma ramp —
-        this marks SELECTION, not an error."""
-        rgb = (80, 255, 80) if overridden else (255, 80, 80)
+    def hover_brush(brush):
+        """A pooled brush knocked back by HOVER_DIM, keeping its alpha. Every
+        dot ramp feeds through here, so hovering dims a frame whatever coloring
+        (pitch / align / volume / transition) it happens to be drawn with."""
+        c = brush.color()
+        rgb = Colors.dim((c.red(), c.green(), c.blue()), Colors.HOVER_DIM)
+        return pg.mkBrush(QColor(*rgb, c.alpha()))
+
+    @staticmethod
+    def highlight_style(state: str = "clean") -> tuple:
+        """(brush, pen) for the pointer box, by what it points at: 'clean' (blue
+        — nothing flagged it), 'mistake' (red) or 'overridden' (green).
+        Deliberately outside the plasma ramp — this marks SELECTION, not an
+        error."""
+        rgb = Colors.HIGHLIGHT_RGB.get(state, Colors.HIGHLIGHT_RGB['clean'])
         return pg.mkBrush(*rgb, 130), pg.mkPen(*rgb, 255, width=2)
 
     @staticmethod

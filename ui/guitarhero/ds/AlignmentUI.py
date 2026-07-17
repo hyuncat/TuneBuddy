@@ -12,12 +12,17 @@ class AlignmentUI:
         - match_lines: dashed user<->score lines for matched (good/sub) pairs
         - insertions:  user notes with no score match (green bars)
         - deletions:   score notes the user never played (red bars)
-        - highlights:  the box around a selected mistake's / clicked note(s)
-          (red while the mistake stands, green once overridden)
+        - highlights:  the pointer box around a selected mistake's / clicked
+          note(s), colored by what it points at (see Colors.highlight_style)
     """
 
     def __init__(self, plot: pg.PlotWidget):
         self.alignment: Alignment | None = None
+        # which kind of mistake the pointer flags (mirrors the MistakeWidget's
+        # "Mistakes:" dropdown), and the user note it points at — kept so a mode
+        # switch can re-color a live selection in place (see set_mode).
+        self.mode = "pitch"
+        self._pointed_note: Note | None = None
         colors = Colors.plot_colors()
 
         self.match_lines = pg.PlotDataItem(x=[], y=[], pen=colors['match_line'])
@@ -37,7 +42,7 @@ class AlignmentUI:
 
         self.highlights = pg.BarGraphItem(x=[], height=[], y0=[], width=[])
         self.highlights.setZValue(5)  # above everything
-        self.override_mistake(False)
+        self._set_state("clean")
 
         for item in (self.match_lines, self.insertions, self.deletions,
                      self.highlights):
@@ -78,6 +83,17 @@ class AlignmentUI:
             ))
 
     # --- MISTAKE / NOTE HIGHLIGHTING ---
+    def set_mode(self, mode: str):
+        """Which kind of mistake reddens the pointer ("pitch" | "timing"). A
+        note it's already pointing at is re-colored in place: one played in tune
+        but late goes blue -> red the moment Timing is picked."""
+        mode = "timing" if mode == "timing" else "pitch"
+        if mode == self.mode:
+            return
+        self.mode = mode
+        if self._pointed_note is not None:
+            self.highlight_user_note(self._pointed_note)
+
     def highlight_mistake(self, mistake: Mistake) -> float | None:
         """Box the note(s) involved in a mistake, colored by its override
         state. Returns the notes' center time so the host can pan to it."""
@@ -95,11 +111,32 @@ class AlignmentUI:
             # box them both to make the onset/duration discrepancy visible.
             notes = [n for n in (mistake.user_note, mistake.midi_note)
                      if n is not None]
-        return self.highlight_note(notes, overridden=mistake.is_overridden())
+        # the list handed us this exact mistake, so its own state colors the
+        # pointer whatever mode is showing; there's no note to re-judge later.
+        self._pointed_note = None
+        return self._highlight_notes(
+            notes, "overridden" if mistake.is_overridden() else "mistake")
 
-    def highlight_note(self, notes: list[Note], overridden: bool = False) -> float | None:
-        """Box the given note(s) — how any clicked/selected note is highlighted.
-        Returns their mean center time (None if there's nothing to box)."""
+    def highlight_user_note(self, note: Note) -> float | None:
+        """Point at a detected user note AND the score note it was aligned to,
+        reddened only if the current mode flags it. Returns their mean center
+        time (None if there's nothing to box)."""
+        self._pointed_note = note
+        match = self.alignment.get_match(user_note=note) if self.alignment else None
+        return self._highlight_notes([note, match], self._note_state(note))
+
+    def _note_state(self, note: Note) -> str:
+        """A pointed-at note's color state: red while the mode's mistakes flag
+        it, green once every one of them is dismissed, blue when it's clean."""
+        mistakes = self.alignment.mistakes_for(note, self.mode) if self.alignment else []
+        if not mistakes:
+            return "clean"
+        return "mistake" if any(not m.is_overridden() for m in mistakes) else "overridden"
+
+    def _highlight_notes(self, notes: list[Note], state: str) -> float | None:
+        """Box the given note(s) in `state`'s color — how any mistake/selected
+        note is highlighted. Returns their mean center time (None if there's
+        nothing to box)."""
         notes = [n for n in notes if n is not None]
         if not notes:
             return None
@@ -109,17 +146,22 @@ class AlignmentUI:
             [n.midi_num[0] for n in notes],
             height=NoteDataUI.NOTE_HEIGHT * 2,
         ))
-        self.override_mistake(overridden)
+        self._set_state(state)
         return float(np.mean([0.5 * (n.start_time + n.end_time) for n in notes]))
 
     def override_mistake(self, overridden: bool):
-        """Swap the highlight color: green if overridden, red if not."""
-        brush, pen = Colors.highlight_style(overridden)
+        """Recolor the pointer when the mistake it points at is dismissed
+        (green) or restored (red)."""
+        self._set_state("overridden" if overridden else "mistake")
+
+    def _set_state(self, state: str):
+        brush, pen = Colors.highlight_style(state)
         self.highlights.setOpts(brush=brush, pen=pen)
 
     def clear_highlight(self):
+        self._pointed_note = None
         self.highlights.setOpts(x=[], width=[], y0=[], height=[])
-        self.override_mistake(False)  # reset color for next use
+        self._set_state("clean")  # reset color for next use
 
     def clear(self):
         """Empty every overlay item and drop the alignment."""
