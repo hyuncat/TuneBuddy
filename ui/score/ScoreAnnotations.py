@@ -1,4 +1,3 @@
-from algorithms.Config import Config
 from app_logic.JsonHandler import JsonHandler
 from app_logic.user.ds.Recording import Recording
 from ui.Colors import Colors
@@ -130,7 +129,6 @@ class ScoreAnnotations:
         frac = Colors.volume_frac(volume, *volume_range)
         return {
             "frac": float(frac),
-            "db": Config.volume_to_db(volume),
             # score-dimmed (unlike GuitarHero's dots) so the cursor reads on top
             "color": Colors.css_rgb(Colors.viridis(frac, dim=True)),
         }

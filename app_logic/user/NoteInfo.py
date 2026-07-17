@@ -2,8 +2,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from algorithms.Config import Config
-
 
 @dataclass
 class NoteInfo:
@@ -21,10 +19,12 @@ class NoteInfo:
     VIB_MIN_VOICED_FRAC = 0.5
     VIB_FFT_PAD = 4096      # zero-pad so short notes still get a fine-grained peak
 
-    # Volume slider floor: a note this far below the take's loudest reads as
-    # empty. The absolute readout uses Config.volume_to_db (raw-signal RMS on
-    # the full-scale = 94 dB convention; SPL-like, not calibrated SPL).
-    VOLUME_FLOOR_DB = -30.0
+    # Volume is shown RELATIVE to this take only — never as an absolute number.
+    # A computer mic's level is uncalibrated (mic gain/distance/AGC all unknown),
+    # and an absolute dBFS reading disagrees with the color ramp (a note can be
+    # loud FOR THIS TAKE yet low in absolute dBFS). Normalizing to the take's own
+    # [quietest, loudest] is gain-invariant and matches the ramp, so volume_frac
+    # is the only volume descriptor — the readout is the color bar, no number.
 
     note_name: str
     cents: float                            # offset from the nearest semitone
@@ -34,16 +34,13 @@ class NoteInfo:
     duration_mistake: str | None = None     # "long" / "short" / None
     vibrato_rate_hz: float | None = None
     vibrato_extent_cents: float | None = None  # sinusoid amplitude (± around center)
-    volume_db: float | None = None          # signed dB vs the take's median note (tooltip)
-    volume_abs_db: float | None = None      # absolute dB of the note's mean volume (Config.volume_to_db)
-    volume_frac: float = 0.0                # 0..1 slider position (vs loudest note)
+    volume_frac: float | None = None        # 0..1 bar position in the take's dBFS range; None = no data
 
     @classmethod
     def analyze(cls, recording, note) -> "NoteInfo":
         midi = float(note.midi_num[0])
         onset_mistake, duration_mistake = cls._timing_mistakes(recording, note)
         rate, extent = cls._vibrato(recording, note)
-        volume_db, volume_abs_db, volume_frac = cls._volume(recording, note)
         return cls(
             note_name=note.get_note_name(),
             cents=(midi - round(midi)) * 100.0,
@@ -53,9 +50,7 @@ class NoteInfo:
             duration_mistake=duration_mistake,
             vibrato_rate_hz=rate,
             vibrato_extent_cents=extent,
-            volume_db=volume_db,
-            volume_abs_db=volume_abs_db,
-            volume_frac=volume_frac,
+            volume_frac=cls._volume(recording, note),
         )
 
     @staticmethod
@@ -119,21 +114,16 @@ class NoteInfo:
         return rate, extent_cents
 
     @classmethod
-    def _volume(cls, recording, note) -> tuple[float | None, float | None, float]:
-        """(signed dB vs the take's MEDIAN note for the tooltip, absolute dB,
-        0..1 slider fraction vs the LOUDEST note). Two references: the slider
-        bar stays pinned to the loudest note, while the relative readout is
-        centered on the median so a note reads +louder / -quieter than typical."""
+    def _volume(cls, recording, note) -> float | None:
+        """0..1 bar position within the take's dBFS range (None when the note
+        carries no measurable volume): the note's mean level placed across the
+        take's [quietest, loudest] frame dBFS — the same normalization the plot
+        dots and ScoreViewer dots color across (mirrored inline here since
+        app_logic can't import ui.Colors)."""
         pd = recording.pitch_data
         vol = pd.mean_volume(note.start_time, note.end_time)
-        notes = recording.note_data.read(i=0, j=len(recording.note_data.times), clean=True)
-        vols = [v for v in (pd.mean_volume(n.start_time, n.end_time) for n in notes) if v > 0]
-        if vol <= 0 or not vols:
-            return None, None, 0.0
-        abs_db = Config.volume_to_db(vol)
-        # slider position: relative to the loudest note, floored at VOLUME_FLOOR_DB
-        frac_db = 20.0 * np.log10(vol / max(vols))
-        frac = (frac_db - cls.VOLUME_FLOOR_DB) / (0.0 - cls.VOLUME_FLOOR_DB)
-        # tooltip readout: signed dB around the median note
-        db = 20.0 * np.log10(vol / float(np.median(vols)))
-        return float(db), float(abs_db), float(min(max(frac, 0.0), 1.0))
+        vmin, vmax = pd.volume_range_db()
+        if vol <= 0 or vmin is None or vmax is None or vmax <= vmin:
+            return None
+        frac = (20.0 * np.log10(vol) - vmin) / (vmax - vmin)
+        return float(min(max(frac, 0.0), 1.0))

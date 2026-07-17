@@ -46,11 +46,14 @@ let mistakeAnnotations = { notes: {}, insertions: [], noteMeta: {}, volumes: {} 
 let annotationColorMode = "pitch";
 let popupMistakes = [];
 let popupIndex = 0;
-// What the open popup is ABOUT — a score note ({index}) or an insertion marker
-// ({slot}), see popupTargets. Held (rather than the popup just being drawn and
-// forgotten) for two reasons: the arrow keys walk it note by note, and every
-// re-render re-anchors the popup from it, so cycling to a note on another system
-// survives the page flip the seek causes. Null = no popup.
+// The SELECTED note/slot — a score note ({index}) or an insertion marker
+// ({slot}), see noteStops. Set by clicking any note, and what the arrow keys
+// walk from (stepSelection). A note with mistakes shows its popup; a plain note
+// (empty .items) is still selected — it just seeks + highlights with no popup.
+// Held (rather than drawn and forgotten) for two reasons: the arrows walk it
+// note by note, and every re-render re-anchors any popup from it, so cycling to
+// a note on another system survives the page flip the seek causes. Null = nothing
+// selected (the arrows are the page's again).
 let popupTarget = null;
 // --- THEME ---
 // Python owns every color (ui/Colors.py) and pushes them here as soon as the
@@ -458,30 +461,41 @@ document.addEventListener("click", (ev) => {
     }
 
     const scoreIndex = noteIdToScoreIndex.get(note.id);
-    const items = popupItemsForNoteIndex(scoreIndex);
-    if (items.length) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        openPopupTarget(noteTarget(scoreIndex, items), ev.clientX, ev.clientY);
+    if (scoreIndex === undefined) {
+        // note isn't in the index map (no annotations loaded): plain seek, no
+        // stepping — nothing to walk without the note<->index map.
+        closeMistakePopup();
+        if (!bridge) return;
+        let t = -1;
+        try { t = tk.getTimeForElement(note.id); } catch (e) { return; }
+        if (typeof t === "number" && t >= 0) bridge.noteClicked(t / 1000);
         return;
     }
 
-    if (!bridge) return;
-    let t = -1;
-    try { t = tk.getTimeForElement(note.id); } catch (e) { return; }
-    if (typeof t === "number" && t >= 0) bridge.noteClicked(t / 1000);
+    // Select the clicked note: this seeks the transport there AND arms the arrow
+    // keys to walk the score from it (see stepSelection). A note with mistakes
+    // opens its popup; a clean note just seeks + highlights (no popup).
+    ev.preventDefault();
+    ev.stopPropagation();
+    const items = popupItemsForNoteIndex(scoreIndex);
+    openStep(
+        { target: noteTarget(scoreIndex, items), itemIndex: items.length ? 0 : -1 },
+        ev.clientX, ev.clientY,
+    );
 });
 
-// Left/right walk the open popup note by note (see stepPopupTarget). Scoped to
-// there BEING a popup, so the arrows are the page's the rest of the time. Keyed
-// on the target rather than on the popup being painted: a step to another system
-// parks it out of sight until the seek flips the page, and walking has to keep
-// working across that gap.
+// Left/right walk the score note by note (see stepSelection): through each
+// individual mistake at a spot (1/5, 2/5, …), then on to the next note; a note
+// with no mistake is a stop too (it just seeks + highlights). Scoped to there
+// BEING a selection (popupTarget, set by clicking any note), so the arrows are
+// the page's the rest of the time. Keyed on the selection rather than on a popup
+// being painted: a step to another system parks any popup out of sight until the
+// seek flips the page, and walking has to keep working across that gap.
 document.addEventListener("keydown", (ev) => {
     const step = ev.key === "ArrowLeft" ? -1 : (ev.key === "ArrowRight" ? 1 : 0);
     if (!step || !popupTarget) return;
     ev.preventDefault();
-    stepPopupTarget(step);
+    stepSelection(step);
 });
 
 // --- INIT VEROVIO TOOLKIT ---
@@ -607,17 +621,6 @@ function volumeForNoteIndex(index) {
     return mistakeAnnotations.volumes[String(index)] || null;
 }
 
-function volumePopupPayload(volume) {
-    const db = volume && Number.isFinite(Number(volume.db))
-        ? `${Number(volume.db).toFixed(1)} dB`
-        : "unavailable";
-    return [{
-        type: "volume",
-        title: "Volume",
-        rows: [{ value: db }],
-    }];
-}
-
 // --- POPUP TARGETS ---
 // The clickable things on the score: annotated notes and the insertion markers
 // between them. One list, in score order, so a click and an arrow key land on
@@ -640,39 +643,53 @@ function slotOrder(slot) {
 }
 
 // What clicking a score note pops up, or [] if it pops up nothing (which lets the
-// click fall through to a plain seek). Volume mode shows the note's volume;
-// otherwise its mistakes for the mode in view.
+// click fall through to a plain seek). Volume mode carries the loudness in the
+// note's COLOR, not a popup — so it pops nothing; otherwise its mistakes for the
+// mode in view.
 function popupItemsForNoteIndex(index) {
-    if (annotationColorMode === "volume") {
-        const volume = volumeForNoteIndex(index);
-        return volume ? volumePopupPayload(volume) : [];
-    }
+    if (annotationColorMode === "volume") return [];
     return visibleMistakesForNoteIndex(index);
 }
 
-// The same for an insertion marker. Timing mode draws no markers at all, so it
-// has none; volume mode always answers (an unmeasurable slot reads "unavailable").
+// The same for an insertion marker. Only pitch mode has slot popups (its
+// insertion mistakes); timing draws no markers, and volume shows loudness by
+// marker COLOR alone.
 function popupItemsForSlot(slot) {
-    if (annotationColorMode === "timing") return [];
-    if (annotationColorMode === "volume") return volumePopupPayload(slot.volume);
+    if (annotationColorMode !== "pitch") return [];
     const mistakes = Array.isArray(slot.mistakes) ? slot.mistakes : [];
     return mistakes.filter((m) => m.category !== "timing");
 }
 
-// Every popup target in the whole score (not just the rendered system), in score
-// order. Rebuilt per keystroke: cheap next to the render a step triggers, and it
-// can't go stale against the color mode or a fresh analysis.
-function popupTargets() {
-    const targets = [];
+// Every stoppable thing on the score, in score order: EVERY score note (whether
+// or not it carries a mistake) plus the insertion markers between them. The arrow
+// keys walk this note by note; a note with no mistake is still a stop (it just
+// seeks + highlights, no popup). Rebuilt per keystroke: cheap next to the render a
+// step triggers, and it can't go stale against the color mode or a fresh analysis.
+function noteStops() {
+    const stops = [];
     for (const index of noteIndexToIds.keys()) {
-        const items = popupItemsForNoteIndex(index);
-        if (items.length) targets.push(noteTarget(index, items));
+        stops.push(noteTarget(index, popupItemsForNoteIndex(index)));
     }
     for (const slot of mistakeAnnotations.insertions || []) {
         const items = popupItemsForSlot(slot);
-        if (items.length) targets.push(slotTarget(slot, items));
+        if (items.length) stops.push(slotTarget(slot, items));
     }
-    return targets.sort((a, b) => a.order - b.order);
+    return stops.sort((a, b) => a.order - b.order);
+}
+
+// The FLAT step sequence the arrows walk: one step per individual mistake, so a
+// slot of 5 extra notes is 5 steps (1/5, 2/5, …) before the next note; a note
+// with no mistake is a single step (itemIndex -1 = seek + highlight, no popup).
+function stepList() {
+    const steps = [];
+    for (const target of noteStops()) {
+        if (target.items.length) {
+            for (let i = 0; i < target.items.length; i++) steps.push({ target, itemIndex: i });
+        } else {
+            steps.push({ target, itemIndex: -1 });
+        }
+    }
+    return steps;
 }
 
 function sameTarget(a, b) {
@@ -681,32 +698,76 @@ function sameTarget(a, b) {
     return a.index === b.index;
 }
 
-// Open `target`'s popup and seek the app to it. With no click point the popup
-// hangs off the target itself — and when the target is on another system it has
-// none yet, so the popup waits for the seek to flip the page and re-anchor it.
-function openPopupTarget(target, clientX, clientY) {
-    popupTarget = target;
-    if (target.slot) seekInsertionSlot(target.slot);
-    else seekAnnotation(target.index);
+// Where the current selection sits in the flat step list, or -1 if it's fallen
+// out of it (the mode / analysis changed under it). A plain-note selection has
+// no shown mistake, so it matches the itemIndex -1 step.
+function currentStepPos(steps) {
+    if (!popupTarget) return -1;
+    const curItem = popupTarget.items.length ? popupIndex : -1;
+    return steps.findIndex((s) => sameTarget(s.target, popupTarget) && s.itemIndex === curItem);
+}
 
+// An arrow key: walk to the neighboring step. Clamps at the ends rather than
+// wrapping. If the selection has fallen out of the list — a mode/analysis change,
+// or a stop that isn't walkable (a volume-mode insertion has no popup) — resume
+// from the step nearest it in score order, so the arrows still land on a true
+// neighbor rather than jumping to an end.
+function stepSelection(dir) {
+    const steps = stepList();
+    if (!steps.length) return;
+    const at = currentStepPos(steps);
+    if (at >= 0) {
+        const next = steps[at + dir];
+        if (next) openStep(next);
+        return;
+    }
+    const order = popupTarget ? popupTarget.order : 0;
+    const after = steps.findIndex((s) => s.target.order > order + 1e-9);
+    // → : first step past `order`; ← : last step before it
+    const idx = dir > 0
+        ? after
+        : (after < 0 ? steps.length - 1 : after - 1);
+    if (idx >= 0 && idx < steps.length) openStep(steps[idx]);
+}
+
+// Select a step: make it the current one, seek the app to it (which moves the
+// slider + highlights the note via the cursor), and — only when it carries a
+// mistake — show that mistake's popup. A plain-note stop shows no popup. With no
+// click point the popup hangs off the target itself; when the target is on
+// another system it has no anchor yet, so it waits for the seek to flip the page
+// and refreshMistakePopup to re-anchor it.
+function openStep(step, clientX, clientY) {
+    popupTarget = step.target;
+    if (step.target.slot) seekInsertionSlot(step.target.slot);
+    else seekNoteIndex(step.target.index);
+
+    if (step.itemIndex < 0 || !step.target.items.length) {
+        popupMistakes = [];
+        hideMistakePopup();
+        return;
+    }
     if (clientX === undefined) {
-        const anchor = targetAnchorPoint(target);
+        const anchor = targetAnchorPoint(step.target);
         if (!anchor) { hideMistakePopup(); return; }
         clientX = anchor.x;
         clientY = anchor.y;
     }
-    showMistakePopup(target.items, clientX, clientY);
+    showMistakePopup(step.target.items, clientX, clientY, step.itemIndex);
 }
 
-// Walk the popup to the neighboring target (the arrow keys). Clamps at the ends
-// rather than wrapping. A target that isn't in the list at all is a dead stop:
-// refreshMistakePopup normally retires those, so this is just belt and braces.
-function stepPopupTarget(step) {
-    const targets = popupTargets();
-    const at = targets.findIndex((t) => sameTarget(t, popupTarget));
-    if (at < 0) return;
-    const next = targets[at + step];
-    if (next) openPopupTarget(next);
+// Seek the transport to a score note. Post-analysis every note carries an
+// app-time seekTime (noteMeta); before that, fall back to the rendered note's
+// Verovio time so plain note-stepping still works.
+function seekNoteIndex(index) {
+    if (!bridge) return;
+    const meta = noteMetaForIndex(index);
+    const sec = meta ? Number(meta.seekTime) : NaN;
+    if (Number.isFinite(sec)) { bridge.annotationClicked(sec); return; }
+    for (const id of noteIndexToIds.get(index) || []) {
+        let t = -1;
+        try { t = tk.getTimeForElement(id); } catch (e) { continue; }
+        if (typeof t === "number" && t >= 0) { bridge.noteClicked(t / 1000); return; }
+    }
 }
 
 // Where a target's popup hangs (client coords): off its notehead, or on the
@@ -729,13 +790,6 @@ function dominantMistakeKind(mistakes) {
     }
     if (types.has("insertion")) return "insertion";
     return "";
-}
-
-function seekAnnotation(scoreIndex) {
-    if (!bridge) return;
-    const meta = noteMetaForIndex(scoreIndex);
-    const sec = meta ? Number(meta.seekTime) : NaN;
-    if (Number.isFinite(sec)) bridge.annotationClicked(sec);
 }
 
 function seekInsertionSlot(slot) {
@@ -955,9 +1009,9 @@ function appendInsertionNotehead(slot, pos, color) {
         if (selectionMode) return; // fall through to measure picking
         ev.preventDefault();
         ev.stopPropagation();
-        // openPopupTarget seeks too: seekTime = the slot's FIRST insertion onset
-        openPopupTarget(slotTarget(slot, popupItemsForSlot(slot)),
-                        ev.clientX, ev.clientY);
+        // openStep seeks too: seekTime = the slot's FIRST insertion onset
+        openStep({ target: slotTarget(slot, popupItemsForSlot(slot)), itemIndex: 0 },
+                 ev.clientX, ev.clientY);
     });
     pos.measureEl.appendChild(g);
 }
@@ -969,7 +1023,9 @@ function renderInsertionMarkers() {
     const pitchFit = activeStaffPitchFit();
 
     for (const slot of slots) {
-        if (!popupItemsForSlot(slot).length) continue;
+        // pitch mode: only slots carrying an insertion mistake get a marker.
+        // volume mode: every slot gets a colored marker (loudness by color, no popup).
+        if (annotationColorMode !== "volume" && !popupItemsForSlot(slot).length) continue;
         const pos = insertionMarkerPosition(slot, pitchFit);
         if (!pos) continue;
 
@@ -1004,19 +1060,22 @@ function closeMistakePopup() {
     hideMistakePopup();
 }
 
-// Re-anchor the open popup onto the page as it stands now, called after every
-// (re)paint of the annotations. This is what carries a popup across the page
-// flip that stepping to another system causes. The two ways that can fail are
-// NOT the same: nothing left to say about the target retires it, while a target
-// merely off the rendered system is parked, since the next render may be the one
-// that brings it back.
+// Re-anchor any open popup onto the page as it stands now, called after every
+// (re)paint of the annotations. This is what carries a popup across the page flip
+// that stepping to another system causes. The selection itself is NEVER dropped
+// here (the arrows keep working): a target with no mistakes to show — a plain
+// note, or one that just lost its mistakes to a mode change — simply hides its
+// popup, and a target merely off the rendered system is parked, since the next
+// render may be the one that brings it back.
 function refreshMistakePopup() {
     if (!popupTarget) return;
     const items = popupTarget.slot
         ? popupItemsForSlot(popupTarget.slot)
         : popupItemsForNoteIndex(popupTarget.index);
+    popupTarget.items = items;
     if (!items.length) {
-        closeMistakePopup();
+        popupMistakes = [];
+        hideMistakePopup();
         return;
     }
     const anchor = targetAnchorPoint(popupTarget);
@@ -1024,14 +1083,13 @@ function refreshMistakePopup() {
         hideMistakePopup();
         return;
     }
-    popupTarget.items = items;
-    showMistakePopup(items, anchor.x, anchor.y);
+    showMistakePopup(items, anchor.x, anchor.y, popupIndex);
 }
 
-function showMistakePopup(mistakes, clientX, clientY) {
+function showMistakePopup(mistakes, clientX, clientY, index = 0) {
     if (!Array.isArray(mistakes) || !mistakes.length) return;
     popupMistakes = mistakes;
-    popupIndex = 0;
+    popupIndex = Math.max(0, Math.min(index, mistakes.length - 1));
     const popup = ensureMistakePopup();
     renderMistakePopup();
     popup.style.display = "block";

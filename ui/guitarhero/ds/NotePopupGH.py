@@ -1,10 +1,10 @@
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
-from PyQt6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel
+from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel, QWidget
 
 from app_logic.user.NoteInfo import NoteInfo
-from ui.Icons import svg_pixmap
 from ui.info.Gradient import VolumeGradient
+from ui.info.Legend import Legend
 
 
 class NotePopupGH(QFrame):
@@ -55,33 +55,48 @@ class NotePopupGH(QFrame):
                 widget.hide()  # deleteLater is deferred; hide now so no stale flash
                 widget.deleteLater()
 
-        for text in self._text_rows(chars):
-            label = QLabel(text)
-            label.setTextFormat(Qt.TextFormat.RichText)
-            self._layout.addWidget(label)
+        for row in self._rows(chars):
+            self._layout.addWidget(row)
         self.adjustSize()
 
-    def _text_rows(self, chars: NoteInfo) -> list[str]:
-        rows = [f"<b>Pitch:</b> {chars.note_name} {chars.cents:+.0f}¢"]
+    def _label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        return label
+
+    def _rows(self, chars: NoteInfo) -> list[QWidget]:
+        rows = [self._label(f"<b>Pitch:</b> {chars.note_name} {chars.cents:+.0f}¢")]
 
         onset = f"<b>Onset:</b> {chars.onset:.2f}s"
         if chars.onset_mistake:
             onset += f" ({self._TIMING_LABELS[chars.onset_mistake]})"
-        rows.append(onset)
+        rows.append(self._label(onset))
 
         duration = f"<b>Duration:</b> {chars.duration:.2f}s"
         if chars.duration_mistake:
             duration += f" ({self._TIMING_LABELS[chars.duration_mistake]})"
-        rows.append(duration)
-
-        rows.append(f"<b>Volume:</b> {chars.volume_abs_db:.1f} dB" if chars.volume_abs_db is not None else "— dB")
+        rows.append(self._label(duration))
 
         if chars.vibrato_rate_hz is not None:
-            rows.append(f"<b>Vibrato:</b> f={chars.vibrato_rate_hz:.1f}Hz, "
-                        f"A={chars.vibrato_extent_cents:.0f}¢")
+            rows.append(self._label(f"<b>Vibrato:</b> f={chars.vibrato_rate_hz:.1f}Hz, "
+                                    f"A={chars.vibrato_extent_cents:.0f}¢"))
         else:
-            rows.append("<b>Vibrato:</b> —")
+            rows.append(self._label("<b>Vibrato:</b> —"))
+
+        rows.extend(self._volume_rows(chars))
         return rows
+
+    def _volume_rows(self, chars: NoteInfo) -> list[QWidget]:
+        """Loudness is shown RELATIVE only — the ramp handle sits within the
+        take's own [quietest, loudest] range (gain-invariant, and it matches the
+        note's color). No absolute dB number: a computer mic is uncalibrated, and
+        an absolute dBFS reading contradicts the take-relative color ramp."""
+        if chars.volume_frac is None:
+            return [self._label("<b>Volume:</b> —")]
+        return [
+            # self._label("<b>Volume:</b>"),
+            Legend.gradient_strip(VolumeGradient(frac=chars.volume_frac), help=False),
+        ]
 
     def popup_at(self, global_pos: QPoint):
         """Show next to the cursor, nudged to stay on screen."""

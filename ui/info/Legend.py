@@ -23,15 +23,18 @@ class Legend:
         return item
 
     @staticmethod
-    def gradient_strip(gradient: Gradient, width: int = 150) -> QWidget:
+    def gradient_strip(gradient: Gradient, width: int = 150,
+                       help: bool = True) -> QWidget:
         """A ramp legend: a (?) carrying the gradient's `help_text`, then the
         strip flanked by its own two end captions. Pass the gradient with no
-        `frac` so it draws plain, with no handle."""
+        `frac` so it draws plain, with no handle. `help=False` drops the (?) for
+        callers that already caption the ramp in words (NotePopupGH)."""
         item = QWidget()
         lay = QHBoxLayout(item)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(5)
-        lay.addWidget(Legend.help_icon(gradient.help_text))
+        if help:
+            lay.addWidget(Legend.help_icon(gradient.help_text))
         low, high = gradient.ends()
         gradient.setFixedWidth(width)
         lay.addWidget(low)
