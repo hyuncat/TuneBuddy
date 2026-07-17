@@ -55,7 +55,7 @@ class SettingsWidget(QWidget):
         bins (MIDI 0..127, named like 'G3' / 'C#5'). Defaults are filled in from
         the active instrument's note range. Applying it sets the Config's
         fmin/fmax (so pitch detection is re-run).
-      - "Tuning": the A4 reference pitch (Hz) the pitch detector tunes to.
+      - "Tuning": set A4's freq in Hz, reruns pitch detection if different
       - "Transpose": a note-name input that transposes the WHOLE score so its
         first note lands on the entered pitch (relative to the first note). Emits
         the target MIDI; app.py shifts the score's MIDI / music21 / NoteData.

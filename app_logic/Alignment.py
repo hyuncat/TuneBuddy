@@ -89,6 +89,101 @@ class Alignment:
         self.init_2(notes)
         self.reindex_mistakes()
 
+    def refresh(self):
+        """Re-key the time indexes from the live note times. The pairs hold Note
+        references, so transposing the notes moves them in place but stales the
+        start/end-time keys built by init_2 — call this after any such move."""
+        self.init_2(self.pairs)
+
+    def sync_score_notes(self, score_notes):
+        """Relink score-side refs to the current Note objects by stable note id.
+
+        ScoreData.change_tempo()/resize() rebuilds NoteData with new Note
+        objects. The alignment stores the old objects, so relink (pairs AND
+        mistakes) before using alignment times for filtering, match lines,
+        deletions, or mistake highlights. `score_notes` is the score's current
+        NoteData for the aligned instrument."""
+        by_id = score_notes.notes_by_id() if score_notes is not None else {}
+        if not by_id:
+            return
+
+        def resolve(note: Note | None) -> Note | None:
+            """This score note's current-timing counterpart when available."""
+            if note is None:
+                return None
+            note_id = getattr(note, "id", None)
+            return note if note_id is None else by_id.get(note_id, note)
+
+        changed = False
+        replacements = {}
+        pairs = []
+        for user_note, score_note in self.pairs:
+            current_score_note = resolve(score_note)
+            if current_score_note is not score_note:
+                changed = True
+                if score_note is not None:
+                    replacements[id(score_note)] = current_score_note
+            pairs.append((user_note, current_score_note))
+
+        if not changed:
+            return
+
+        self.pairs = pairs
+        for mistakes in (self.pitch_mistakes, self.timing_mistakes):
+            for mistake in mistakes:
+                midi_note = getattr(mistake, "midi_note", None)
+                if midi_note is None:
+                    continue
+                current_midi_note = replacements.get(id(midi_note))
+                if current_midi_note is None:
+                    current_midi_note = resolve(midi_note)
+                if current_midi_note is not midi_note:
+                    mistake.midi_note = current_midi_note
+        self.init_2(pairs)
+
+    def _insertion_pair_index(self, mistake: Mistake) -> int | None:
+        """The pair row an insertion mistake occupies (user note, no score
+        note). Trusts the mistake's stored pair_index when valid, else searches
+        by note identity."""
+        pair_index = mistake.get_pair_index()
+        if pair_index is not None and 0 <= pair_index < len(self.pairs):
+            return pair_index
+        for i, (user_note, score_note) in enumerate(self.pairs):
+            if score_note is None and self._same_note(user_note, mistake.user_note):
+                return i
+        return None
+
+    def flanking_score_notes(self, mistake: Mistake) -> tuple[Note | None, Note | None] | None:
+        """The score notes immediately before/after an insertion's slot — the
+        neighbors an insertion marker is drawn between. None when the insertion
+        can't be located (or has no scored neighbor on either side)."""
+        pair_index = self._insertion_pair_index(mistake)
+        if pair_index is None:
+            return None
+        left = next((self.pairs[i][1] for i in range(pair_index - 1, -1, -1)
+                     if self.pairs[i][1] is not None), None)
+        right = next((self.pairs[i][1] for i in range(pair_index + 1, len(self.pairs))
+                      if self.pairs[i][1] is not None), None)
+        if left is None and right is None:
+            return None
+        return (left, right)
+
+    def insertion_seek_time(self, mistake: Mistake) -> float:
+        """Timeline anchor for an insertion: the inserted note's own onset,
+        else the midpoint of (or the nearer of) its flanking score notes."""
+        user_note = getattr(mistake, "user_note", None)
+        if user_note is not None:
+            return float(user_note.start_time)
+        flanks = self.flanking_score_notes(mistake)
+        if flanks is None:
+            return 0.0
+        left, right = flanks
+        if left is not None and right is not None:
+            return float((left.end_time + right.start_time) / 2.0)
+        if left is not None:
+            return float(left.end_time)
+        return float(right.start_time)
+
     def reindex_mistakes(self, mistakes: list[Mistake] | None = None):
         """Refresh each mistake's pair_index from the current pair list.
 

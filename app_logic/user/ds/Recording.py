@@ -345,20 +345,29 @@ class Recording:
         """App-time of the recording's logical audio end."""
         return self.audio_data.get_end_time()
     
-    def shift(self, delta: float):
-        """Slide the WHOLE recorded take (audio, pitches, notes) by `delta` sec on
-        the app-time line. Audio/pitch frames move via their shared time origin (no
-        array copy); notes are rekeyed. General primitive; NOTE resize_score no
-        longer calls it — the take is kept fixed and the score is moved onto it
-        instead (so audio/pitch stay indexed in their own app-time)."""
-        if not delta:
+    def transpose(self, dx: float=None, dy: float=None):
+        """Move the WHOLE recorded take by `dx` sec on the app-time line and/or
+        `dy` semitones. Audio/pitch frames move via their shared time origin (no
+        array copy); notes go through NoteData.transpose; the alignment's
+        time index is rebuilt (its pairs reference the same Note objects, so
+        only its keys go stale). General primitive; NOTE resize_score does not
+        call it — the take is kept fixed and the score is moved onto it instead
+        (so audio/pitch stay indexed in their own app-time)."""
+        if not dx and not dy:
             return
-        self.audio_data.t_origin += delta
-        self.pitch_data.t_origin += delta
+        if dx:
+            self.audio_data.t_origin += dx
+            self.pitch_data.t_origin += dx
         for p in self.pitch_data.data:
-            if p is not None:
-                p.time += delta
-        self.note_data.shift(delta)
+            if p is None:
+                continue
+            if dx:
+                p.time += dx
+            if dy and p.value != -1:
+                p.value += dy
+                p.candidate_pitches = [(m + dy, prob) for m, prob in p.candidate_pitches]
+        self.note_data.transpose(dx=dx, dy=dy)
+        self.alignment.refresh()
 
     def resize_score(
         self,
@@ -446,11 +455,9 @@ class Recording:
         # take's first voiced note, instead of dragging the take to t=0. The take
         # never moves, so its audio/pitch/note timeline stays the single app-time
         # truth the slider and audio player index against (no negative t_origin,
-        # no shift — which is what used to desync the waveform from the cursor).
-        # transpose_notes takes an absolute offset from the untransposed baseline;
-        # (sd.transpose_offset - score_bounds[0]) re-bases it even when change_tempo
-        # no-ops, and + take_anchor_time then anchors the span onto the take.
-        sd.transpose_notes(sd.transpose_offset - score_bounds[0] + take_anchor_time)
+        # no take-transpose — which is what used to desync the waveform from the
+        # cursor).
+        sd.transpose(dx=take_anchor_time - score_bounds[0])
 
         self._update_pitch_distances()
         return True

@@ -1,7 +1,6 @@
 # code for practice mode
 from __future__ import annotations
 import time
-from pathlib import Path
 
 import numpy as np
 from PyQt6.QtWidgets import (
@@ -14,9 +13,9 @@ from app_logic.midi.MidiPlayer import MidiPlayer
 from app_logic.user.ds.Recording import Recording
 from app_logic.user.AudioRecorder import AudioRecorder
 
-# adjust this import to wherever your GuitarHero widget lives
-from ui.ScoreViewer import ScoreViewer
-from ui.GuitarHero import GuitarHero
+from ui.score.ScoreViewer import ScoreViewer
+from ui.guitarhero.GuitarHero import GuitarHero
+from ui.info.ClipDialog import ClipDialog
 from ui.time.ScoreTimeMap import ScoreTimeMap
 
 
@@ -72,11 +71,9 @@ class PracticeTab(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
 
-        ABSOLUTE_PROJECT_ROOT = Path(__file__).resolve().parent
-
         # the score viewer owns its own "Loading..." placeholder until Verovio's
         # JS API is ready (see ScoreViewer).
-        self.score_viewer = ScoreViewer(project_root=ABSOLUTE_PROJECT_ROOT)
+        self.score_viewer = ScoreViewer()
 
         self.guitar_hero = GuitarHero(self.recording)
         self.guitar_hero.load_score(self.score_data)
@@ -88,12 +85,49 @@ class PracticeTab(QWidget):
         self.center_splitter.addWidget(self.guitar_hero)
         self.center_splitter.setStretchFactor(0, 1)  # score viewer grows
         self.center_splitter.setStretchFactor(1, 1)  # guitar hero grows
-        self.center_splitter.setSizes([180, 520])     # initial heights (resizable)
+        # pre-load default; every render then auto-fits the pane to the score's
+        # full height (_fit_score_viewer_height) until the user drags the handle.
+        self.center_splitter.setSizes([180, 520])
+        self._score_splitter_user_set = False
+        self._last_content_height = 0.0
+        self.center_splitter.splitterMoved.connect(self._on_score_splitter_moved)
         self._layout.addWidget(self.center_splitter)
 
     def init_signals(self):
         self.score_viewer.load_finished.connect(self.refresh_score_viewer)
+        self.score_viewer.note_clicked.connect(self.on_note_clicked)
+        self.score_viewer.trim_requested.connect(self.on_trim_requested)
+        self.score_viewer.content_height_changed.connect(self._fit_score_viewer_height)
         self.recording.pitch_detector.pitch_detected.connect(self.pitch_detected)
+
+    # --- SCORE PANE AUTO-FIT (mirrors PerformTab, minus the legend row) ---
+    def _on_score_splitter_moved(self, *_):
+        """The user dragged the score/guitar-hero handle: their sizing wins from
+        now on (auto-fit stops re-asserting the rendered height)."""
+        self._score_splitter_user_set = True
+
+    def _fit_score_viewer_height(self, content_height: float):
+        """Size the score pane to the freshly rendered system so the default
+        view shows the whole line without scrolling."""
+        self._last_content_height = content_height
+        if self._score_splitter_user_set:
+            return
+        sizes = self.center_splitter.sizes()
+        total = sum(sizes)
+        if total <= 0:
+            return
+        MIN_GUITAR_HERO = 160
+        needed = min(int(content_height) + 4, total - MIN_GUITAR_HERO)
+        if needed <= 0:
+            return
+        self.center_splitter.setSizes([needed, total - needed])
+
+    def showEvent(self, event):
+        """Re-assert the auto-fit when the tab becomes visible: a load that ran
+        while the tab was hidden fitted against stale splitter geometry."""
+        super().showEvent(event)
+        if self._last_content_height:
+            self._fit_score_viewer_height(self._last_content_height)
 
     def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth):
         """Inject the shared transport components (owned by the host app). The
@@ -182,7 +216,7 @@ class PracticeTab(QWidget):
         music. Pitch-only, so it stays in sync with the Perform tab's score."""
         if self.score_data is None or self.score_data.score is None:
             return
-        self.score_data.transpose(semitones)
+        self.score_data.transpose(dy=semitones)
         self.guitar_hero.update_view_items()
         self.refresh_score_viewer()
 
@@ -229,6 +263,7 @@ class PracticeTab(QWidget):
         self.practice_time = t
         self._last_render = 0.0
         self.is_recording = True
+        self.guitar_hero.set_live(True)  # pitch-dot opacity: fixed absolute dB window
         self.audio_recorder.run(start_time=t)
         self.recording.pitch_detector.run(start_time=t)
 
@@ -236,6 +271,7 @@ class PracticeTab(QWidget):
         if not self.is_recording:
             return
         self.is_recording = False
+        self.guitar_hero.set_live(False)  # pitch-dot opacity: remap to the take's range
         self.wall_clock.pause()
         self.audio_recorder.stop()
         self.recording.pitch_detector.stop()
@@ -337,19 +373,29 @@ class PracticeTab(QWidget):
         return on_pitch
 
     # --- SCORE VIEWER ---
+    def on_note_clicked(self, viewer_sec: float):
+        """A note was clicked in the sheet music: jump the transport (slider +
+        cursor + GuitarHero) to that note. Scrub-only — ignored while playing or
+        recording (practice recording is pitch-driven, the click must not move
+        the playhead). Mirrors PerformTab.on_note_clicked."""
+        if self.is_playing or self.is_recording:
+            return
+        self.slider.set_time(self._score_note_start_from_viewer(viewer_sec))
+        self._move_views(self.slider.get_time())
+
+    def _score_note_start_from_viewer(self, viewer_t: float) -> float:
+        """Map the clicked Verovio note time to app time (ScoreTimeMap), then
+        snap to the nearest rendered score note onset. Mirrors
+        PerformTab._score_note_start_from_viewer."""
+        app_t = self._time_map.app_time(viewer_t, self.score_data)
+        starts = self.score_data.note_starts(all_instruments=self.viewer_show_full)
+        if not starts:
+            return app_t
+        return min(starts, key=lambda t: abs(t - app_t))
+
     def _score_viewer_time(self, t: float) -> float:
-        """Map a wall-clock time `t` (current tempo) into the Verovio cursor's
-        timeframe. First undo any tempo change (-> original-tempo app time), then
-        run that through the barline-anchored map so the cursor lands on whatever
-        note is actually SOUNDING (the MIDI/NoteData timeline), not on Verovio's
-        independently-drifting timemap. Falls back to the plain scalar until the
-        map's anchors have been pulled. Mirrors PerformTab._score_viewer_time."""
-        bpm_og = self.score_data.bpm_og or self.score_data.bpm
-        if not bpm_og:
-            return t
-        # undo the transpose offset then the tempo change (mirrors PerformTab)
-        og_t = (t - self.score_data.transpose_offset) * self.score_data.bpm / bpm_og
-        return self._time_map.to_viewer(og_t)
+        """Wall-clock time -> Verovio cursor time (see ScoreTimeMap.viewer_time)."""
+        return self._time_map.viewer_time(t, self.score_data)
 
     def refresh_score_viewer(self, *_):
         """Re-render the score viewer to match the active instrument's part.
@@ -397,25 +443,44 @@ class PracticeTab(QWidget):
         self.recording.cleanup() # get rid of any stale pitch/audio data
 
     # --- CLIP (measure-range focus; stored on ScoreData as note indices) ---
-    def apply_clip(self):
-        """Clip menu 'Clip': clip to the measures selected in the score viewer."""
-        self.score_viewer.get_clip_selection(self._on_clip_selection)
+    def start_clip_selection(self):
+        """Clip menu 'Select measures': arm measure picking in the score viewer.
+        Mirrors PerformTab.start_clip_selection."""
+        self.score_viewer.set_selection_mode(True)
+        if self.status_bar is not None:
+            self.status_bar.update_status(
+                "Select the first and last measures of your desired range, "
+                "then right-click to clip.")
 
-    def _on_clip_selection(self, sel: dict | None):
-        """Turn a pulled measure selection into a note-index clip. `sel` holds
+    def on_trim_requested(self):
+        """Right-click while selecting: pull the picked measures, then confirm
+        (async pull; _on_trim_selection shows the popup and applies)."""
+        self.score_viewer.get_clip_selection(self._on_trim_selection)
+
+    def _on_trim_selection(self, sel: dict | None):
+        """Confirm ("Trim?") and apply the pulled measure selection. `sel` holds
         inclusive measure INDICES; ScoreData resolves them to notes off its own
-        MIDI timeline (drift-free). Mirrors PerformTab._on_clip_selection."""
+        MIDI timeline (drift-free). Mirrors PerformTab._on_trim_selection."""
         if not sel:
-            return  # nothing selected -> leave the current clip as-is
+            if self.status_bar is not None:
+                self.status_bar.update_status("Click a start and an end measure first.")
+            return
+        if not ClipDialog.ask(self):
+            return  # keep selecting
+        if self.status_bar is not None:
+            self.status_bar.update_status("")
         clip = self.score_data.note_index_range_for_measures(
             sel["startIdx"], sel["endIdx"])
         if clip is None:
             return
+        self.score_viewer.set_selection_mode(False)
         self.set_clip(clip, seek=True)
         self.clip_changed.emit(clip)  # mirror onto the other tab (global clip)
 
     def reset_clip(self):
-        """Clip menu 'Reset': drop the clip (mirrored onto the other tab)."""
+        """Clip menu 'Reset': drop the clip (mirrored onto the other tab) and
+        disarm any in-progress measure selection."""
+        self.score_viewer.set_selection_mode(False)
         self.set_clip(None)
         self.clip_changed.emit(None)
 

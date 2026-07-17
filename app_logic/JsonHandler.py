@@ -363,7 +363,7 @@ class JsonHandler:
 
         transpose_semitones = int(payload.get("transpose_semitones") or 0)
         if transpose_semitones and sd.first_note_midi() is not None:
-            sd.transpose(transpose_semitones)
+            sd.transpose(dy=transpose_semitones)
 
         bpm = self._unpack_number(payload.get("bpm"), default=sd.bpm)
         if bpm and abs(float(bpm) - float(sd.bpm)) > 1e-9:

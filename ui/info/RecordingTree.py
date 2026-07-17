@@ -106,6 +106,18 @@ class RecordingTree(QWidget):
         self._score_items_by_path[score_path] = self.MIDI_ROOT
         self._suppress_selection_changed = False
 
+    def folder_contains_score(self, folder: str | Path) -> bool:
+        """Whether `folder` holds any loadable score file (SCORE_EXTENSIONS) —
+        the precondition for init_folder to produce a non-empty library."""
+        try:
+            return any(
+                path.is_file() and path.suffix.lower() in self.SCORE_EXTENSIONS
+                for path in Path(folder).rglob("*")
+            )
+        except OSError as e:
+            print(f"Could not scan folder '{folder}': {e}")
+            return False
+
     def init_folder(self, folder_path: str | Path) -> list[str]:
         """Scan `folder_path` and populate a recursive score/recording library."""
         root_path = Path(folder_path)

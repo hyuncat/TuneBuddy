@@ -14,8 +14,8 @@ PYIN_DEFAULT_MAX_VOLUME = 0.95
 class Config:
     DEFAULT_MIN_NOTE_LENGTH: ClassVar[float] = 0.03
 
-    # note-name spellings indexed by pitch class (midi % 12). get_note_name()
-    # picks one; the transpose autocomplete offers both.
+    # note-name spellings indexed by pitch class (midi % 12)
+    # get_note_name() picks one; the transpose autocomplete offers both
     SHARP_NOTE_NAMES: ClassVar[list] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     FLAT_NOTE_NAMES: ClassVar[list] = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
@@ -112,6 +112,19 @@ class Config:
         Convert a MIDI note number to frequency.
         """
         return self.tuning * (2 ** ((midi_num - 69) / 12))
+
+    # dB shown for a full-scale (RMS 1.0) signal: the 1 Pa = 94 dB SPL mic
+    # convention, so uncalibrated readouts land in familiar sound-level-meter
+    # territory (~50-90 dB) instead of negative dBFS. Not true SPL — the actual
+    # level depends on mic gain.
+    DB_FULL_SCALE: ClassVar[float] = 94.0
+
+    @staticmethod
+    def volume_to_db(volume: float | None) -> float | None:
+        """RMS of the raw (un-normalized) signal -> displayed absolute dB."""
+        if volume is None or volume <= 0:
+            return None
+        return float(20.0 * np.log10(volume) + Config.DB_FULL_SCALE)
 
 
     def __repr__(self):

@@ -26,7 +26,7 @@ class AudioData:
         # take records a one-beat runway BEFORE the head, so capture can begin at a
         # NEGATIVE app-time; setting t_origin to that start keeps the buffer
         # 0-indexed while reads/writes still address samples by their app-time.
-        # Shifting the whole recording (see Recording.shift) is just += on this.
+        # Shifting the whole recording (see Recording.transpose) is just += on this.
         self.t_origin = 0.0
 
         if audio_filepath is not None:

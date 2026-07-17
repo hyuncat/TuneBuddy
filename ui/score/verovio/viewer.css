@@ -1,0 +1,140 @@
+html, body { height: 100%; margin: 0; background: #111; }
+#wrap { height: 100%; overflow: auto; background: #1a1a1a; }
+#notation { max-width: 1100px; margin: 0 auto; padding: 12px; }
+.page {
+  background: #fff;
+  margin: 0 0 14px 0;
+  padding: 10px;
+  border-radius: 10px;
+  position: relative; /* overlay positioning */
+}
+.page svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+/* --- ANNOTATION COLORS ---
+   The --score-* custom properties are pushed in from Python (ui/Colors.py is
+   the single source of truth for the whole app's theme; see setThemeColors in
+   viewer.js) — deliberately NOT defaulted here, so there is no second copy to
+   drift. Un-themed, noteheads just render in their normal black. */
+g.note.mistake-deletion g.notehead,
+g.note.mistake-deletion g.notehead * {
+  color: var(--score-deletion) !important;
+  fill: var(--score-deletion) !important;
+  stroke: var(--score-deletion) !important;
+}
+g.note.mistake-substitution g.notehead,
+g.note.mistake-substitution g.notehead * {
+  color: var(--score-substitution) !important;
+  fill: var(--score-substitution) !important;
+  stroke: var(--score-substitution) !important;
+}
+g.note.mistake-timing g.notehead,
+g.note.mistake-timing g.notehead * {
+  color: var(--score-timing) !important;
+  fill: var(--score-timing) !important;
+  stroke: var(--score-timing) !important;
+}
+g.note.volume-colored g.notehead,
+g.note.volume-colored g.notehead * {
+  color: var(--score-volume-color) !important;
+  fill: var(--score-volume-color) !important;
+  stroke: var(--score-volume-color) !important;
+}
+/* the current-note pointer; every other score color is knocked back 10%
+   (Colors.SCORE_DIM) so this stays legible on top of them in every mode */
+g.note.playing g.notehead,
+g.note.playing g.notehead * {
+  color: var(--score-current) !important;
+  fill: var(--score-current) !important;
+  stroke: var(--score-current) !important;
+}
+/* the insertion "extra note" head, injected as SVG into its measure group
+   (so it scales with the score and dims with clipped-out measures) */
+.mistake-insertion-marker {
+  cursor: pointer;
+}
+#mistake-popup {
+  display: none;
+  position: fixed;
+  min-width: 172px;
+  max-width: 260px;
+  padding: 10px 12px;
+  background: rgb(255, 255, 255);
+  color: rgb(28, 30, 34);
+  border: 1px solid rgba(20, 20, 20, 0.18);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.26);
+  font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  z-index: 100000;
+}
+.mistake-popup-title {
+  text-align: center;
+  font-weight: 700;
+  margin-bottom: 7px;
+}
+.mistake-popup-row {
+  text-align: left;
+  white-space: nowrap;
+}
+.mistake-popup-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 9px;
+}
+.mistake-popup-count {
+  font-size: 12px;
+  color: rgba(28, 30, 34, 0.62);
+}
+.mistake-popup-controls button {
+  min-width: 34px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(20, 20, 20, 0.22);
+  border-radius: 4px;
+  background: rgb(245, 246, 248);
+  color: rgb(28, 30, 34);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 20px;
+}
+.mistake-popup-controls button:hover {
+  background: rgb(232, 235, 240);
+}
+
+/* --- CLIP SELECTION --- */
+/* notes are click-to-seek; while measure selection is armed ("Select measures")
+   the whole score turns crosshair and clicks pick a clip start/end instead */
+g.note { cursor: pointer; }
+body.selecting g.measure,
+body.selecting g.note { cursor: crosshair; }
+
+/* the in-progress pick: a translucent box spanning the STAFF height (the
+   per-measure clip-highlight rect, sized to the staff lines), behind the notes
+   so the measure reads as selected without recoloring the noteheads. */
+g.measure.selected rect.clip-highlight { fill: rgba(6, 114, 197, 0.20); }
+
+/* once clipped, measures OUTSIDE the focus range dim (the full score stays
+   laid out — clipping never re-renders, it just greys the context). */
+g.measure.clipped-out { opacity: 0.28; }
+
+/* Mirror qdarktheme's dark scrollbars (the rest of the app uses Qt's
+   styled scrollbars; this web view renders its own Chromium ones). */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: rgb(65, 66, 66);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(94, 94, 94);
+}

@@ -198,6 +198,22 @@ class PitchData:
             and (include_transitions or not getattr(pitch, "is_transition", False))
         )
 
+    def volume_range_db(self) -> tuple[float | None, float | None]:
+        """(min_dBFS, max_dBFS) over the voiced frames' volumes, or (None, None)
+        when nothing voiced carries volume. Review-mode volume coloring maps
+        this range onto the quiet->loud ramp."""
+        frames = self.read(i=0, j=len(self.data), clean=True)
+        vols = [float(p.volume) for p in frames if getattr(p, "volume", 0.0) > 0]
+        if not vols:
+            return (None, None)
+        return (20.0 * float(np.log10(min(vols))), 20.0 * float(np.log10(max(vols))))
+
+    def mean_volume(self, start_time: float, end_time: float) -> float:
+        """Mean voiced-frame volume in the window (0.0 when nothing voiced)."""
+        frames = self.read(start_time=start_time, end_time=end_time, clean=True)
+        vols = [float(p.volume) for p in frames if getattr(p, "volume", 0.0) > 0]
+        return float(np.mean(vols)) if vols else 0.0
+
     def get_voiced_range(self, include_transitions: bool=True) -> tuple[float, float]:
         """Return the app-time range covered by voiced pitch frames."""
         first = None

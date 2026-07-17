@@ -10,6 +10,12 @@ from app_logic.midi.MidiData import MidiData
 from app_logic.NoteData import NoteData, Note
 
 class ScoreData:
+    # MIDI/music21/Verovio round-trips can put a note that is visually on a
+    # barline a few microseconds before that barline. Clipping by selected
+    # measures should include/exclude those boundary notes with the score, not
+    # with float noise. This tolerance is used only when resolving measure clips.
+    CLIP_BOUNDARY_EPS = 1e-3
+
     def __init__(self, filepath: str | Path=None): 
         # --- ESSENTIAL DATA ---
         # for their respective midiplayer / verovio uses
@@ -116,7 +122,7 @@ class ScoreData:
         nd = self.note_datas.get(channel)
         if not nd or not nd.times:
             return None
-        eps = 1e-6
+        eps = self.CLIP_BOUNDARY_EPS
         idxs = [i for i, t in enumerate(nd.times) if t0 - eps <= t < t1 - eps]
         if not idxs:
             return None
@@ -188,8 +194,9 @@ class ScoreData:
             return None
         s0 = nd.read_note(i=i0).start_time
         s1 = nd.read_note(i=i1).start_time
-        m0 = max(0, bisect.bisect_right(onsets, s0 + 1e-6) - 1)
-        m1 = max(0, bisect.bisect_right(onsets, s1 + 1e-6) - 1)
+        eps = self.CLIP_BOUNDARY_EPS
+        m0 = max(0, bisect.bisect_right(onsets, s0 + eps) - 1)
+        m1 = max(0, bisect.bisect_right(onsets, s1 + eps) - 1)
         return (m0, m1)
 
     def clipped_note_data(self, channel: int | None = None) -> NoteData:
@@ -307,6 +314,21 @@ class ScoreData:
         scale = (bpm_og / bpm) if bpm else 1.0
         off = self.transpose_offset
         return [o * scale + off for o in og]
+
+    def note_starts(self, all_instruments: bool = False) -> list[float]:
+        """Onset times of the notes the score viewer is showing: every
+        non-metronome channel with all_instruments, else just the active one.
+        (What score-note clicks snap the transport to.)"""
+        if all_instruments:
+            channels = [ch for ch in self.instruments if ch != self.metronome_channel]
+        else:
+            channels = [self.active_instrument]
+        starts: list[float] = []
+        for ch in channels:
+            nd = self.note_datas.get(ch)
+            if nd is not None:
+                starts.extend(nd.times)
+        return starts
 
     def get_default_instrument(self) -> int:
         """Called at the beginning to set a default first instrument (non-metronome)"""
@@ -605,47 +627,43 @@ class ScoreData:
         return beats
     
     def transpose_notes(self, offset_sec: float):
-        """Shift all score notes so the piece starts `offset_sec` seconds in.
+        """Place the score so it starts `offset_sec` seconds in — the ABSOLUTE
+        time offset from the untransposed baseline, as tracked in
+        `transpose_offset`. Idempotent (the relative move is derived from the
+        tracked offset), so restoring a cached offset can't stack. Live code
+        moves the score with transpose(dx=...) instead."""
+        self.transpose(dx=offset_sec - self._beat_offset)
 
-        Sets each note's absolute time from its *untransposed baseline*
-        (`base_start_time`/`base_end_time`) rather than incrementing, so calling
-        this repeatedly with the same offset is idempotent — repeated resizes no
-        longer drift the score to the right. Also rebuilds each NoteData's `data`
-        dict keys and `times` list so they stay in sync with the notes' new
-        start_times (otherwise time-indexed lookups read stale keys)."""
-        for notedata in self.note_datas.values():
-            new_data = {}
-            for note in notedata.data.values():
-                note.start_time = note.base_start_time + offset_sec
-                note.end_time = note.base_end_time + offset_sec
-                new_data[note.start_time] = note
-            notedata.data = new_data
-            notedata.times = sorted(new_data.keys())
+    def transpose(self, dx: float=None, dy: float=None):
+        """Move the ENTIRE score by `dx` seconds and/or `dy` semitones, keeping
+        every representation in sync. Both moves flow through
+        NoteData.transpose for the per-instrument notes.
 
-        # shift the beat grid by the same offset so the GuitarHero gridlines stay
-        # aligned with the transposed notes (idempotent: rebuilt from baseline).
-        self._beat_offset = offset_sec
-        self._rebuild_beats()
+        dx (TIME): shifts all note_datas plus the beat grid / metronome clicks;
+        the cumulative offset accumulates in `_beat_offset` (see
+        transpose_offset) so the score-viewer time map can undo it. Used by
+        resize_score to land the score on the take. The clip (note INDICES) is
+        untouched.
 
-    # --- PITCH TRANSPOSITION (NB: distinct from transpose_notes, which is TIME) ---
-    def transpose(self, semitones: int):
-        """Transpose the ENTIRE score up/down by `semitones` half steps, keeping
-        all three representations in sync so playback, the GuitarHero piano-roll,
-        and the Verovio sheet music all reflect the new pitches:
-            1. midi_data  — the messages that get played
-            2. score      — the music21 score the MusicXML view is exported from
-            3. note_datas — the per-instrument Note pitches (GuitarHero + editing)
+        dy (PITCH): shifts 1. midi_data (the messages that get played),
+        2. the music21 score (the MusicXML pushed to Verovio), and
+        3. note_datas (GuitarHero + editing), skipping the metronome channel.
+        Applied incrementally and accumulated in `transpose_semitones`, so
+        callers hand it a delta and repeated calls compose correctly."""
+        if dx:
+            for notedata in self.note_datas.values():
+                notedata.transpose(dx=dx)
+            # shift the beat grid by the same offset so the GuitarHero
+            # gridlines stay aligned with the transposed notes.
+            self._beat_offset += dx
+            self._rebuild_beats()
 
-        This is a *pitch-only* shift: note timing, the metronome, and the clip
-        (stored as note INDICES) are all untouched. Applied incrementally and
-        accumulated in `transpose_semitones`, so callers can hand it a delta and
-        repeated calls compose correctly (a delta of 0 is a no-op)."""
-        if self.score is None or not semitones:
+        if not dy or self.score is None:
             return
-
+        semitones = int(dy)
         # 1. MIDI playback (shifts the shared note-message pitch baseline)
         self.midi_data.transpose(semitones)
-        # 2. music21 score (drives the MusicXML pushed to Verovio); int == semitones
+        # 2. music21 score (drives the MusicXML pushed to Verovio)
         original_midi = self.first_note_midi()
         p_from = m21pitch.Pitch(midi=original_midi)
         p_to   = m21pitch.Pitch(midi=original_midi + semitones)
@@ -653,15 +671,11 @@ class ScoreData:
         trans  = m21interval.Interval(p_from, p_to)
         self.score.transpose(trans, inPlace=True)
         # 3. live NoteData pitches — shift in place so the current views update
-        #    without a full rebuild. Skip the metronome channel + unvoiced (-1).
+        #    without a full rebuild. Skip the metronome channel.
         for channel, nd in self.note_datas.items():
             if channel == self.metronome_channel:
                 continue
-            for note in nd.data.values():
-                note.midi_num = [
-                    int(max(0, min(127, m + semitones))) if m != -1 else -1
-                    for m in note.midi_num
-                ]
+            nd.transpose(dy=semitones)
 
         self.transpose_semitones += semitones
 

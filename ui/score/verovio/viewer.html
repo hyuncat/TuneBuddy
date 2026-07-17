@@ -10,8 +10,8 @@
       // must be defined before loading verovio-toolkit-wasm.js
       var Module = {
         locateFile: function(path, prefix) {
-          // viewer.html lives in: resources/verovio/
-          // wasm lives in:        resources/verovio/imports
+          // viewer.html lives in: ui/score/verovio/
+          // wasm lives in:        ui/score/verovio/imports
           return "./imports/" + path;
         }
       };
@@ -19,12 +19,16 @@
     <!-- local verovio WASM loader -->
     <script src="./imports/verovio-toolkit-wasm.js"></script>
 
+    <!-- Qt WebChannel (JS->Python push bridge; baked into QtWebEngine).
+         Missing outside the Qt app (plain browser / node test) - viewer.js
+         guards on QWebChannel being undefined. -->
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
     <!-- app code -->
     <script src="./viewer.js"></script>
   </head>
 
   <body>
     <div id="wrap"><div id="notation"></div></div>
-    <div id="status">Loading Verovio…</div>
   </body>
 </html>
