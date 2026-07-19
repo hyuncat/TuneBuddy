@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import fields
+import base64
 import gzip
 import json
 import lzma
 import math
+import numpy as np
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,6 +15,7 @@ from app_logic.Alignment import Alignment, Mistake
 from app_logic.NoteData import Note, NoteData
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.user.ds.PitchData import Pitch, PitchData
+from app_logic.user.ds.TimbreData import TimbreData
 
 if TYPE_CHECKING:
     from app_logic.user.ds.Recording import Recording
@@ -206,6 +209,7 @@ class JsonHandler:
             "score": self._score_to_payload(rec, score_path),
             "config": self._config_to_payload(rec.config),
             "pitch_data": self._pitch_data_to_payload(rec),
+            "timbre": self._timbre_to_payload(rec.timbre_data),
             "note_data": self._note_data_to_payload(rec.note_data),
             "alignment": self._alignment_to_payload(rec),
             "overridden_mistake_indices": sorted(int(i) for i in rec.overridden_mistake_indices),
@@ -236,6 +240,8 @@ class JsonHandler:
             recording.audio_data.end_index = min(end_index, len(recording.audio_data.data))
 
         recording.pitch_data = self._pitch_data_from_payload(recording, payload.get("pitch_data") or {})
+        recording.timbre_data = self._timbre_from_payload(
+            recording, payload.get("timbre") or {})
         recording.note_data = self._note_data_from_payload(payload.get("note_data") or [])
         recording.alignment = self._alignment_from_payload(recording, payload.get("alignment") or {})
         recording.overridden_mistake_indices = {
@@ -483,6 +489,45 @@ class JsonHandler:
             pitch.is_transition,
             self._pack_number(pitch.value),
         ]
+
+    @staticmethod
+    def _timbre_to_payload(data: TimbreData):
+        with data.lock:
+            n_cols = int(data.computed_until)
+            if n_cols <= 0 or not data.written[:n_cols].any():
+                return None
+            vals = data.values[:, :n_cols].copy()
+            missing = ~data.written[:n_cols]
+        if missing.any():
+            vals[:, missing] = data.floor_db
+        # One byte per bin/column. Offset by the -120 dB floor so 0..240
+        # represents -120..0 dB in 0.5 dB steps.
+        quantized = np.rint((np.clip(vals, data.floor_db, 0.0) - data.floor_db) * 2.0)
+        quantized = quantized.astype(np.uint8)
+        return {
+            "stride": int(data.stride),
+            "t_origin": JsonHandler._pack_number(data.t_origin),
+            "midi_min": int(data.midi_min),
+            "midi_max": int(data.midi_max),
+            "n_cols": n_cols,
+            "floor_db": data.floor_db,
+            "step_db": 0.5,
+            "blob": base64.b64encode(quantized.tobytes(order="C")).decode("ascii"),
+        }
+
+    def _timbre_from_payload(self, recording: Recording, payload: dict) -> TimbreData:
+        td = TimbreData(config=recording.config)
+        if not payload or not payload.get("blob"):
+            return td
+        if (int(payload.get("stride", td.stride)) != td.stride
+                or int(payload.get("midi_min", td.midi_min)) != td.midi_min
+                or int(payload.get("midi_max", td.midi_max)) != td.midi_max
+                or float(payload.get("step_db", 0.5)) != 0.5):
+            return td
+        td.t_origin = self._unpack_number(payload.get("t_origin"), default=0.0)
+        raw = base64.b64decode(payload["blob"], validate=True)
+        td.load_quantized(np.frombuffer(raw, dtype=np.uint8), int(payload.get("n_cols", 0)))
+        return td
 
     def _pitch_from_payload(self, recording: Recording, payload) -> Pitch | None:
         if payload is None:

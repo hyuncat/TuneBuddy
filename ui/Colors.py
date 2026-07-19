@@ -1,4 +1,5 @@
 import math
+import numpy as np
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
@@ -34,6 +35,12 @@ class Colors:
         (68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98), (253, 231, 37)
     ]
 
+    # --- magma: timbre heatmap (matplotlib magma, dark -> hot) ---
+    MAGMA_ANCHORS = [
+        (0, 0, 4), (51, 15, 106), (120, 28, 129),
+        (189, 55, 121), (249, 105, 92), (252, 253, 191),
+    ]
+
     # The score draws on white paper with the cursor color landing ON TOP of
     # annotated noteheads, so every score color is knocked back 10%. The
     # GuitarHero plot has no such constraint and uses them full strength.
@@ -51,6 +58,19 @@ class Colors:
     }
     CURRENT_RGB = (0, 110, 154)  # the score's playback cursor (never dimmed)
     TRANSITION_RGB = (140, 140, 140)  # unvoiced / transition frames
+
+    # --- note-detail panel (ui/note): timeline / contour / axes ---
+    PLOT_BG_RGB = (20, 20, 25)       # the pyqtgraph panels' background
+    NOTE_TIMELINE_RGB = (0, 255, 0)  # mirrors the GuitarHero timeline (own knob)
+    NOTE_AXIS_RGB = (230, 230, 235)  # near-white axes for legibility
+    NOTE_VOLUME_RGB = (94, 201, 98)  # the volume curve — viridis's "loud" green
+    # the flat single-color pitch contour, editable per graph: volume/vibrato
+    # draw it UNDER their curve on the dark bg; timbre ABOVE the magma heatmap
+    NOTE_CONTOUR_RGB = {
+        'volume': (95, 100, 110),
+        'vibrato': (95, 100, 110),
+        'timbre': (170, 170, 175),
+    }
     # the GuitarHero pointer box, keyed by what it points AT. Clean takes the
     # score cursor's own blue: pointing at a note nothing flagged means "you are
     # here", the same thing it means on the score, so it must not read as an error.
@@ -153,6 +173,26 @@ class Colors:
         rgb = Colors.HIGHLIGHT_RGB.get(state, Colors.HIGHLIGHT_RGB['clean'])
         return pg.mkBrush(*rgb, 130), pg.mkPen(*rgb, 255, width=2)
 
+    # --- note-detail panel pens ---
+    @staticmethod
+    def note_timeline_pen():
+        return pg.mkPen(*Colors.NOTE_TIMELINE_RGB, 255)
+
+    @staticmethod
+    def note_contour_pen(role: str):
+        """The flat pitch-contour pen for one note-panel graph
+        ('volume' | 'vibrato' | 'timbre')."""
+        return pg.mkPen(*Colors.NOTE_CONTOUR_RGB[role], 255, width=4)
+
+    @staticmethod
+    def note_axis_pen():
+        return pg.mkPen(*Colors.NOTE_AXIS_RGB)
+
+    @staticmethod
+    def note_axis_hex() -> str:
+        """The axis color as '#rrggbb' (pyqtgraph label styles want css)."""
+        return "#{:02x}{:02x}{:02x}".format(*Colors.NOTE_AXIS_RGB)
+
     @staticmethod
     def midi_rgba(m: int, alpha: int = 50) -> tuple[int, int, int, int]:
         """Background stripe color for a MIDI number (sharps darkened)."""
@@ -187,10 +227,31 @@ class Colors:
         return Colors.ramp(Colors.VIRIDIS_ANCHORS, frac, dim=dim)
 
     @staticmethod
+    def viridis_brushes(buckets: int = None) -> list:
+        """Pooled brushes along the viridis ramp (the volume dots and the
+        vibrato panel's secondary-metric dots share this pool)."""
+        n = buckets or Colors.VOLUME_BUCKETS
+        return [pg.mkBrush(QColor(*Colors.viridis(i / (n - 1)))) for i in range(n)]
+
+    @staticmethod
     def volume_brushes() -> list:
         """Pooled brushes along the viridis ramp, one per volume bucket."""
-        n = Colors.VOLUME_BUCKETS
-        return [pg.mkBrush(QColor(*Colors.viridis(i / (n - 1)))) for i in range(n)]
+        return Colors.viridis_brushes()
+
+    # --- timbre ---
+    @staticmethod
+    def magma_anchors() -> list:
+        return list(Colors.MAGMA_ANCHORS)
+
+    @staticmethod
+    def magma(frac: float) -> tuple[int, int, int]:
+        return Colors.ramp(Colors.MAGMA_ANCHORS, frac)
+
+    @staticmethod
+    def magma_lut(n: int = 256) -> np.ndarray:
+        n = max(2, int(n))
+        return np.asarray(
+            [Colors.magma(i / (n - 1)) for i in range(n)], dtype=np.ubyte)
 
     @staticmethod
     def volume_frac(volume: float, vmin_db: float = None, vmax_db: float = None) -> float:

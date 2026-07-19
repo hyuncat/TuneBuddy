@@ -61,6 +61,7 @@ class PracticeTab(QWidget):
         self.slider = None
         self.status_bar = None
         self.midi_player = None
+        self.note_panel = None
 
         self.init_ui()
         self.init_signals()
@@ -129,16 +130,19 @@ class PracticeTab(QWidget):
         if self._last_content_height:
             self._fit_score_viewer_height(self._last_content_height)
 
-    def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth):
-        """Inject the shared transport components (owned by the host app). The
-        panel drives these directly during practice playback/recording; the host
-        routes the matching button clicks / clock+slider ticks back to us.
+    def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth,
+                           note_panel=None):
+        """Inject the shared transport components (owned by the host app) plus
+        the shared NotePanel. The panel drives these directly during practice
+        playback/recording; the host routes the matching button clicks /
+        clock+slider ticks back to us.
 
         The MIDI player is the panel's OWN (sharing only the synth + clock) so it
         plays *this tab's* independent score — Perform's resize never leaks in."""
         self.wall_clock = wall_clock
         self.slider = slider
         self.status_bar = status_bar
+        self.note_panel = note_panel
         self.midi_player = MidiPlayer(midi_synth, wall_clock)
         # the plot is the master view while recording (driven by emitted pitch
         # times, not the clock): keep the shared slider following it.
@@ -264,6 +268,8 @@ class PracticeTab(QWidget):
         self._last_render = 0.0
         self.is_recording = True
         self.guitar_hero.set_live(True)  # pitch-dot opacity: fixed absolute dB window
+        if self.note_panel is not None:
+            self.note_panel.set_live(True)  # trailing-window mode
         self.audio_recorder.run(start_time=t)
         self.recording.pitch_detector.run(start_time=t)
 
@@ -272,6 +278,8 @@ class PracticeTab(QWidget):
             return
         self.is_recording = False
         self.guitar_hero.set_live(False)  # pitch-dot opacity: remap to the take's range
+        if self.note_panel is not None:
+            self.note_panel.set_live(False)
         self.wall_clock.pause()
         self.audio_recorder.stop()
         self.recording.pitch_detector.stop()
@@ -282,6 +290,8 @@ class PracticeTab(QWidget):
         self.score_data.update_time(t)
         self.score_viewer.set_playback_time(self._score_viewer_time(t))
         self.guitar_hero.move_plot(t)
+        if self.note_panel is not None:
+            self.note_panel.update_time(t)
 
     def render_at(self, t: float):
         """Public alias used by the host (e.g. on tab switch) to line this tab's

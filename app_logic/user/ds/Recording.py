@@ -6,6 +6,8 @@ from typing import Literal
 
 from app_logic.user.ds.AudioData import AudioData
 from app_logic.user.ds.PitchData import PitchData, Pitch
+from app_logic.user.ds.VibratoData import VibratoData
+from app_logic.user.ds.TimbreData import TimbreData
 from app_logic.midi.ScoreData import ScoreData
 from app_logic.Alignment import Alignment
 from app_logic.NoteData import NoteData
@@ -35,6 +37,7 @@ class Recording:
         from app_logic.user.ds.OnsetData import OnsetDetector, OnsetData
         from algorithms.MistakeDetector import MistakeDetector
         from algorithms.MistakeChecker import MistakeChecker
+        from algorithms.VibratoDetector import VibratoDetector
 
         self.pitch_detector = PitchDetector(recording=self)
         self.pitch_smoother = PitchSmoother(recording=self)
@@ -42,10 +45,13 @@ class Recording:
         self.transition_detector = TransitionDetector(recording=self)
         self.mistake_detector = MistakeDetector(recording=self)
         self.mistake_checker = MistakeChecker(recording=self)
+        self.vibrato_detector = VibratoDetector(recording=self)
 
         # essential data variables
         self.audio_data = AudioData(config=self.config)
         self.pitch_data = PitchData(config=self.config)
+        self.vibrato_data = VibratoData(config=self.config)
+        self.timbre_data = TimbreData(config=self.config)
         self.note_data = NoteData()
         self.onset_data = OnsetData(config=self.config)
         self.onset_detector = OnsetDetector(recording=self)
@@ -61,6 +67,8 @@ class Recording:
 
         # queue data structures for real time pitch detection
         self.a2p_queue = Buffer(self.config.sr) #audio-to-pitches
+        self._timbre_thread: threading.Thread | None = None
+        self._timbre_thread_lock = threading.Lock()
 
     def update_config(self, config: Config=None):
         """initialize the config, either with a provided one or a default one"""
@@ -83,6 +91,8 @@ class Recording:
             self.mistake_detector.update_config(self.config)
         if hasattr(self, 'mistake_checker'):
             self.mistake_checker.update_config(self.config)
+        if hasattr(self, 'vibrato_detector'):
+            self.vibrato_detector.update_config(self.config)
     # def on_pitches_detected(self, pitches):
     #     self.pitch_data.data = pitches
 
@@ -110,6 +120,8 @@ class Recording:
         self.unsaved_changes = False
         self.loaded_from_cache = False
         self.pitch_data = PitchData(config=self.config)
+        self.vibrato_data = VibratoData(config=self.config)
+        self.timbre_data = TimbreData(config=self.config)
         self.reset_analysis()
         if load_cache:
             self.load_cache(score_filepath=score_filepath, recording_name=recording_name)
@@ -144,6 +156,13 @@ class Recording:
     def save_cache(
         self, score_filepath: str | Path=None, recording_name: str=None,
     ) -> bool:
+        # A cache saved after loading a pre-timbre sidecar should be upgraded in
+        # place even when the user never opened the Timbre panel.
+        if self.timbre_data.is_empty() and self.audio_data.end_index >= self.config.w1:
+            self.ensure_timbre()
+            thread = self._timbre_thread
+            if thread is not None and thread.is_alive():
+                thread.join()
         return JsonHandler(self).save_cache(
             score_filepath=score_filepath,
             recording_name=recording_name,
@@ -154,15 +173,23 @@ class Recording:
         score_filepath: str | Path=None,
         recording_name: str=None,
     ) -> bool:
-        return JsonHandler(self).load_cache(
+        loaded = JsonHandler(self).load_cache(
             score_filepath=score_filepath,
             recording_name=recording_name,
         )
+        # VibratoData deliberately is not persisted: it is derived solely from
+        # rebuilding it here guarantees it can never be stale against a cached
+        # pitch track.
+        if loaded:
+            self.vibrato_data = self.vibrato_detector.detect(self.pitch_data)
+        return loaded
 
     def cleanup(self):
         """Re-init essential data structures. Called before load_score() in app."""
         self.audio_data = AudioData(config=self.config)
         self.pitch_data = PitchData(config=self.config)
+        self.vibrato_data = VibratoData(config=self.config)
+        self.timbre_data = TimbreData(config=self.config)
         self.reset_analysis()
 
     def reset_analysis(self):
@@ -177,6 +204,9 @@ class Recording:
         `on_phase(text)`, if given, is called at the start of each stage so a
         caller can surface progress (e.g. a status-bar message)."""
         audio = self.audio_data.read_all()
+        self.vibrato_data = VibratoData(config=self.config)
+        self.timbre_data = TimbreData(config=self.config)
+        self.timbre_data.t_origin = self.audio_data.t_origin
         stop_status = self._phase_status_timer(on_phase, "Detecting pitches")
         try:
             self.pitch_data.data = self.pitch_detector.detect_pitches(
@@ -208,6 +238,12 @@ class Recording:
             for p in self.pitch_data.data:
                 if p is not None:
                     p.time += origin
+
+        stop_status = self._phase_status_timer(on_phase, "Detecting vibrato")
+        try:
+            self.vibrato_data = self.vibrato_detector.detect(self.pitch_data)
+        finally:
+            stop_status()
 
     @staticmethod
     def _phase_status_timer(on_phase, label: str):
@@ -243,7 +279,7 @@ class Recording:
             notes.get_min_note_length(default=self.config.get_min_note_length(), clean=True)
         )
 
-    def detect_notes(self):
+    def detect_notes(self, use_transitions=False):
         """Run PELT note detection on the current pitch data."""
         self.transition_detector.detect_transitions(self.pitch_data.data)
         # resize to the stable pitch span so score-derived note-length heuristics
@@ -251,12 +287,17 @@ class Recording:
         self.resize_score(to_span="pitch", include_transitions=False)
         self.update_min_note_length()
         self.onset_data = self.onset_detector.detect()
-        # self.transition_detector.detect_transitions(self.pitch_data.data)
+        if use_transitions:    
+            self.transition_detector.detect_transitions(self.pitch_data.data)
         nd = self.note_detector.detect_notes(self.pitch_data.data)
         self.note_data = self.note_detector.refine_with_onsets(nd, self.onset_data.times)
         # resize the score to the take's voiced NOTE span in case
         # some voiced noise got through cracks
         self.resize_score(to_span="onset")
+        # detect_transitions above (re)marked the pitch frames, and those marks
+        # are the vibrato segment boundaries — the pre-analysis vibrato pass ran
+        # before any existed, so only now can note changes cut the segments.
+        self.vibrato_data = self.vibrato_detector.detect(self.pitch_data)
 
 
     def recompute_note_pitches(self, verbose: bool = False):
@@ -269,6 +310,7 @@ class Recording:
 
     def prune_transition_notes(self, verbose: bool = False):
         """Drop detected notes that are mostly transition frames."""
+        pass # prune_transition_notes was deleted
         self.note_data = self.note_detector.prune_transition_notes(
             self.note_data,
             self.pitch_data,
@@ -322,6 +364,9 @@ class Recording:
     def write_pitch_data(self, indata: list[Pitch], start_time: float):
         """Write detected pitches to pitch_data at the given start_time."""
         self.pitch_data.write(indata, start_time)
+        # Centered windows become available about vib_win_sec/2 behind the
+        # playhead. extend() only computes newly available stride points.
+        self.vibrato_detector.extend(self.vibrato_data, self.pitch_data)
 
     def get_length(self, raw=True):
         if raw:
@@ -358,6 +403,8 @@ class Recording:
         if dx:
             self.audio_data.t_origin += dx
             self.pitch_data.t_origin += dx
+            self.vibrato_data.t_origin += dx
+            self.timbre_data.t_origin += dx
         for p in self.pitch_data.data:
             if p is None:
                 continue
@@ -579,10 +626,64 @@ class Recording:
         if pitch_changed:
             with self.pitch_data.lock:
                 self.pitch_data.data = self.pitch_data.data[:keep_count]
+                self.pitch_data.end_index = min(self.pitch_data.end_index, keep_count)
+
+        self.vibrato_data.trim_to(trim_time)
+        self.timbre_data.trim_to(trim_time)
 
         if audio_changed and mark_unsaved:
             self.unsaved_changes = True
         return audio_changed or pitch_changed
+
+    def ensure_timbre(self, on_done=None) -> bool:
+        """Lazily backfill TimbreData from raw audio on a daemon thread.
+
+        Returns True when work was started. Old caches omit the additive
+        timbre payload; this path restores it without rerunning pYIN.
+        """
+        if int(getattr(self.config, "cqt_stride", 0) or 0) <= 0:
+            if on_done is not None:
+                on_done()
+            return False
+        if self.audio_data.end_index < self.config.w1:
+            if on_done is not None:
+                on_done()
+            return False
+        if not self.timbre_data.is_empty():
+            if on_done is not None:
+                on_done()
+            return False
+        with self._timbre_thread_lock:
+            if self._timbre_thread is not None and self._timbre_thread.is_alive():
+                return False
+
+            def worker():
+                from algorithms.CQT import CQT
+
+                try:
+                    audio = self.audio_data.read_all()
+                    cfg = self.config
+                    target = TimbreData(config=cfg)
+                    target.t_origin = self.audio_data.t_origin
+                    # Publish the target before filling it so TimbreWidget can
+                    # show columns progressively while an old cache backfills.
+                    self.timbre_data = target
+                    if len(audio) >= cfg.w1:
+                        cqt = CQT(cfg)
+                        frames = np.lib.stride_tricks.sliding_window_view(
+                            audio, cfg.w1)[::cfg.h1]
+                        stride = max(1, int(cfg.cqt_stride))
+                        for frame_i in range(0, len(frames), stride):
+                            target.write(frame_i // stride, cqt.power_db(frames[frame_i]))
+                except Exception as e:
+                    print(f"[CQT] timbre backfill failed: {e}")
+                finally:
+                    if on_done is not None:
+                        on_done()
+
+            self._timbre_thread = threading.Thread(target=worker, daemon=True)
+            self._timbre_thread.start()
+            return True
 
 
     # --- JSON LOADING / SAVING WRAPPERS ---

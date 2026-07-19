@@ -9,16 +9,6 @@ class NoteInfo:
     Generated on demand from a Recording's pitch frames + alignment via
     analyze(), and cached on the inspected Note (Note.info)."""
 
-    # Vibrato is only reported when a dominant pitch oscillation sits in a
-    # plausible band and is big/long enough to be deliberate: violin vibrato
-    # runs ~5-8 Hz, the band is wider to catch slow student vibrato.
-    VIB_MIN_HZ = 2.5
-    VIB_MAX_HZ = 10.0
-    VIB_MIN_CENTS = 5.0     # smaller oscillations are pitch jitter, not vibrato
-    VIB_MIN_CYCLES = 2.0    # need >= 2 full cycles inside the note to trust the peak
-    VIB_MIN_VOICED_FRAC = 0.5
-    VIB_FFT_PAD = 4096      # zero-pad so short notes still get a fine-grained peak
-
     # Volume is shown RELATIVE to this take only — never as an absolute number.
     # A computer mic's level is uncalibrated (mic gain/distance/AGC all unknown),
     # and an absolute dBFS reading disagrees with the color ramp (a note can be
@@ -66,52 +56,13 @@ class NoteInfo:
                 duration_mistake = m.type
         return onset_mistake, duration_mistake
 
-    @classmethod
-    def _note_frames(cls, recording, note) -> list:
-        return recording.pitch_data.read(
-            start_time=note.start_time, end_time=note.end_time,
-        )
-
-    @classmethod
-    def _vibrato(cls, recording, note) -> tuple[float | None, float | None]:
-        """Dominant pitch oscillation inside the note: (rate Hz, extent cents),
-        or (None, None) when there's no credible vibrato. Transition frames are
-        excluded and gaps interpolated so slides in/out don't fake a peak; a
-        linear detrend removes scoop/drift while leaving the oscillation."""
-        pd = recording.pitch_data
-        frames = cls._note_frames(recording, note)
-        frame_rate = recording.config.sr / recording.config.h1
-
-        vals = np.full(len(frames), np.nan)
-        for i, p in enumerate(frames):
-            if pd.is_voiced_pitch(p, include_transitions=False):
-                vals[i] = p.value
-        voiced = ~np.isnan(vals)
-        n = len(vals)
-        if n < 8 or voiced.mean() < cls.VIB_MIN_VOICED_FRAC:
+    @staticmethod
+    def _vibrato(recording, note) -> tuple[float | None, float | None]:
+        """Summarize the same instantaneous track drawn by VibratoWidget."""
+        vibrato_data = getattr(recording, "vibrato_data", None)
+        if vibrato_data is None:
             return None, None
-
-        idx = np.arange(n, dtype=np.float64)
-        vals = np.interp(idx, idx[voiced], vals[voiced])
-        vals = vals - np.polyval(np.polyfit(idx, vals, 1), idx)
-
-        window = np.hanning(n)
-        n_fft = max(n, cls.VIB_FFT_PAD)
-        spec = np.fft.rfft(vals * window, n=n_fft)
-        freqs = np.fft.rfftfreq(n_fft, d=1.0 / frame_rate)
-        # |X_k| of a windowed sinusoid of amplitude a is ~ a * sum(window)/2
-        amps = np.abs(spec) * 2.0 / window.sum()
-
-        band = (freqs >= cls.VIB_MIN_HZ) & (freqs <= cls.VIB_MAX_HZ)
-        if not band.any():
-            return None, None
-        k = int(np.argmax(amps[band]))
-        rate = float(freqs[band][k])
-        extent_cents = float(amps[band][k]) * 100.0
-
-        if extent_cents < cls.VIB_MIN_CENTS or (n / frame_rate) * rate < cls.VIB_MIN_CYCLES:
-            return None, None
-        return rate, extent_cents
+        return vibrato_data.note_summary(note)
 
     @classmethod
     def _volume(cls, recording, note) -> float | None:

@@ -65,6 +65,7 @@ class PerformTab(QWidget):
         self.status_bar = None
         self.midi_player = None
         self.mistake_widget = None
+        self.note_panel = None
 
         self.init_ui()
         self.init_signals()
@@ -215,17 +216,20 @@ class PerformTab(QWidget):
         if self._last_content_height:
             self._fit_score_viewer_height(self._last_content_height)
 
-    def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth, mistake_widget):
+    def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth,
+                           mistake_widget, note_panel=None):
         """Inject the shared transport (owned by the host) plus the Perform-only
-        MistakeWidget. The panel drives the transport during playback/recording;
-        the host routes the matching button clicks / clock+slider ticks back. The
-        MIDI player is the panel's OWN (sharing only the synth + clock) so it
-        plays this tab's score independently of the Practice tab's."""
+        MistakeWidget and the shared NotePanel. The panel drives the transport
+        during playback/recording; the host routes the matching button clicks /
+        clock+slider ticks back. The MIDI player is the panel's OWN (sharing
+        only the synth + clock) so it plays this tab's score independently of
+        the Practice tab's."""
         self.wall_clock = wall_clock
         self.slider = slider
         self.status_bar = status_bar
         self.midi_player = MidiPlayer(midi_synth, wall_clock)
         self.mistake_widget = mistake_widget
+        self.note_panel = note_panel
         # keep the shared slider following the plot as it moves
         self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
         # mistake list <-> guitar hero highlight/override coupling
@@ -282,6 +286,8 @@ class PerformTab(QWidget):
             self.guitar_hero.load_user(rec)
         if self.mistake_widget is not None:
             self.mistake_widget.clear()
+        if self.note_panel is not None:
+            self.note_panel.clear()
         self.score_viewer.clear_mistake_annotations()
 
     def _clear_analysis(self):
@@ -298,6 +304,8 @@ class PerformTab(QWidget):
             self.guitar_hero.load_user(rec)
         if self.mistake_widget is not None:
             self.mistake_widget.clear()
+        if self.note_panel is not None:
+            self.note_panel.clear()
         self.score_viewer.clear_mistake_annotations()
 
     def set_active_instrument(self, channel: int):
@@ -374,6 +382,8 @@ class PerformTab(QWidget):
         self.status_bar.update_status("")
         self.guitar_hero.load_user(self.recording)
         self._refresh_guitar_hero_now()
+        if self.note_panel is not None:
+            self.note_panel.refresh()
         JsonHandler(self.recording).save_cache()
 
     def _refresh_guitar_hero_now(self):
@@ -428,9 +438,13 @@ class PerformTab(QWidget):
         origin = min(0.0, t)
         self.recording.audio_data.t_origin = origin
         self.recording.pitch_data.t_origin = origin
+        self.recording.vibrato_data.t_origin = origin
+        self.recording.timbre_data.t_origin = origin
         self.wall_clock.set_floor(origin)
         self.is_recording = True
         self.guitar_hero.set_live(True)  # pitch-dot opacity: fixed absolute dB window
+        if self.note_panel is not None:
+            self.note_panel.set_live(True)  # trailing-window mode
         self.audio_player.stop()
         self.wall_clock.start(t)
         self.audio_recorder.run(start_time=t)
@@ -442,6 +456,8 @@ class PerformTab(QWidget):
             return
         self.is_recording = False
         self.guitar_hero.set_live(False)  # pitch-dot opacity: remap to the take's range
+        if self.note_panel is not None:
+            self.note_panel.set_live(False)
         self.wall_clock.pause()
         self.wall_clock.set_floor(0.0)  # drop the runway floor for plain playback
         self.audio_recorder.stop()
@@ -454,6 +470,8 @@ class PerformTab(QWidget):
         self.score_data.update_time(t)
         self.score_viewer.set_playback_time(self._score_viewer_time(t))
         self.guitar_hero.move_plot(t)
+        if self.note_panel is not None:
+            self.note_panel.update_time(t)
 
     def render_at(self, t: float):
         """Public alias used by the host (e.g. on tab switch) to line this tab's
@@ -496,7 +514,7 @@ class PerformTab(QWidget):
             return
         print("analyzing... ")
         rec.reset_analysis()  # clear stale notes/alignment/mistakes before recomputing
-        rec.detect_notes()
+        rec.detect_notes(use_transitions=True)
         # rec.recompute_note_pitches()
         # rec.prune_transition_notes()
 
@@ -521,6 +539,8 @@ class PerformTab(QWidget):
             self.slider.set_time(start_bounds[0])
         self.guitar_hero.update_clip_overlay()
         self._refresh_mistake_widget(rec)
+        if self.note_panel is not None:
+            self.note_panel.refresh()
         JsonHandler(rec).save_cache()
 
         # the resize stretched the score to match the take => its BPM/length

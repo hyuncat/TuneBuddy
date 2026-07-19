@@ -46,6 +46,24 @@ class Config:
     pitch_tolerance: float = 0.5   # semitones
     timing_tolerance: float = 0.25  # sec
 
+    # --- VIBRATO (instantaneous windowed LS-Prony — see algorithms/VibratoDetector) ---
+    vib_win_sec: float = 0.4      # sliding analysis window (McLeod ch. 9)
+    # Frame-dense is an invariant, not a persisted per-take option: old caches
+    # may contain the former value 4 and must not silently restore decimation.
+    vib_stride: ClassVar[int] = 1
+    vib_order: int = 2            # linear-prediction order (2 = one real sinusoid)
+    vib_min_cycles: float = 1.5   # cycles the fit AND the observed alternations must cover
+    vib_min_quality: float = 0.3  # below this, report continuous 0 Hz / 0 cents
+    # Unvoiced dropouts up to this long are bridged so a few lost frames don't
+    # cut the vibrato curve; longer gaps and any transition frame end the
+    # analysis segment. Keep below min_gap_length, the note-splitting gap.
+    vib_max_gap_sec: float = 0.06
+
+    # --- TIMBRE (semitone-spaced pseudo-CQT heatmap) ---
+    cqt_midi_min: int = 36        # C2
+    cqt_midi_max: int = 108       # C8 (inclusive)
+    cqt_stride: int = 4           # pitch frames per spectrum column; <=0 disables
+
     # --- note-name helper ---
     @staticmethod
     def get_note_name(midi_num: float | None, prefer_flats: bool = False) -> str:

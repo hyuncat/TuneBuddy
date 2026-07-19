@@ -193,8 +193,26 @@ class NoteData:
 
         return note
 
-    def read(self, start_time: float=None, end_time: float=None, 
-             i=None, j=None, clean:bool=False) -> list[Note]:        
+    def note_containing(self, t: float, clean: bool=True) -> Note | None:
+        """The note actually sounding at time t (strict start<=t<=end), or
+        None. Unlike read_current_note — which returns the preceding note
+        during rests — gaps between notes read as no note, which is what the
+        note-detail panel's blank rule needs. clean=True also treats rests
+        (midi_num[0] == -1) as no note."""
+        if not self.times:
+            return None
+        i = bisect_right(self.times, t) - 1  # last note starting at or before t
+        if i < 0:
+            return None
+        note = self.data[self.times[i]]
+        if not (note.start_time <= t <= note.end_time):
+            return None
+        if clean and (not note.midi_num or note.midi_num[0] == -1):
+            return None
+        return note
+
+    def read(self, start_time: float=None, end_time: float=None,
+             i=None, j=None, clean:bool=False) -> list[Note]:
         """return all notes found within the start_time - end_time boundaries"""
         if not self.times or (start_time is None and end_time is None and i is None and j is None):
             return []

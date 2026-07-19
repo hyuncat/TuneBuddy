@@ -99,7 +99,7 @@ class GuitarHero(QWidget):
 
     # --- INIT STUFF ---
     def init_background(self):
-        self.plot.setBackground((20,20,25))
+        self.plot.setBackground(Colors.PLOT_BG_RGB)
         # our colorful custom MIDI background — also owns the gridlines + the
         # clip dim bands (it adds itself + its items to the plot)
         self.bg = MidiBackground(self.plot)

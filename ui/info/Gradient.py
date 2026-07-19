@@ -89,3 +89,39 @@ class PitchGradient(Gradient):
 
     def ends(self) -> tuple[QWidget, QWidget]:
         return QLabel("correct"), QLabel("way off")
+
+
+class VibratoGradient(Gradient):
+    """Viridis legend for the metric coloring VibratoWidget's dots."""
+
+    HELP = ("Dot color shows the other vibrato measurement: slow to fast when "
+            "the graph displays width, or narrow to wide when it displays speed.")
+
+    def __init__(self, low: str, high: str, parent=None):
+        super().__init__(parent=parent)
+        self.low = low
+        self.high = high
+
+    def anchors(self) -> list:
+        return Colors.viridis_anchors()
+
+    def ends(self) -> tuple[QWidget, QWidget]:
+        return QLabel(self.low), QLabel(self.high)
+
+
+class TimbreGradient(Gradient):
+    """Magma spectrum-level legend with the widget's current dBFS bounds."""
+
+    HELP = ("Color shows energy at each pitch-frequency bin: black/purple is "
+            "quiet and orange/yellow is strong spectral energy.")
+
+    def __init__(self, low_db: float, high_db: float, parent=None):
+        super().__init__(parent=parent)
+        self.low_db = low_db
+        self.high_db = high_db
+
+    def anchors(self) -> list:
+        return Colors.magma_anchors()
+
+    def ends(self) -> tuple[QWidget, QWidget]:
+        return QLabel(f"{self.low_db:.0f} dBFS"), QLabel(f"{self.high_db:.0f} dBFS")
