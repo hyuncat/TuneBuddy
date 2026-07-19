@@ -10,7 +10,7 @@ from ui.note.NoteCurveWidget import NoteCurveWidget
 
 
 class VibratoWidget(NoteCurveWidget):
-    """Instantaneous vibrato speed/width over the note under the cursor.
+    """Vibrato speed/width over the note under the cursor.
 
     The selected metric is the y value; pooled viridis brushes encode the
     other metric. All signal analysis lives in VibratoDetector, so repainting
@@ -25,9 +25,11 @@ class VibratoWidget(NoteCurveWidget):
     Y_PADDING = 0.15
     HELP = ("Vibrato over the note under the cursor. Speed is the oscillation "
             "rate in Hz; Width is the pitch excursion on either side of the "
-            "note center (± cents). An estimate is attempted at every pitch "
-            "frame once at least two cycles fit in the analysis window. The "
-            "grey line is the pitch contour.")
+            "note center (± cents). Each credible estimate is shown across "
+            "the pitch span used to infer it, so full wave periods share their "
+            "detected characteristics. Dot colors use the minimum and maximum "
+            "across the whole recording for direct note-to-note comparison. "
+            "The grey line is the pitch contour.")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -108,10 +110,15 @@ class VibratoWidget(NoteCurveWidget):
             self._render_blank()
             return
         visible_colors = colors[mask]
-        color_min = float(np.min(visible_colors))
-        color_max = float(np.max(visible_colors))
-        if color_max > color_min:
-            fractions = (visible_colors - color_min) / (color_max - color_min)
+        color_metric = "rate" if width_mode else "extent"
+        color_range = data.global_characteristic_range(color_metric)
+        if color_range is not None and color_range[1] > color_range[0]:
+            color_min, color_max = color_range
+            fractions = np.clip(
+                (visible_colors - color_min) / (color_max - color_min),
+                0.0,
+                1.0,
+            )
         else:
             fractions = np.full(len(visible_colors), 0.5)
         indices = np.rint(fractions * (len(self.brushes) - 1)).astype(int)

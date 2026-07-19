@@ -7,13 +7,19 @@ from algorithms.Config import Config
 
 
 class VibratoData:
-    """Time-indexed instantaneous vibrato track: rate (Hz), extent (± cents)
+    """Time-indexed vibrato-characteristic track: rate (Hz), extent (± cents)
     and fit quality per point of a uniform pitch-frame grid
     (index i <-> pitch frame i*stride <-> that frame's center time). A computed
     0 Hz / 0 cents sample means no measurable oscillation (including unvoiced
     pitch); NaN is reserved for unwritten/not-yet-computed time. Filled by
     VibratoDetector; never persisted — it derives purely from the pitch
     track, so a cache load just recomputes it.
+
+    Offline note-aware values are source-mapped: every credible centered fit
+    contributes its characteristics to the local note span it describes, and
+    overlapping estimates are combined. Thus edge frames can carry the
+    vibrato characteristics that were inferred using their neighboring
+    periods instead of falsely appearing as isolated zero-vibrato points.
 
     The note association is arithmetic on the uniform grid
     (note_index_range), not a stored map, so it cannot go stale when
@@ -100,6 +106,34 @@ class VibratoData:
         extents = self._median3(extents)[i0 - j0:i1 - j0]
         times = self.index_time(np.arange(i0, i1, dtype=float))
         return times, rates, extents
+
+    def global_characteristic_range(
+            self, metric: str,
+    ) -> tuple[float, float] | None:
+        """Recording-wide min/max for a displayed vibrato characteristic.
+
+        Uses the same median-smoothed values as :meth:`curve` and only samples
+        with a positive detected rate. The stored 0 Hz / 0 cents sentinel means
+        "no measurable vibrato", so including it would make every recording's
+        slow/narrow endpoint zero rather than the least/most subtle vibrato the
+        performer actually produced.
+        """
+        if metric not in {"rate", "extent"}:
+            raise ValueError(f"Unknown vibrato metric: {metric}")
+        with self.lock:
+            rates = self.rates[:self.computed_until].astype(float, copy=True)
+            extents = self.extents[:self.computed_until].astype(float, copy=True)
+        rates = self._median3(rates)
+        extents = self._median3(extents)
+        values = rates if metric == "rate" else extents
+        detected = (
+            np.isfinite(rates)
+            & np.isfinite(extents)
+            & (rates > 0.0)
+        )
+        if not detected.any():
+            return None
+        return float(np.min(values[detected])), float(np.max(values[detected]))
 
     def at(self, t: float) -> tuple[float, float] | tuple[None, None]:
         """(rate, extent) at the grid point nearest app-time t (may be NaN)."""

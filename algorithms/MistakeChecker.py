@@ -1,4 +1,5 @@
 import numpy as np
+from itertools import combinations
 
 from algorithms.Config import Config
 from app_logic.user.ds.Recording import Recording
@@ -15,7 +16,11 @@ class MistakeChecker:
 
     # shortest-note factor for the split viability check (used to sit on Config as
     # mistake_checker_min_note_factor; it's checker-internal, so it's a constant).
-    MIN_NOTE_FACTOR = 0.3
+    MIN_NOTE_FACTOR = 0.25
+    # A score-guided split must still expose a real change in the observed
+    # pitch. This is intentionally below NoteDetector.pitch_thresh because the
+    # two target-supporting medians can sit near opposite tolerance edges.
+    MIN_SPLIT_PITCH_CHANGE = 0.5
 
     def __init__(self, recording: Recording = None, config: Config = None, verbose: bool = False):
         self.recording = recording
@@ -66,8 +71,49 @@ class MistakeChecker:
         )
         edits = []  # each edit is (notes_to_remove, notes_to_add)
         edited_note_times = set()
+        handled_deletion_ids = set()
+
+        # Consecutive deletions can be several real notes swallowed by one long
+        # detected host. Solve their boundaries jointly; repairing only the
+        # first deletion greedily tends to consume the onset needed by the next.
+        deletions = sorted(
+            (m for m in mistakes if m.type == "deletion"),
+            key=lambda m: m.pair_index,
+        )
+        groups = []
+        for deletion in deletions:
+            if (
+                groups
+                and deletion.pair_index == groups[-1][-1].pair_index + 1
+            ):
+                groups[-1].append(deletion)
+            else:
+                groups.append([deletion])
+        for group in groups:
+            if len(group) < 2:
+                continue
+            edit = self.handle_deletion_group(group)
+            if edit is None:
+                continue
+            removed, added = edit
+            removed_times = {n.start_time for n in removed}
+            if removed_times & edited_note_times:
+                continue
+            edits.append(edit)
+            edited_note_times.update(removed_times)
+            handled_deletion_ids.update(id(m) for m in group)
+            if self.verbose:
+                print(
+                    "  [check_mistakes] joint deletion edit for "
+                    f"pairs {[m.pair_index for m in group]}: "
+                    f"remove {[round(n.start_time, 2) for n in removed]} -> "
+                    f"add {[round(n.start_time, 2) for n in added]}"
+                )
+
         for mistake in mistakes:
             edit = None
+            if id(mistake) in handled_deletion_ids:
+                continue
             if mistake.type == "deletion":
                 edit = self.handle_deletion(mistake)
             elif mistake.type == "insertion":
@@ -120,6 +166,7 @@ class MistakeChecker:
             return
         try:
             n_mistakes = len(rec.alignment.pitch_mistakes)
+            notes_changed = False
             if self.verbose:
                 print(f"initial mistakes: {n_mistakes}")
             while True:
@@ -139,9 +186,15 @@ class MistakeChecker:
                     if self.verbose:
                         print("no improvement after correction, breaking loop")
                     break
+                notes_changed = True
                 n_mistakes = new_n_mistakes  # made progress -> raise the baseline
         finally:
             self.verbose = old_verbose
+        if notes_changed:
+            # Split/merge correction changes the only legal analysis span and
+            # median baseline for vibrato. Rebuild from the final note set so
+            # the feature cannot remain stale against pre-correction boundaries.
+            rec.recompute_vibrato(note_aware=True)
 
     # --- mistake handlers ---------------------------------------------------
     def handle_deletion(self, mistake: Mistake):
@@ -161,7 +214,10 @@ class MistakeChecker:
         split = self._split_note(host, pitches, *targets)
         if split is None:
             if self.verbose:
-                print(f"      [split-fail] host@{host.start_time:.2f}: too few frames ({len(pitches)})")
+                print(
+                    f"      [split-fail] host@{host.start_time:.2f}: "
+                    f"no corroborated boundary ({len(pitches)} frames)"
+                )
             return None
         self._remedian_notes(split, targets)
         ok = self._split_resembles_score(split, targets)
@@ -170,6 +226,47 @@ class MistakeChecker:
                   f"halves=[{split[0].midi_num[0]:.1f}, {split[1].midi_num[0]:.1f}] "
                   f"targets=({targets[0]:.1f}, {targets[1]:.1f}) resembles={ok} (tol={self.config.pitch_tolerance})")
         if not ok:
+            return None
+        return [host], split
+
+    def handle_deletion_group(self, mistakes: list[Mistake]):
+        """Split one host across a consecutive run of deleted score notes."""
+        if len(mistakes) < 2:
+            return None
+        intended = [mistake.midi_note for mistake in mistakes]
+        prev_note = mistakes[0].user_note
+        next_id = (prev_note.id + 1) if prev_note else 0
+        next_note = self.nd.read_note(i=next_id)
+
+        candidates = []
+        for host, at_start in ((prev_note, False), (next_note, True)):
+            if host is None:
+                continue
+            support = sum(self._count_close(host, target) for target in intended)
+            if all(
+                self._count_close(host, target) >= self._min_close_frames()
+                for target in intended
+            ):
+                candidates.append((support, host, at_start))
+        if not candidates:
+            return None
+        _, host, at_start = max(candidates, key=lambda item: item[0])
+        intended_pitches = [note.midi_num[0] for note in intended]
+        targets = (
+            [*intended_pitches, self._score_pitch(host)]
+            if at_start
+            else [self._score_pitch(host), *intended_pitches]
+        )
+        pitches = self.pd.read(
+            start_time=host.start_time,
+            end_time=host.end_time,
+            clean=True,
+        )
+        split = self._split_note_multiple(host, pitches, targets)
+        if split is None:
+            return None
+        self._remedian_notes(split, targets)
+        if not self._split_resembles_score(split, targets):
             return None
         return [host], split
 
@@ -307,19 +404,154 @@ class MistakeChecker:
                    for note, target in zip(split, targets))
 
     def _split_note(self, note: Note, pitches: list, target_first: float, target_second: float):
-        """Split one user note into two at the optimal pitch boundary between the
-        two targets (single-breakpoint, minimizing summed pitch distance).
-        Returns [first, second] or None if there aren't enough voiced frames."""
-        if len(pitches) < 2:  # need >= 2 frames to place a boundary between them
+        """Split a deleted score note back out of its detected host.
+
+        Prefer a spectral onset inside the host and use that exact time. If no
+        viable onset exists, fall back to the score-guided pitch breakpoint only
+        when its two sides have a real median-pitch discontinuity. A smooth or
+        same-pitch host with neither cue is deliberately left unsplit.
+        """
+        min_frames = self._min_close_frames()
+        if len(pitches) < 2 * min_frames:
             return None
 
         midis = np.array([p.value for p in pitches])
-        # cost[k] = sum|midi - target_first| over frames < k  +  sum|midi - target_second| over frames >= k
+        times = np.array([p.time for p in pitches])
+
+        # When several spectral onsets lie inside the host, choose the viable
+        # onset whose ordered halves best resemble the two score targets.
+        onset_data = getattr(self.recording, "onset_data", None)
+        onset_candidates = []
+        if onset_data is not None:
+            for onset_time in onset_data.read(
+                start_time=note.start_time,
+                end_time=note.end_time,
+            ):
+                onset_time = float(onset_time)
+                if not note.start_time < onset_time < note.end_time:
+                    continue
+                k = int(np.searchsorted(times, onset_time, side="left"))
+                if min_frames <= k <= len(pitches) - min_frames:
+                    onset_candidates.append((
+                        self._split_cost(midis, k, target_first, target_second),
+                        onset_time,
+                        k,
+                    ))
+
+        if onset_candidates:
+            for _, split_time, k in sorted(
+                onset_candidates,
+                key=lambda candidate: candidate[0],
+            ):
+                if self._has_pitch_change(midis, k):
+                    return self._notes_at_split(note, midis, k, split_time)
+
+        # No onset: find the score-target-optimal pitch boundary, then require a
+        # real change in the observed median pitch. This avoids the former flat-
+        # cost k=1 split on repeated/same-pitch material.
         left_cost = np.concatenate([[0.0], np.cumsum(np.abs(midis - target_first))])
         right_cost = np.concatenate([np.cumsum(np.abs(midis - target_second)[::-1])[::-1], [0.0]])
         cost = left_cost + right_cost
-        k = int(np.argmin(cost[1:-1]) + 1)  # exclude k=0 / k=N so both notes stay non-empty
-        split_time = pitches[k].time
+        valid_cost = cost[min_frames:len(pitches) - min_frames + 1]
+        if valid_cost.size == 0:
+            return None
+        k = int(np.argmin(valid_cost) + min_frames)
+        left_median = float(np.median(midis[:k]))
+        right_median = float(np.median(midis[k:]))
+        if abs(left_median - right_median) < max(
+            self.MIN_SPLIT_PITCH_CHANGE,
+            self.config.pitch_thresh,
+        ):
+            return None
+
+        split_time = 0.5 * (pitches[k - 1].time + pitches[k].time)
+        return self._notes_at_split(note, midis, k, split_time)
+
+    def _has_pitch_change(self, midis: np.ndarray, k: int) -> bool:
+        """Reject onset candidates whose two spans are the same flat note."""
+        if not 0 < k < len(midis):
+            return False
+        return abs(
+            float(np.median(midis[:k]))
+            - float(np.median(midis[k:]))
+        ) >= self.MIN_SPLIT_PITCH_CHANGE
+
+    def _split_note_multiple(self, note: Note, pitches: list,
+                             targets: list[float]) -> list[Note] | None:
+        """Jointly place len(targets)-1 score-guided spectral boundaries."""
+        n_boundaries = len(targets) - 1
+        min_frames = self._min_close_frames()
+        if n_boundaries < 1 or len(pitches) < len(targets) * min_frames:
+            return None
+        midis = np.asarray([p.value for p in pitches], dtype=float)
+        times = np.asarray([p.time for p in pitches], dtype=float)
+        onset_data = getattr(self.recording, "onset_data", None)
+        if onset_data is None:
+            return None
+        candidate_indices = []
+        for onset_time in onset_data.read(
+            start_time=note.start_time,
+            end_time=note.end_time,
+        ):
+            k = int(np.searchsorted(times, float(onset_time), side="left"))
+            if min_frames <= k <= len(pitches) - min_frames:
+                candidate_indices.append((k, float(onset_time)))
+
+        best = None
+        for chosen in combinations(candidate_indices, n_boundaries):
+            indices = [0, *(item[0] for item in chosen), len(pitches)]
+            if any(b - a < min_frames for a, b in zip(indices, indices[1:])):
+                continue
+            medians = [
+                float(np.median(midis[a:b]))
+                for a, b in zip(indices, indices[1:])
+            ]
+            if any(
+                abs(a - b) < self.MIN_SPLIT_PITCH_CHANGE
+                for a, b in zip(medians, medians[1:])
+            ):
+                continue
+            cost = sum(
+                float(np.abs(midis[a:b] - target).sum())
+                for a, b, target in zip(indices, indices[1:], targets)
+            )
+            if best is None or cost < best[0]:
+                best = (cost, chosen, indices)
+        if best is None:
+            return None
+
+        _, chosen, indices = best
+        boundaries = [note.start_time, *(item[1] for item in chosen), note.end_time]
+        split = []
+        for start, end, a, b in zip(
+            boundaries,
+            boundaries[1:],
+            indices,
+            indices[1:],
+        ):
+            split.append(Note(
+                i=-1,
+                start_time=float(start),
+                end_time=float(end),
+                midi_num=[float(np.median(midis[a:b]))],
+                velocity=note.velocity,
+                instrument=note.instrument,
+            ))
+        return split
+
+    @staticmethod
+    def _split_cost(midis: np.ndarray, k: int,
+                    target_first: float, target_second: float) -> float:
+        """Ordered score-target cost for one candidate split index."""
+        return float(
+            np.abs(midis[:k] - target_first).sum()
+            + np.abs(midis[k:] - target_second).sum()
+        )
+
+    @staticmethod
+    def _notes_at_split(note: Note, midis: np.ndarray, k: int,
+                        split_time: float) -> list[Note]:
+        """Build two replacement notes around a validated split boundary."""
 
         first = Note(
             i=-1, 

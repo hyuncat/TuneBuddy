@@ -1,5 +1,6 @@
 import numpy as np
-from math import ceil
+from bisect import bisect_right
+from math import ceil, floor
 
 from algorithms.Config import Config
 from app_logic.user.ds.VibratoData import VibratoData
@@ -9,12 +10,14 @@ class VibratoDetector:
     """Instantaneous vibrato estimation: windowed LS-Prony over the pitch
     track.
 
-    Each grid point gets a centered `vib_win_sec` window of pitch frames, cut
-    down to the contiguous voiced SEGMENT around its center: unvoiced dropouts
-    up to `vib_max_gap_sec` are bridged by interpolation, while transition
-    frames and longer gaps end the segment — a fit must never mix two notes,
-    which is what faked large slow "vibrato" at every note boundary. The
-    segment is DC/linear detrended (plus a Heaviside per bridged dropout, so
+    Each grid point gets a centered `vib_win_sec` window of pitch frames. In
+    the offline, note-aware pass that window is hard-clipped to the detected
+    note containing its center; within that note, unvoiced dropouts up to
+    `vib_max_gap_sec` are bridged by interpolation, while longer gaps end the
+    segment. A fit must never mix two notes: two otherwise-flat note changes
+    can look exactly like a few cycles of slow vibrato in a centered window.
+    The segment is centered on the full note's voiced median and linearly
+    detrended (plus a Heaviside per bridged dropout, so
     an unmarked note change reads as a step, not oscillation), then an
     order-`vib_order` least-squares
     linear prediction (covariance-method Prony) whose least-damped oscillatory
@@ -25,9 +28,9 @@ class VibratoDetector:
     (of both the fitted rate and the OBSERVED sign alternations — a ramp,
     step, or bump fits a sinusoid but cannot alternate), enough voiced pitch,
     or a coherent fit are explicitly stored as 0 Hz / 0 cents rather than
-    disappearing as gaps. Transition marks come from note detection, so the
-    pre-analysis pass cuts only on gaps; Recording.detect_notes re-runs
-    detect() once the marks exist.
+    disappearing as gaps. Before notes exist (including live recording), the
+    detector falls back to gap/transition segmentation; Recording.detect_notes
+    replaces that provisional track with a note-aware pass.
 
     Why Prony instead of an FFT peak: at 0.4 s the DFT's resolution (2.5 Hz
     Rayleigh, ~10 Hz Hann mainlobe) is on the order of the 4-8 Hz being
@@ -37,7 +40,15 @@ class VibratoDetector:
     & Chew 2017, J. Math & Music: the Filter Diagonalisation Method). Prony's
     classic noise sensitivity is tamed by the smoothed input track and the LS
     formulation; low-quality results become continuous zero samples rather
-    than missing timepoints."""
+    than missing timepoints.
+
+    A successful note-aware fit describes the whole pitch span used to make
+    it, not only the center frame where the sliding-window calculation was
+    requested. After the raw fits are complete, each one is therefore mapped
+    back across that source span and overlapping fits are quality-weighted.
+    This makes the stored curve a many-frames-to-one-characteristic mapping:
+    note edges inherit the estimate that depended on them, while hard gaps and
+    note boundaries still stop propagation."""
 
     VIB_MIN_VOICED_FRAC = 0.5
     # The pitch frame rate (~344 fps at h1=128) puts a 4-8 Hz vibrato pole at
@@ -72,16 +83,21 @@ class VibratoDetector:
         self.config = config
 
     # --- whole-track / incremental passes ---
-    def detect(self, pitch_data) -> VibratoData:
+    def detect(self, pitch_data, note_data=None) -> VibratoData:
         """Full pass over every pitch-frame center, including clipped edge
-        windows when they still contain `vib_min_cycles` estimated cycles."""
+        windows when they still contain `vib_min_cycles` estimated cycles.
+
+        When ``note_data`` is available, every analysis window and its robust
+        pitch center come exclusively from the detected note containing that
+        grid point. This is deliberately independent of transition flags.
+        """
         vd = VibratoData(config=self.config)
         vd.t_origin = pitch_data.t_origin
-        self.extend(vd, pitch_data, finalize=True)
+        self.extend(vd, pitch_data, finalize=True, note_data=note_data)
         return vd
 
     def extend(self, vibrato_data: VibratoData, pitch_data,
-               finalize: bool = False) -> None:
+               finalize: bool = False, note_data=None) -> None:
         """Compute every not-yet-computed grid point whose full centered
         window of pitch frames exists. Incremental: cheap to call per written
         frame from the live pitch thread (values land half a window behind
@@ -112,6 +128,18 @@ class VibratoDetector:
              if pitch_data.data[j] is not None),
             first_written,
         )
+        note_aware = note_data is not None and bool(
+            getattr(note_data, "times", None)
+        )
+        note_starts, note_regions = self._note_regions(
+            pitch_data,
+            note_data,
+            available,
+        )
+        # Successful finalized note-aware fits are mapped back over the local
+        # note segment they describe. Keeping this off the live path preserves
+        # its causal half-window delay.
+        coverage = [] if note_aware and finalize else None
         first_grid = ceil(first_written / stride)
         if i < first_grid:
             if first_grid:
@@ -129,8 +157,31 @@ class VibratoDetector:
             center = i * stride
             lo = max(first_written, center - half)
             hi = min(last_written + 1, center + half + 1)
-            vals = self._segment_values(pitch_data, lo, hi, center)
-            sample = (self.vibrato_sample(vals, frame_rate)
+            baseline = None
+            if note_aware:
+                center_time = (
+                    pitch_data.t_origin
+                    + (center * cfg.h1 + 0.5 * cfg.w1) / cfg.sr
+                )
+                region_i = bisect_right(note_starts, center_time) - 1
+                region = (
+                    note_regions[region_i]
+                    if 0 <= region_i < len(note_regions)
+                    else None
+                )
+                if region is None or center_time > region[1]:
+                    lo = hi  # the center is in a rest, not an analyzed note
+                else:
+                    _, _, note_lo, note_hi, baseline = region
+                    lo = max(lo, note_lo)
+                    hi = min(hi, note_hi)
+            segment = (
+                self._segment_values_with_bounds(pitch_data, lo, hi, center)
+                if lo < hi
+                else None
+            )
+            vals = segment[0] if segment is not None else None
+            sample = (self.vibrato_sample(vals, frame_rate, baseline=baseline)
                       if vals is not None else None)
             if sample is None:
                 # Computed-but-no-oscillation is real information, distinct
@@ -140,14 +191,79 @@ class VibratoDetector:
                 vibrato_data.write(i, 0.0, 0.0, 0.0)
             else:
                 vibrato_data.write(i, *sample)
+                if coverage is not None:
+                    _, source_lo, source_hi = segment
+                    coverage.append((source_lo, source_hi, *sample))
             i += 1
+
+        if coverage:
+            self._map_fits_to_source_spans(
+                vibrato_data,
+                coverage,
+                first_grid=first_grid,
+                last_grid=last_grid,
+            )
+
+    def _note_regions(self, pitch_data, note_data, available: int):
+        """Sorted note windows as frame-center bounds plus a robust baseline.
+
+        Recompute the median from the pitch frames inside the *current* note
+        boundaries instead of trusting an older note summary. MistakeChecker
+        can split/merge notes after the first detection pass, and this keeps
+        vibrato centered on those final replacement spans.
+        """
+        if note_data is None or not getattr(note_data, "times", None):
+            return [], []
+
+        cfg = self.config
+        starts = []
+        regions = []
+        notes = note_data.read(i=0, j=len(note_data.times), clean=True)
+        for note in notes:
+            pos0 = (
+                ((note.start_time - pitch_data.t_origin) * cfg.sr - 0.5 * cfg.w1)
+                / cfg.h1
+            )
+            pos1 = (
+                ((note.end_time - pitch_data.t_origin) * cfg.sr - 0.5 * cfg.w1)
+                / cfg.h1
+            )
+            note_lo = max(0, int(ceil(pos0)))
+            note_hi = min(available, int(floor(pos1)) + 1)
+            if note_lo >= note_hi:
+                continue
+            voiced = [
+                p.value
+                for p in pitch_data.data[note_lo:note_hi]
+                if pitch_data.is_voiced_pitch(p, include_transitions=False)
+            ]
+            if not voiced:
+                continue
+            starts.append(float(note.start_time))
+            regions.append((
+                float(note.start_time),
+                float(note.end_time),
+                note_lo,
+                note_hi,
+                float(np.median(voiced)),
+            ))
+        return starts, regions
 
     def _segment_values(self, pitch_data, lo: int, hi: int,
                         center: int) -> np.ndarray | None:
+        """Compatibility wrapper returning only the source values."""
+        segment = self._segment_values_with_bounds(pitch_data, lo, hi, center)
+        return segment[0] if segment is not None else None
+
+    def _segment_values_with_bounds(
+            self, pitch_data, lo: int, hi: int, center: int,
+    ) -> tuple[np.ndarray, int, int] | None:
         """Midi values for the contiguous analysis segment around frame
         `center` within [lo, hi): voiced frames with interior dropout gaps
         (<= vib_max_gap_sec, NaN for the fit to bridge). Transition frames and
-        longer gaps end the segment. None when no voiced frame is reachable
+        longer gaps end the segment. Returns the values plus the absolute
+        half-open bounds of the local note span they describe, including a
+        tolerated unvoiced edge gap. None means no voiced frame is reachable
         from the center — that instant genuinely has no oscillation to
         measure."""
         cfg = self.config
@@ -194,30 +310,122 @@ class VibratoDetector:
 
         start = expand(min(anchors), -1)
         end = expand(max(anchors), 1)
-        return vals[start:end + 1]
+
+        def include_edge_gap(edge: int, step: int) -> int:
+            """Include the short unvoiced tail associated with this segment.
+
+            Those frames do not enter the numerical fit, but in the note-aware
+            result they belong to the same wave characteristic. A hard
+            transition or a gap beyond the configured bridge length still
+            stops the mapping.
+            """
+            last, j, gap = edge, edge + step, 0
+            while (0 <= j < n and gap < max_gap and not hard[j]
+                   and not voiced[j]):
+                last = j
+                gap += 1
+                j += step
+            return last
+
+        mapped_start = include_edge_gap(start, -1)
+        mapped_end = include_edge_gap(end, 1)
+        return vals[start:end + 1], lo + mapped_start, lo + mapped_end + 1
+
+    @staticmethod
+    def _map_fits_to_source_spans(
+            vibrato_data: VibratoData,
+            coverage: list[tuple[int, int, float, float, float]],
+            first_grid: int,
+            last_grid: int,
+    ) -> None:
+        """Map successful window fits back to their note-bounded grid spans.
+
+        Difference arrays make the many-window overlap linear in the number of
+        fits plus output points instead of repeatedly visiting every frame in
+        every window. Fit quality is the evidence weight. Points that no
+        credible fit depended on retain their raw zero (no oscillation).
+        """
+        if last_grid < first_grid:
+            return
+        stride = vibrato_data.stride
+        n = last_grid - first_grid + 1
+        rate_diff = np.zeros(n + 1, dtype=np.float64)
+        extent_diff = np.zeros(n + 1, dtype=np.float64)
+        quality_diff = np.zeros(n + 1, dtype=np.float64)
+        weight_diff = np.zeros(n + 1, dtype=np.float64)
+
+        for source_lo, source_hi, rate, extent, quality in coverage:
+            # Grid center i represents pitch frame i*stride. Include the grid
+            # points belonging to this fit's note-bounded local span.
+            i0 = max(first_grid, int(ceil(source_lo / stride)))
+            i1 = min(last_grid + 1, int(ceil(source_hi / stride)))
+            if i0 >= i1:
+                continue
+            j0, j1 = i0 - first_grid, i1 - first_grid
+            weight = max(float(quality), np.finfo(np.float64).eps)
+            for diff, value in (
+                    (rate_diff, float(rate) * weight),
+                    (extent_diff, float(extent) * weight),
+                    (quality_diff, float(quality) * weight),
+                    (weight_diff, weight),
+            ):
+                diff[j0] += value
+                diff[j1] -= value
+
+        weights = np.cumsum(weight_diff[:-1])
+        covered = weights > 0.0
+        if not covered.any():
+            return
+        rates = np.cumsum(rate_diff[:-1])
+        extents = np.cumsum(extent_diff[:-1])
+        qualities = np.cumsum(quality_diff[:-1])
+        for offset in np.flatnonzero(covered):
+            weight = weights[offset]
+            vibrato_data.write(
+                first_grid + int(offset),
+                rates[offset] / weight,
+                extents[offset] / weight,
+                qualities[offset] / weight,
+            )
 
     # --- the windowed estimator ---
-    def vibrato_sample(self, vals: np.ndarray, frame_rate: float):
+    def vibrato_sample(self, vals: np.ndarray, frame_rate: float,
+                       baseline: float | None = None):
         """One analysis segment -> (rate_hz, extent_cents, quality), or None
         when no credible vibrato. `vals` = midi pitches whose NaN runs are
-        short dropouts (segment endpoints are always voiced)."""
+        short dropouts (segment endpoints are always voiced). ``baseline`` is
+        the full detected note's voiced median in the note-aware pass."""
         n = len(vals)
         voiced = np.isfinite(vals)
         if n < 8 or voiced.mean() < self.VIB_MIN_VOICED_FRAC:
             return None
         idx = np.arange(n, dtype=np.float64)
-        # nuisance design: DC + slope + one Heaviside per bridged dropout
-        # (see STEP_MIN_GAP_SEC), fit on real samples only
+        if baseline is None or not np.isfinite(baseline):
+            baseline = float(np.median(vals[voiced]))
+        centered = vals - baseline
+        # The note median is the DC center. Nuisance columns therefore contain
+        # only a centered slope plus zero-mean Heavisides for bridged dropouts;
+        # this keeps a boundary window referenced to the underlying note rather
+        # than letting each clipped fragment invent a new local pitch center.
         vi = np.flatnonzero(voiced)
         min_gap = max(1, int(round(self.STEP_MIN_GAP_SEC * frame_rate)))
         gap_starts = vi[np.flatnonzero(np.diff(vi) > min_gap) + 1]
         if len(gap_starts) > 4:  # that torn, the segment is not a note
             return None
-        T = np.column_stack(
-            [np.ones(n), idx] + [(idx >= g).astype(float) for g in gap_starts])
-        beta, *_ = np.linalg.lstsq(T[voiced], vals[voiced], rcond=None)
+        slope = idx - float(np.median(idx[voiced]))
+        nuisance = [slope]
+        for gap_start in gap_starts:
+            step = (idx >= gap_start).astype(float)
+            step -= float(np.mean(step[voiced]))
+            nuisance.append(step)
+        T = np.column_stack(nuisance)
+        beta, *_ = np.linalg.lstsq(T[voiced], centered[voiced], rcond=None)
         # interpolate the RESIDUALS so bridged gaps carry no step energy
-        x = np.interp(idx, idx[voiced], vals[voiced] - T[voiced] @ beta)
+        x = np.interp(
+            idx,
+            idx[voiced],
+            centered[voiced] - T[voiced] @ beta,
+        )
         xv = x[voiced]
         var = float(np.dot(xv, xv))
         if var <= np.finfo(float).eps * n:

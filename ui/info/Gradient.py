@@ -95,7 +95,8 @@ class VibratoGradient(Gradient):
     """Viridis legend for the metric coloring VibratoWidget's dots."""
 
     HELP = ("Dot color shows the other vibrato measurement: slow to fast when "
-            "the graph displays width, or narrow to wide when it displays speed.")
+            "the graph displays width, or narrow to wide when it displays speed. "
+            "The scale uses the minimum and maximum across the whole recording.")
 
     def __init__(self, low: str, high: str, parent=None):
         super().__init__(parent=parent)

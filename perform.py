@@ -250,6 +250,8 @@ class PerformTab(QWidget):
         self.audio_player.load_audio(rec.audio_data)
         self.audio_recorder.load_recording(rec)
         self._refresh_mistake_widget(rec)
+        if rec.analysis_notice and self.status_bar is not None:
+            self.status_bar.update_status(rec.analysis_notice)
 
     def _wire_detector(self, rec: Recording):
         """Each recording owns its own pitch detector; connect each only once."""
@@ -514,16 +516,30 @@ class PerformTab(QWidget):
             return
         print("analyzing... ")
         rec.reset_analysis()  # clear stale notes/alignment/mistakes before recomputing
-        rec.detect_notes(use_transitions=True)
+        rec.detect_notes(use_transitions=False)
         # rec.recompute_note_pitches()
         # rec.prune_transition_notes()
 
+        # Give the initial alignment an onset-fitted score. Count-in/runway and
+        # the final note's release must never affect the fitted tempo.
+        rec.resize_score(to_span="onset")
         rec.detect_mistakes()
         rec.mistake_checker.mistake_correction_loop()
+
+        # Correction can split/merge the edge notes and thereby change the
+        # take's first/last onset. Refit from the FINAL corrected onsets before
+        # GuitarHero renders the score bars, then relink the alignment because
+        # change_tempo() rebuilt the score Note objects.
+        if not rec.resize_score_to_aligned_onsets():
+            rec.resize_score(to_span="onset")
+        rec.alignment.sync_score_notes(
+            rec.score_data.note_datas.get(rec.active_instrument)
+        )
         rec.reindex_mistakes()
         rec.update_alignment_distances() # color the user pitches by the final alignment
         rec.mistake_detector.detect_timing_mistakes()  # derive early/late/short/long from the final alignment
         rec.trim_end()
+        rec.analysis_notice = ""
 
         # reload every view with the fresh analysis (note/alignment may have been
         # overwritten by the correction loop)

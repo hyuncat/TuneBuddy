@@ -29,6 +29,11 @@ class JsonHandler:
     """
 
     CACHE_VERSION = 1
+    # v2: spectral onsets moved to score-guided deletion correction.
+    # v3: unvoiced pitch-run splitting follows min_gap_factor * min_note_length.
+    # v4: explicit adaptive spectral-flux candidates plus onset-corroborated
+    # marginal PELT boundaries.
+    NOTE_ANALYSIS_VERSION = 4
     CACHE_SUFFIX = ".json.xz"
     GZIP_CACHE_SUFFIX = ".json.gz"
     LEGACY_CACHE_SUFFIX = ".json"
@@ -208,6 +213,10 @@ class JsonHandler:
             },
             "score": self._score_to_payload(rec, score_path),
             "config": self._config_to_payload(rec.config),
+            "note_analysis": {
+                "version": self.NOTE_ANALYSIS_VERSION,
+                "segmentation_config": rec.config.note_segmentation_config(),
+            },
             "pitch_data": self._pitch_data_to_payload(rec),
             "timbre": self._timbre_to_payload(rec.timbre_data),
             "note_data": self._note_data_to_payload(rec.note_data),
@@ -231,8 +240,19 @@ class JsonHandler:
         else:
             recording.active_instrument = recording.score_data.active_instrument
 
-        recording.config = self._config_from_payload(payload.get("config") or {})
-        recording.update_config(recording.config)
+        # Per-take/user-facing settings still come from the sidecar, but note
+        # segmentation settings are code-owned defaults.  Otherwise changing
+        # pitch_thresh in Config appears to do nothing for every cached take.
+        runtime_config = recording.config
+        cached_config = self._config_from_payload(payload.get("config") or {})
+        changed_segmentation = []
+        for name in Config.NOTE_SEGMENTATION_FIELDS:
+            effective = getattr(runtime_config, name)
+            cached = getattr(cached_config, name)
+            if cached != effective:
+                changed_segmentation.append((name, cached, effective))
+                setattr(cached_config, name, effective)
+        recording.update_config(cached_config)
 
         recording.audio_data.t_origin = self._unpack_number(rec_payload.get("audio_t_origin"), default=0.0)
         end_index = rec_payload.get("audio_end_index")
@@ -242,13 +262,38 @@ class JsonHandler:
         recording.pitch_data = self._pitch_data_from_payload(recording, payload.get("pitch_data") or {})
         recording.timbre_data = self._timbre_from_payload(
             recording, payload.get("timbre") or {})
-        recording.note_data = self._note_data_from_payload(payload.get("note_data") or [])
-        recording.alignment = self._alignment_from_payload(recording, payload.get("alignment") or {})
-        recording.overridden_mistake_indices = {
-            int(i) for i in payload.get("overridden_mistake_indices", [])
-            if isinstance(i, int)
-        }
-        recording.alignment.reapply_overrides(recording.overridden_mistake_indices)
+        note_meta = payload.get("note_analysis") or {}
+        cached_analysis_version = int(
+            # Sidecars predating note-analysis metadata contain boundaries made
+            # by the old fixed 100 ms gap rule, so they must be rebuilt too.
+            note_meta.get("version", 0)
+        )
+        invalidate_notes = (
+            bool(changed_segmentation)
+            or cached_analysis_version != self.NOTE_ANALYSIS_VERSION
+        )
+        effective = recording.config.note_segmentation_config()
+        print(f"Effective note segmentation config: {effective}")
+        if invalidate_notes:
+            recording.reset_analysis()
+            details = ", ".join(
+                f"{name} {old:g} -> {new:g}"
+                for name, old, new in changed_segmentation
+            )
+            if cached_analysis_version != self.NOTE_ANALYSIS_VERSION:
+                details = (details + ", " if details else "") + "analysis version changed"
+            recording.analysis_notice = (
+                f"Cached note analysis is stale ({details}); click Analyze to recompute."
+            )
+            print(recording.analysis_notice)
+        else:
+            recording.note_data = self._note_data_from_payload(payload.get("note_data") or [])
+            recording.alignment = self._alignment_from_payload(recording, payload.get("alignment") or {})
+            recording.overridden_mistake_indices = {
+                int(i) for i in payload.get("overridden_mistake_indices", [])
+                if isinstance(i, int)
+            }
+            recording.alignment.reapply_overrides(recording.overridden_mistake_indices)
 
     def _recording(self, recording: Recording | None) -> Recording:
         rec = recording or self.recording

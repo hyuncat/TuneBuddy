@@ -28,6 +28,8 @@ class Recording:
         # inherit the score's current active instrument so new recordings
         # always target whichever channel was selected when they were created
         self.active_instrument = self.score_data.active_instrument
+        self._note_segmentation_signature = None
+        self.analysis_notice = ""
         self.update_config(config)
 
         # algorithms!!
@@ -77,6 +79,14 @@ class Recording:
         else:
             self.config = config
 
+        signature = self.config.note_segmentation_signature()
+        previous_signature = self._note_segmentation_signature
+        segmentation_changed = (
+            previous_signature is not None
+            and previous_signature != signature
+        )
+        self._note_segmentation_signature = signature
+
         if hasattr(self, 'pitch_detector'):
             self.pitch_detector.load_config(self.config)
         if hasattr(self, 'pitch_smoother'):
@@ -93,6 +103,17 @@ class Recording:
             self.mistake_checker.update_config(self.config)
         if hasattr(self, 'vibrato_detector'):
             self.vibrato_detector.update_config(self.config)
+        if segmentation_changed and hasattr(self, 'note_data'):
+            changed = [
+                name for (name, old), (_, new) in zip(previous_signature, signature)
+                if old != new
+            ]
+            self.reset_analysis()
+            self.analysis_notice = (
+                "Note analysis cleared after segmentation setting change: "
+                + ", ".join(changed)
+                + ". Click Analyze to recompute."
+            )
     # def on_pitches_detected(self, pitches):
     #     self.pitch_data.data = pitches
 
@@ -177,11 +198,11 @@ class Recording:
             score_filepath=score_filepath,
             recording_name=recording_name,
         )
-        # VibratoData deliberately is not persisted: it is derived solely from
-        # rebuilding it here guarantees it can never be stale against a cached
-        # pitch track.
+        # VibratoData deliberately is not persisted: it derives solely from the
+        # pitch track. Rebuilding it against cached notes guarantees it cannot
+        # be stale against their current boundaries.
         if loaded:
-            self.vibrato_data = self.vibrato_detector.detect(self.pitch_data)
+            self.recompute_vibrato(note_aware=True)
         return loaded
 
     def cleanup(self):
@@ -241,7 +262,7 @@ class Recording:
 
         stop_status = self._phase_status_timer(on_phase, "Detecting vibrato")
         try:
-            self.vibrato_data = self.vibrato_detector.detect(self.pitch_data)
+            self.recompute_vibrato(note_aware=False)
         finally:
             stop_status()
 
@@ -281,7 +302,13 @@ class Recording:
 
     def detect_notes(self, use_transitions=False):
         """Run PELT note detection on the current pitch data."""
-        self.transition_detector.detect_transitions(self.pitch_data.data)
+        if use_transitions:
+            self.transition_detector.detect_transitions(self.pitch_data.data)
+        else:
+            # Transition flags are derived analysis and are persisted with pitch
+            # frames. Do not let flags from an older cached run affect a pipeline
+            # that explicitly disabled transition-based segmentation.
+            self.transition_detector.clear_transitions(self.pitch_data.data)
         # resize to the stable pitch span so score-derived note-length heuristics
         # use a tempo close to the take before PELT runs.
         self.resize_score(to_span="pitch", include_transitions=False)
@@ -289,15 +316,23 @@ class Recording:
         self.onset_data = self.onset_detector.detect()
         if use_transitions:    
             self.transition_detector.detect_transitions(self.pitch_data.data)
-        nd = self.note_detector.detect_notes(self.pitch_data.data)
-        self.note_data = self.note_detector.refine_with_onsets(nd, self.onset_data.times)
-        # resize the score to the take's voiced NOTE span in case
-        # some voiced noise got through cracks
-        self.resize_score(to_span="onset")
-        # detect_transitions above (re)marked the pitch frames, and those marks
-        # are the vibrato segment boundaries — the pre-analysis vibrato pass ran
-        # before any existed, so only now can note changes cut the segments.
-        self.vibrato_data = self.vibrato_detector.detect(self.pitch_data)
+        # PELT is the only initial note-boundary generator. Spectral onsets are
+        # retained in onset_data for MistakeChecker, which may use one to repair
+        # a score-note deletion, but they never create speculative notes here.
+        self.note_data = self.note_detector.detect_notes(self.pitch_data.data)
+        # Replace the provisional whole-track/live vibrato pass. Detected note
+        # spans are hard boundaries even when transition-based note segmentation
+        # is disabled, so adjacent pitches cannot manufacture edge vibrato.
+        self.recompute_vibrato(note_aware=True)
+
+    def recompute_vibrato(self, note_aware: bool = True):
+        """Rebuild vibrato from pitch data, optionally bounded by current notes."""
+        note_data = self.note_data if note_aware and self.note_data.times else None
+        self.vibrato_data = self.vibrato_detector.detect(
+            self.pitch_data,
+            note_data=note_data,
+        )
+        return self.vibrato_data
 
 
     def recompute_note_pitches(self, verbose: bool = False):
@@ -506,6 +541,67 @@ class Recording:
         # cursor).
         sd.transpose(dx=take_anchor_time - score_bounds[0])
 
+        self._update_pitch_distances()
+        return True
+
+    def resize_score_to_aligned_onsets(self, respect_clip: bool = True) -> bool:
+        """Fit tempo from user onsets actually paired with score notes.
+
+        Unlike ``resize_score(to_span="onset")``, insertion fragments at either
+        edge cannot become the fit endpoints.  Prefer exact matches for the
+        first/last clipped score notes; when an endpoint was deleted, fall back
+        to the outermost two matched score notes and fit that shared sub-span.
+        """
+        if self.alignment is None or not self.alignment.pairs:
+            return False
+
+        score_notes = (
+            self.score_data.clipped_note_data(channel=self.active_instrument)
+            if respect_clip
+            else self.score_data.note_datas.get(self.active_instrument)
+        )
+        if score_notes is None or len(score_notes.times) < 2:
+            return False
+
+        allowed_ids = {
+            note.id for note in score_notes.read(i=0, j=len(score_notes.times))
+        }
+        matches = [
+            (user_note, score_note)
+            for user_note, score_note in self.alignment.pairs
+            if user_note is not None
+            and score_note is not None
+            and score_note.id in allowed_ids
+        ]
+        if len(matches) < 2:
+            return False
+
+        matches.sort(key=lambda pair: pair[1].start_time)
+        by_score_id = {score_note.id: (user_note, score_note)
+                       for user_note, score_note in matches}
+        first_score = score_notes.read_note(i=0)
+        last_score = score_notes.read_note(i=len(score_notes.times) - 1)
+        first_pair = by_score_id.get(first_score.id, matches[0])
+        last_pair = by_score_id.get(last_score.id, matches[-1])
+        first_user, first_matched_score = first_pair
+        last_user, last_matched_score = last_pair
+
+        user_span = last_user.start_time - first_user.start_time
+        score_span = last_matched_score.start_time - first_matched_score.start_time
+        if user_span <= 0 or score_span <= 0:
+            return False
+
+        sd = self.score_data
+        sd.change_tempo(max(1.0, sd.bpm * score_span / user_span))
+
+        # change_tempo rebuilds score Note objects. Resolve the anchor by its
+        # stable id, then land that score onset on the fixed user timeline.
+        current_notes = sd.note_datas.get(self.active_instrument)
+        current_by_id = current_notes.notes_by_id() if current_notes else {}
+        current_first = current_by_id.get(first_matched_score.id)
+        if current_first is None:
+            return False
+        sd.transpose(dx=first_user.start_time - current_first.start_time)
         self._update_pitch_distances()
         return True
 
