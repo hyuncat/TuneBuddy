@@ -13,9 +13,21 @@ PYIN_DEFAULT_MAX_VOLUME = 0.95
 @dataclass
 class Config:
     DEFAULT_MIN_NOTE_LENGTH: ClassVar[float] = 0.03
+    # These settings change note boundaries while reusing the cached pitch
+    # track.  They are code-owned (there is currently no per-take UI for them),
+    # so a changed default must invalidate cached notes/alignment instead of
+    # being silently replaced by an older sidecar value.
+    NOTE_SEGMENTATION_FIELDS: ClassVar[tuple[str, ...]] = (
+        "pitch_thresh",
+        "h2",
+        "min_gap_factor",
+        "onset_z_threshold",
+        "onset_min_spacing_sec",
+        "onset_adaptive_window_sec",
+    )
 
-    # note-name spellings indexed by pitch class (midi % 12). get_note_name()
-    # picks one; the transpose autocomplete offers both.
+    # note-name spellings indexed by pitch class (midi % 12)
+    # get_note_name() picks one; the transpose autocomplete offers both
     SHARP_NOTE_NAMES: ClassVar[list] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     FLAT_NOTE_NAMES: ClassVar[list] = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
@@ -35,16 +47,45 @@ class Config:
     max_volume: float = 0.95  # %th percentile (as a fraction) of frame RMS used as the loud reference
 
     # --- NOTE DETECTION PARAMETERS ---
-    pitch_thresh: float = 0.25  # in semitones, min diff b/w 2 notes to consider them distinct
+    pitch_thresh: float = 0.5  # in semitones, min diff b/w 2 notes to consider them distinct
     min_note_length: float = 0.03  # in sec
     h2: int = 1  # PELT jump parameter
-    min_gap_length: float = 0.1 # in sec
+    # A consecutive unvoiced run this fraction of the score-derived shortest
+    # note starts a new pitch run. 0.25 catches intentional ~20 ms sung breaks
+    # when the shortest score note is ~80 ms, while ignoring isolated dropouts.
+    min_gap_factor: float = 0.25
+    # Custom log-spectral-flux candidate picker. The threshold is in robust
+    # local MAD units; spacing suppresses closely repeated peaks; the adaptive
+    # window establishes the rolling median/MAD baseline.
+    onset_z_threshold: float = 4.0
+    onset_min_spacing_sec: float = 0.16
+    onset_adaptive_window_sec: float = 0.31
+    # Legacy sidecar/notebook compatibility; no longer used by NoteDetector.
+    min_gap_length: float = 0.1
 
     # --- STRING EDIT PARAMETERS ---
     ins_cost: float = 5
     del_cost: float = 5
     pitch_tolerance: float = 0.5   # semitones
     timing_tolerance: float = 0.25  # sec
+
+    # --- VIBRATO (instantaneous windowed LS-Prony — see algorithms/VibratoDetector) ---
+    vib_win_sec: float = 0.4      # sliding analysis window (McLeod ch. 9)
+    # Frame-dense is an invariant, not a persisted per-take option: old caches
+    # may contain the former value 4 and must not silently restore decimation.
+    vib_stride: ClassVar[int] = 1
+    vib_order: int = 2            # linear-prediction order (2 = one real sinusoid)
+    vib_min_cycles: float = 1.5   # cycles the fit AND the observed alternations must cover
+    vib_min_quality: float = 0.3  # below this, report continuous 0 Hz / 0 cents
+    # Unvoiced dropouts up to this long are bridged so a few lost frames don't
+    # cut the vibrato curve; longer gaps and any transition frame end the
+    # analysis segment. Keep below the effective note-splitting gap.
+    vib_max_gap_sec: float = 0.06
+
+    # --- TIMBRE (semitone-spaced pseudo-CQT heatmap) ---
+    cqt_midi_min: int = 36        # C2
+    cqt_midi_max: int = 108       # C8 (inclusive)
+    cqt_stride: int = 4           # pitch frames per spectrum column; <=0 disables
 
     # --- note-name helper ---
     @staticmethod
@@ -89,6 +130,20 @@ class Config:
             sec = self.DEFAULT_MIN_NOTE_LENGTH
         self.set_min_note_length(sec)
         return self.min_note_length
+
+    def note_segmentation_config(self) -> dict[str, float | int]:
+        """The code-owned settings that determine detected note boundaries."""
+        return {
+            name: getattr(self, name)
+            for name in self.NOTE_SEGMENTATION_FIELDS
+        }
+
+    def note_segmentation_signature(self) -> tuple:
+        """Stable comparison key used to invalidate stale note analysis."""
+        return tuple(
+            (name, getattr(self, name))
+            for name in self.NOTE_SEGMENTATION_FIELDS
+        )
 
     def min_note_seconds(self, factor: float = 1.0) -> float:
         return max(0.0, float(self.min_note_length) * float(factor))

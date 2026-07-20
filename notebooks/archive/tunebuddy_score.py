@@ -14,7 +14,7 @@ from ui.info.Toolbar import Toolbar
 from ui.GuitarHero import ScorePlot
 from ui.time.Slider import Slider
 from ui.time.WallClock import WallClock
-from ui.info.Settings import SettingsDialog
+from notebooks.archive.Settings import SettingsDialog
 from ui.time.Clipper import ClipperDialog
 from notebooks.archive.ScoreViewer import ScoreViewer
 from notebooks.archive.RecordingTree import RecordingTree

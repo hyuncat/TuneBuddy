@@ -133,6 +133,10 @@ class PitchData:
         DEFAULT_LENGTH = 60 # (sec)
         self.data: list[Pitch] = [None] * ceil(self.time_to_index(DEFAULT_LENGTH))
         self.lock = threading.Lock()
+        # high-water mark: one past the last frame write() has landed. The
+        # offline/cache paths assign `data` wholesale instead — see
+        # frames_available() for the fallback they rely on.
+        self.end_index = 0
 
         self.UNVOICED_THRESHOLD = config.unv_thresh # threshold above which a pitch is considered unvoiced
 
@@ -148,6 +152,7 @@ class PitchData:
             p.ensure_compatible(self.config) if p is not None else None
             for p in pitches
         ]
+        self.end_index = len(self.data)
 
     def write(self, pitches: list[Pitch] | Pitch, start_time: float=0):
         """write the pitches to the data at the given time index"""
@@ -169,6 +174,16 @@ class PitchData:
 
         with self.lock:
             self.data[i:j] = pitches
+            self.end_index = max(self.end_index, j)
+
+    def frames_available(self) -> int:
+        """One past the last frame that holds data. write() tracks it live;
+        data assigned wholesale (offline detection, cache load) is an
+        exact-length list with a real tail, so fall back to the length then."""
+        n = self.end_index
+        if self.data and self.data[-1] is not None:
+            n = max(n, len(self.data))
+        return min(n, len(self.data))
 
     def read(self, start_time: float=0, end_time: float=0, i: int=None, j: int=None, clean=False, include_transitions: bool=True) -> list[Pitch]:
         """returns the array of pitches corresponding to start_time <--> end_time"""
@@ -197,6 +212,76 @@ class PitchData:
             and pitch.unvoiced_prob < self.UNVOICED_THRESHOLD
             and (include_transitions or not getattr(pitch, "is_transition", False))
         )
+
+    def _frame_time(self, i: int) -> float:
+        """App-time of frame i's center (the same convention detect_pitches
+        stamps Pitch.time with)."""
+        return self.t_origin + (i * self.config.h1 + 0.5 * self.config.w1) / self.config.sr
+
+    def _curve_index_range(self, t0: float, t1: float) -> tuple[int, int]:
+        """Half-open frame-index range whose CENTER times fall in [t0, t1].
+
+        `time_to_index` addresses streaming writes by their frame-start time;
+        plot curves use frame centers, so they must undo the w1/2 offset.
+        """
+        cfg = self.config
+        pos0 = ((t0 - self.t_origin) * cfg.sr - 0.5 * cfg.w1) / cfg.h1
+        pos1 = ((t1 - self.t_origin) * cfg.sr - 0.5 * cfg.w1) / cfg.h1
+        i0 = max(0, int(np.ceil(pos0)))
+        i1 = min(len(self.data), max(i0, int(np.floor(pos1)) + 1))
+        return i0, i1
+
+    def pitch_curve(self, t0: float, t1: float, include_transitions: bool=True) -> tuple[np.ndarray, np.ndarray]:
+        """(times, midis) over the frames in [t0, t1) — the pitch contour,
+        with NaN where a frame is missing/unvoiced so plots drawn with
+        connect='finite' break across the gaps."""
+        i0, j = self._curve_index_range(t0, t1)
+        times = np.empty(j - i0)
+        midis = np.full(j - i0, np.nan)
+        for k in range(j - i0):
+            p = self.data[i0 + k]
+            times[k] = p.time if p is not None else self._frame_time(i0 + k)
+            if p is not None and self.is_voiced_pitch(p, include_transitions=include_transitions):
+                midis[k] = p.value
+        return times, midis
+
+    def volume_curve(self, t0: float, t1: float,
+                     floor_db: float = -120.0) -> tuple[np.ndarray, np.ndarray]:
+        """(times, dBFS) over every WRITTEN frame in [t0, t1).
+
+        Pitch voicing is irrelevant to loudness: an unpitched/noisy frame still
+        has meaningful RMS volume. Digital silence is drawn at `floor_db` so a
+        continuous recorded stream stays continuous; only an unwritten `None`
+        frame remains NaN and breaks the curve.
+        """
+        i0, j = self._curve_index_range(t0, t1)
+        times = np.empty(j - i0)
+        dbs = np.full(j - i0, np.nan)
+        for k in range(j - i0):
+            p = self.data[i0 + k]
+            times[k] = p.time if p is not None else self._frame_time(i0 + k)
+            if p is None:
+                continue
+            vol = float(getattr(p, "volume", 0.0) or 0.0)
+            dbs[k] = (max(float(floor_db), 20.0 * np.log10(vol))
+                      if vol > 0 else float(floor_db))
+        return times, dbs
+
+    def volume_range_db(self) -> tuple[float | None, float | None]:
+        """(min_dBFS, max_dBFS) over the voiced frames' volumes, or (None, None)
+        when nothing voiced carries volume. Review-mode volume coloring maps
+        this range onto the quiet->loud ramp."""
+        frames = self.read(i=0, j=len(self.data), clean=True)
+        vols = [float(p.volume) for p in frames if getattr(p, "volume", 0.0) > 0]
+        if not vols:
+            return (None, None)
+        return (20.0 * float(np.log10(min(vols))), 20.0 * float(np.log10(max(vols))))
+
+    def mean_volume(self, start_time: float, end_time: float) -> float:
+        """Mean voiced-frame volume in the window (0.0 when nothing voiced)."""
+        frames = self.read(start_time=start_time, end_time=end_time, clean=True)
+        vols = [float(p.volume) for p in frames if getattr(p, "volume", 0.0) > 0]
+        return float(np.mean(vols)) if vols else 0.0
 
     def get_voiced_range(self, include_transitions: bool=True) -> tuple[float, float]:
         """Return the app-time range covered by voiced pitch frames."""

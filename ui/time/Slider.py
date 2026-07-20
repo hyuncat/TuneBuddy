@@ -14,13 +14,15 @@ class Slider(QWidget):
         self._layout = QVBoxLayout()
         self.setLayout(self._layout)
 
-        # slider <==> timer resolution variables
+        # Slider resolution is separate from the wall-clock repaint rate. The
+        # clock may tick at 10 Hz, but seeking to score-note onsets needs finer
+        # precision than 100 ms.
         self.wall_clock = wall_clock
         self.wall_clock.time_changed.connect(self.handle_timer_update)
 
         # init our slider!!
         self.DEFAULT_LENGTH_SEC = 30
-        self.TICKS_PER_SEC = self.wall_clock.hz # 10 ticks per sec
+        self.TICKS_PER_SEC = 1000
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.midi_length_ticks = int(self.DEFAULT_LENGTH_SEC*self.TICKS_PER_SEC)
         self.midi_length_sec = self.DEFAULT_LENGTH_SEC
@@ -160,7 +162,7 @@ class Slider(QWidget):
     # --- TIMER RELATED ---
     def handle_timer_update(self, t: float) -> None:
         """called whenever timer is updated (every 100ms)"""
-        tick = int(t * self.wall_clock.hz)
+        tick = int(round(t * self.TICKS_PER_SEC))
         self.current_tick = tick
 
         # ensure current tick never exceeds the (possibly clipped) maximum; on a
@@ -183,12 +185,19 @@ class Slider(QWidget):
 
     def get_time(self):
         """get current time of slider in seconds (clamped to the clip window)"""
-        t = self.slider.value() / self.wall_clock.hz
+        t = self.slider.value() / self.TICKS_PER_SEC
         if self.clip_window is not None:
             b0, b1 = self.clip_window
             t = min(max(t, b0), b1)
         return t
     
+    @staticmethod
+    def format_time(seconds: float) -> str:
+        """A time in seconds as the transport label's mm:ss.s format."""
+        mins = int(seconds // 60)
+        secs = seconds % 60
+        return f"{mins:02}:{secs:04.1f}"
+
     def get_total_time(self):
         """get total time of slider in seconds"""
         return self.slider.maximum() / self.TICKS_PER_SEC

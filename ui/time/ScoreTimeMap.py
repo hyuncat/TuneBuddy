@@ -62,6 +62,26 @@ class ScoreTimeMap:
         Identity until anchored."""
         return self._interp(self._vero, self._app, vero_t)
 
+    def viewer_time(self, t: float, score_data) -> float:
+        """Wall-clock app time (current tempo) -> Verovio cursor time: undo the
+        transpose offset (a clip-resize shifts the score), then the tempo change
+        (-> the original-tempo timeframe the anchors live in), then the barline
+        map. Falls back to the plain scalar until anchored."""
+        bpm_og = score_data.bpm_og or score_data.bpm
+        if not bpm_og:
+            return t
+        og_t = (t - score_data.transpose_offset) * score_data.bpm / bpm_og
+        return self.to_viewer(og_t)
+
+    def app_time(self, viewer_t: float, score_data) -> float:
+        """Inverse of viewer_time: a Verovio-timeline time back onto the app's
+        wall-clock timeline (barline map, then redo tempo + transpose offset)."""
+        bpm_og = score_data.bpm_og or score_data.bpm
+        if not bpm_og or not score_data.bpm:
+            return viewer_t
+        og_t = self.from_viewer(viewer_t)
+        return og_t * bpm_og / score_data.bpm + score_data.transpose_offset
+
     @staticmethod
     def _interp(xs: list[float], ys: list[float], x: float) -> float:
         if len(xs) < 2:

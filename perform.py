@@ -1,9 +1,8 @@
 # code for performance / analysis mode
 from __future__ import annotations
-from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QSplitter, QMessageBox
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QMessageBox, QLabel, QComboBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
@@ -13,12 +12,15 @@ from app_logic.JsonHandler import JsonHandler
 from app_logic.user.ds.Recording import Recording
 from app_logic.user.AudioPlayer import AudioPlayer
 from app_logic.user.AudioRecorder import AudioRecorder
-from app_logic.Alignment import Alignment
-from app_logic.NoteData import NoteData
 from app_logic.user.ds.PitchData import PitchData
 
-from ui.ScoreViewer import ScoreViewer
-from ui.GuitarHero import GuitarHero
+from ui.Colors import Colors
+from ui.score.ScoreViewer import ScoreViewer
+from ui.score.ScoreAnnotations import ScoreAnnotations
+from ui.guitarhero.GuitarHero import GuitarHero
+from ui.info.ClipDialog import ClipDialog
+from ui.info.Gradient import VolumeGradient
+from ui.info.Legend import Legend
 from ui.time.ScoreTimeMap import ScoreTimeMap
 
 
@@ -50,6 +52,7 @@ class PerformTab(QWidget):
         # full score. The host (app.py) owns the toggle and pushes it in via
         # set_show_full; this is the panel's render-time cache of it.
         self.viewer_show_full = False
+        self.score_color_mode = "pitch"
 
         # barline-anchored app<->Verovio time correspondence: keeps the score
         # cursor on the MIDI/NoteData timeline (the source of truth) instead of
@@ -62,6 +65,7 @@ class PerformTab(QWidget):
         self.status_bar = None
         self.midi_player = None
         self.mistake_widget = None
+        self.note_panel = None
 
         self.init_ui()
         self.init_signals()
@@ -72,46 +76,167 @@ class PerformTab(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
 
-        ABSOLUTE_PROJECT_ROOT = Path(__file__).resolve().parent
-
         # the score viewer owns its own "Loading..." placeholder until Verovio's
         # JS API is ready (see ScoreViewer).
-        self.score_viewer = ScoreViewer(project_root=ABSOLUTE_PROJECT_ROOT)
-
+        self.score_viewer = ScoreViewer()
+        self.score_viewer.set_annotation_color_mode(self.score_color_mode)
         self.guitar_hero = GuitarHero(self.recording)
+        self.score_panel = self._build_score_panel()
 
         # score viewer stacked ON TOP of the guitar hero, in a vertical splitter
         # so both are adjustable in height.
         self.center_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.center_splitter.addWidget(self.score_viewer)
+        self.center_splitter.addWidget(self.score_panel)
         self.center_splitter.addWidget(self.guitar_hero)
         self.center_splitter.setStretchFactor(0, 1)  # score viewer grows
         self.center_splitter.setStretchFactor(1, 1)  # guitar hero grows
-        # start the score viewer compact so its single white page roughly fills
-        # the box (still user-resizable via the handle below it).
-        self.center_splitter.setSizes([180, 520])    # initial heights (resizable)
+        # pre-load default; every render then auto-fits the pane to the score's
+        # full height (_fit_score_viewer_height) until the user drags the handle.
+        self.center_splitter.setSizes([180, 520])
+        self._score_splitter_user_set = False
+        self._last_content_height = 0.0
+        self.center_splitter.splitterMoved.connect(self._on_score_splitter_moved)
         self._layout.addWidget(self.center_splitter)
+        
+        #TODO: move this somewhere where it makes more sense
+        gh_margins = self.guitar_hero.layout().contentsMargins()
+        self._score_legend_row.setContentsMargins(
+            gh_margins.left() + 8, 2, gh_margins.right() + 8, 2)
 
     def init_signals(self):
         self.score_viewer.load_finished.connect(self.on_score_viewer_loaded)
+        self.score_viewer.note_clicked.connect(self.on_note_clicked)
+        self.score_viewer.annotation_clicked.connect(self.on_annotation_clicked)
+        self.score_viewer.trim_requested.connect(self.on_trim_requested)
+        self.score_viewer.content_height_changed.connect(self._fit_score_viewer_height)
 
-    def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth, mistake_widget):
+    def _build_score_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.score_viewer, stretch=1)
+        layout.addLayout(self._build_score_legend_row())
+        return panel
+
+    def _build_score_legend_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(8, 2, 8, 2)  # L/R re-matched to GuitarHero's in init_ui
+        row.setSpacing(14)
+        self._score_legend_row = row
+
+        self._score_legend_items = QHBoxLayout()
+        self._score_legend_items.setContentsMargins(0, 0, 0, 0)
+        self._score_legend_items.setSpacing(14)
+        row.addLayout(self._score_legend_items)
+        row.addStretch(1)
+
+        picker = QHBoxLayout()
+        picker.setSpacing(6)
+        picker.addWidget(QLabel("Colors:"))
+        self.score_color_combo = QComboBox()
+        self.score_color_combo.addItems(["Pitch", "Timing", "Volume"])
+        self.score_color_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.score_color_combo.setStyleSheet(GuitarHero._COMBO_STYLE)
+        self.score_color_combo.currentTextChanged.connect(self._on_score_color_mode_changed)
+        picker.addWidget(self.score_color_combo)
+        row.addLayout(picker)
+
+        self._rebuild_score_legend()
+        return row
+
+    def _rebuild_score_legend(self):
+        while self._score_legend_items.count():
+            item = self._score_legend_items.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.deleteLater()
+
+        # swatches mirror what the SCORE paints, so they take its dimmed colors
+        # (Colors.SCORE_DIM); the cursor is the one color that stays full.
+        current = (Colors.CURRENT_RGB, "current")
+        if self.score_color_mode == "volume":
+            self._score_legend_items.addWidget(
+                Legend.gradient_strip(VolumeGradient(dim=True)))
+            self._score_legend_items.addWidget(Legend.swatch(*current))
+            return
+
+        if self.score_color_mode == "timing":
+            items = [(Colors.mistake_rgb("timing", dim=True), "error"), current]
+        else:
+            # insertions and deletions share one color and one label: both are a
+            # note that shouldn't be where it is, played or missed.
+            items = [
+                (Colors.mistake_rgb("insertion", dim=True), "wrong note"),
+                (Colors.mistake_rgb("substitution", dim=True), "off-pitch"),
+                current,
+            ]
+        for rgb, text in items:
+            self._score_legend_items.addWidget(Legend.swatch(rgb, text))
+
+    def _on_score_color_mode_changed(self, text: str):
+        label = text.lower()
+        if label.startswith("timing"):
+            self.score_color_mode = "timing"
+        elif label == "volume":
+            self.score_color_mode = "volume"
+        else:
+            self.score_color_mode = "pitch"
+        self._rebuild_score_legend()
+        self.score_viewer.set_annotation_color_mode(self.score_color_mode)
+
+    # --- SCORE PANE AUTO-FIT ---
+    def _on_score_splitter_moved(self, *_):
+        """The user dragged the score/guitar-hero handle: their sizing wins from
+        now on (auto-fit stops re-asserting the rendered height)."""
+        self._score_splitter_user_set = True
+
+    def _fit_score_viewer_height(self, content_height: float):
+        """Size the score pane to the freshly rendered system (plus the legend
+        row) so the default view shows the whole line without scrolling."""
+        self._last_content_height = content_height
+        if self._score_splitter_user_set:
+            return
+        sizes = self.center_splitter.sizes()
+        total = sum(sizes)
+        if total <= 0:
+            return
+        MIN_GUITAR_HERO = 160
+        needed = int(content_height) + self._score_legend_row.sizeHint().height() + 4
+        needed = min(needed, total - MIN_GUITAR_HERO)
+        if needed <= 0:
+            return
+        self.center_splitter.setSizes([needed, total - needed])
+
+    def showEvent(self, event):
+        """Re-assert the auto-fit when the tab becomes visible: a load that ran
+        while the tab was hidden fitted against stale splitter geometry."""
+        super().showEvent(event)
+        if self._last_content_height:
+            self._fit_score_viewer_height(self._last_content_height)
+
+    def attach_timekeeping(self, wall_clock, slider, status_bar, midi_synth,
+                           mistake_widget, note_panel=None):
         """Inject the shared transport (owned by the host) plus the Perform-only
-        MistakeWidget. The panel drives the transport during playback/recording;
-        the host routes the matching button clicks / clock+slider ticks back. The
-        MIDI player is the panel's OWN (sharing only the synth + clock) so it
-        plays this tab's score independently of the Practice tab's."""
+        MistakeWidget and the shared NotePanel. The panel drives the transport
+        during playback/recording; the host routes the matching button clicks /
+        clock+slider ticks back. The MIDI player is the panel's OWN (sharing
+        only the synth + clock) so it plays this tab's score independently of
+        the Practice tab's."""
         self.wall_clock = wall_clock
         self.slider = slider
         self.status_bar = status_bar
         self.midi_player = MidiPlayer(midi_synth, wall_clock)
         self.mistake_widget = mistake_widget
+        self.note_panel = note_panel
         # keep the shared slider following the plot as it moves
         self.guitar_hero.plot_moved.connect(self.slider.handle_timer_update)
         # mistake list <-> guitar hero highlight/override coupling
         self.mistake_widget.selected.connect(self.on_mistake_selected)
         self.mistake_widget.cleared.connect(self.guitar_hero.clear_highlight)
         self.mistake_widget.override_toggled.connect(self.on_mistake_override_toggled)
+        self.mistake_widget.mode_changed.connect(self.guitar_hero.set_mistake_mode)
 
     # --- HOST-DRIVEN STATE ---
     def set_active_recording(self, rec: Recording):
@@ -125,6 +250,8 @@ class PerformTab(QWidget):
         self.audio_player.load_audio(rec.audio_data)
         self.audio_recorder.load_recording(rec)
         self._refresh_mistake_widget(rec)
+        if rec.analysis_notice and self.status_bar is not None:
+            self.status_bar.update_status(rec.analysis_notice)
 
     def _wire_detector(self, rec: Recording):
         """Each recording owns its own pitch detector; connect each only once."""
@@ -161,6 +288,9 @@ class PerformTab(QWidget):
             self.guitar_hero.load_user(rec)
         if self.mistake_widget is not None:
             self.mistake_widget.clear()
+        if self.note_panel is not None:
+            self.note_panel.clear()
+        self.score_viewer.clear_mistake_annotations()
 
     def _clear_analysis(self):
         """Clear stale analysis (notes/alignment/mistakes/overrides) and refresh
@@ -176,6 +306,9 @@ class PerformTab(QWidget):
             self.guitar_hero.load_user(rec)
         if self.mistake_widget is not None:
             self.mistake_widget.clear()
+        if self.note_panel is not None:
+            self.note_panel.clear()
+        self.score_viewer.clear_mistake_annotations()
 
     def set_active_instrument(self, channel: int):
         """Make `channel` the active instrument: wipe analysis-derived data, re-init
@@ -201,7 +334,7 @@ class PerformTab(QWidget):
         live). Pitch-only: timing and the clip are untouched."""
         if self.score_data is None or self.score_data.score is None:
             return
-        self.score_data.transpose(semitones)
+        self.score_data.transpose(dy=semitones)
         self.guitar_hero.update_view_items()
         self.refresh_score_viewer()
 
@@ -251,6 +384,8 @@ class PerformTab(QWidget):
         self.status_bar.update_status("")
         self.guitar_hero.load_user(self.recording)
         self._refresh_guitar_hero_now()
+        if self.note_panel is not None:
+            self.note_panel.refresh()
         JsonHandler(self.recording).save_cache()
 
     def _refresh_guitar_hero_now(self):
@@ -305,8 +440,13 @@ class PerformTab(QWidget):
         origin = min(0.0, t)
         self.recording.audio_data.t_origin = origin
         self.recording.pitch_data.t_origin = origin
+        self.recording.vibrato_data.t_origin = origin
+        self.recording.timbre_data.t_origin = origin
         self.wall_clock.set_floor(origin)
         self.is_recording = True
+        self.guitar_hero.set_live(True)  # pitch-dot opacity: fixed absolute dB window
+        if self.note_panel is not None:
+            self.note_panel.set_live(True)  # trailing-window mode
         self.audio_player.stop()
         self.wall_clock.start(t)
         self.audio_recorder.run(start_time=t)
@@ -317,6 +457,9 @@ class PerformTab(QWidget):
         if not self.is_recording:
             return
         self.is_recording = False
+        self.guitar_hero.set_live(False)  # pitch-dot opacity: remap to the take's range
+        if self.note_panel is not None:
+            self.note_panel.set_live(False)
         self.wall_clock.pause()
         self.wall_clock.set_floor(0.0)  # drop the runway floor for plain playback
         self.audio_recorder.stop()
@@ -329,6 +472,8 @@ class PerformTab(QWidget):
         self.score_data.update_time(t)
         self.score_viewer.set_playback_time(self._score_viewer_time(t))
         self.guitar_hero.move_plot(t)
+        if self.note_panel is not None:
+            self.note_panel.update_time(t)
 
     def render_at(self, t: float):
         """Public alias used by the host (e.g. on tab switch) to line this tab's
@@ -371,16 +516,30 @@ class PerformTab(QWidget):
             return
         print("analyzing... ")
         rec.reset_analysis()  # clear stale notes/alignment/mistakes before recomputing
-        rec.detect_notes()
+        rec.detect_notes(use_transitions=False)
         # rec.recompute_note_pitches()
         # rec.prune_transition_notes()
 
+        # Give the initial alignment an onset-fitted score. Count-in/runway and
+        # the final note's release must never affect the fitted tempo.
+        rec.resize_score(to_span="onset")
         rec.detect_mistakes()
         rec.mistake_checker.mistake_correction_loop()
+
+        # Correction can split/merge the edge notes and thereby change the
+        # take's first/last onset. Refit from the FINAL corrected onsets before
+        # GuitarHero renders the score bars, then relink the alignment because
+        # change_tempo() rebuilt the score Note objects.
+        if not rec.resize_score_to_aligned_onsets():
+            rec.resize_score(to_span="onset")
+        rec.alignment.sync_score_notes(
+            rec.score_data.note_datas.get(rec.active_instrument)
+        )
         rec.reindex_mistakes()
         rec.update_alignment_distances() # color the user pitches by the final alignment
         rec.mistake_detector.detect_timing_mistakes()  # derive early/late/short/long from the final alignment
         rec.trim_end()
+        rec.analysis_notice = ""
 
         # reload every view with the fresh analysis (note/alignment may have been
         # overwritten by the correction loop)
@@ -396,6 +555,8 @@ class PerformTab(QWidget):
             self.slider.set_time(start_bounds[0])
         self.guitar_hero.update_clip_overlay()
         self._refresh_mistake_widget(rec)
+        if self.note_panel is not None:
+            self.note_panel.refresh()
         JsonHandler(rec).save_cache()
 
         # the resize stretched the score to match the take => its BPM/length
@@ -419,6 +580,7 @@ class PerformTab(QWidget):
             rec.mistake_detector.detect_timing_mistakes()
         self.mistake_widget.load_mistakes(rec.alignment.pitch_mistakes)
         self.mistake_widget.load_timing_mistakes(rec.alignment.timing_mistakes)
+        self._refresh_score_mistakes(rec)
 
     def refresh_mistake_widget(self, rec: Recording | None = None):
         """Public wrapper used by app-level controls that update derived mistakes
@@ -426,6 +588,16 @@ class PerformTab(QWidget):
         rec = rec or self.recording
         if rec is not None:
             self._refresh_mistake_widget(rec)
+
+    def _refresh_score_mistakes(self, rec: Recording | None = None):
+        """Send the score viewer the active recording's mistakes keyed by
+        drift-free score-note indices. The web layer handles only rendering and
+        click popups; it never infers note identity from Verovio seconds."""
+        rec = rec or self.recording
+        if rec is None or not rec.has_analysis():
+            self.score_viewer.clear_mistake_annotations()
+            return
+        self.score_viewer.set_mistake_annotations(ScoreAnnotations.build(rec))
 
     def on_mistake_selected(self, idx: int):
         """Triggered after a mistake is clicked in MistakeWidget.
@@ -455,6 +627,7 @@ class PerformTab(QWidget):
             mistakes[idx].toggle_override()
             self.mistake_widget.refresh_override(idx)
             self.guitar_hero.update_highlight_override(mistakes[idx].is_overridden())
+            self._refresh_score_mistakes(self.recording)
             JsonHandler(self.recording).save_cache()
             return
         self.recording.toggle_mistake_override(idx)
@@ -462,24 +635,41 @@ class PerformTab(QWidget):
         self.mistake_widget.refresh_override(idx)
         self.guitar_hero.update_highlight_override(mistake.is_overridden())
         self.guitar_hero.update_view_items()
+        self._refresh_score_mistakes(self.recording)
         JsonHandler(self.recording).save_cache()
 
     # --- SCORE VIEWER ---
+    def on_note_clicked(self, viewer_sec: float):
+        """A note was clicked in the sheet music: jump the transport (slider +
+        cursor + GuitarHero) to that note. Scrub-only — ignored while playing or
+        recording, when the clock owns the cursor."""
+        if self.is_playing or self.is_recording:
+            return
+        self.slider.set_time(self._score_note_start_from_viewer(viewer_sec))
+        self.move_views(self.slider.get_time())
+
+    def on_annotation_clicked(self, app_sec: float):
+        """A colored score-note annotation or insertion triangle was clicked.
+        Unlike ordinary score-note clicks, annotations already carry app-time
+        from the drift-free NoteData/alignment mapping."""
+        if self.is_playing or self.is_recording:
+            return
+        self.slider.set_time(float(app_sec))
+        self.move_views(self.slider.get_time())
+
+    def _score_note_start_from_viewer(self, viewer_t: float) -> float:
+        """Map the clicked Verovio note time to app time (ScoreTimeMap), then
+        snap to the nearest rendered score note onset so the shared slider lands
+        on the NoteData start time."""
+        app_t = self._time_map.app_time(viewer_t, self.score_data)
+        starts = self.score_data.note_starts(all_instruments=self.viewer_show_full)
+        if not starts:
+            return app_t
+        return min(starts, key=lambda t: abs(t - app_t))
+
     def _score_viewer_time(self, t: float) -> float:
-        """Map a wall-clock time `t` (current tempo) into the Verovio cursor's
-        timeframe. First undo any tempo change (-> original-tempo app time), then
-        run that through the barline-anchored map so the cursor lands on whatever
-        note is actually SOUNDING (the MIDI/NoteData timeline), not on Verovio's
-        independently-drifting timemap. Falls back to the plain scalar until the
-        map's anchors have been pulled."""
-        bpm_og = self.score_data.bpm_og or self.score_data.bpm
-        if not bpm_og:
-            return t
-        # undo the transpose offset (resize_score shifts the selected score span
-        # to start at t=0) THEN the tempo change -> original-tempo app time, the
-        # frame measure_onsets_og / the barline map are anchored in.
-        og_t = (t - self.score_data.transpose_offset) * self.score_data.bpm / bpm_og
-        return self._time_map.to_viewer(og_t)
+        """Wall-clock time -> Verovio cursor time (see ScoreTimeMap.viewer_time)."""
+        return self._time_map.viewer_time(t, self.score_data)
 
     def refresh_score_viewer(self):
         """Re-render the Verovio score viewer.
@@ -488,11 +678,13 @@ class PerformTab(QWidget):
             return
         channel = None if self.viewer_show_full else self.score_data.active_instrument
         self.score_viewer.load_score(self.score_data, channel=channel)
+        self.score_viewer.set_annotation_color_mode(self.score_color_mode)
         # rebuild the barline time map for the freshly laid-out score (async pull
         # of Verovio's measure onsets), then re-assert the clip grey-out so it
         # survives the re-layout (and clears itself when the score isn't clipped).
         self._rebuild_time_map(channel)
         self._refresh_clip_focus()
+        self._refresh_score_mistakes()
 
     def _rebuild_time_map(self, channel):
         """Re-anchor the app<->Verovio time map to the freshly rendered score, so
@@ -518,27 +710,46 @@ class PerformTab(QWidget):
         self.viewer_ready.emit()
 
     # --- CLIP (measure-range focus; stored on ScoreData as note indices) ---
-    def apply_clip(self):
-        """Clip menu 'Clip': clip to the measures selected in the score viewer
-        (async pull; _on_clip_selection applies it)."""
-        self.score_viewer.get_clip_selection(self._on_clip_selection)
+    def start_clip_selection(self):
+        """Clip menu 'Select measures': arm measure picking in the score viewer.
+        The user clicks a start + end measure, then right-clicks — the viewer's
+        trim_requested lands in on_trim_requested to confirm + apply."""
+        self.score_viewer.set_selection_mode(True)
+        if self.status_bar is not None:
+            self.status_bar.update_status(
+                "Select the first and last measures of your desired range, "
+                "then right-click to clip.")
 
-    def _on_clip_selection(self, sel: dict | None):
-        """Turn a pulled measure selection into a note-index clip. `sel` holds
+    def on_trim_requested(self):
+        """Right-click while selecting: pull the picked measures, then confirm
+        (async pull; _on_trim_selection shows the popup and applies)."""
+        self.score_viewer.get_clip_selection(self._on_trim_selection)
+
+    def _on_trim_selection(self, sel: dict | None):
+        """Confirm ("Trim?") and apply the pulled measure selection. `sel` holds
         inclusive measure INDICES (startIdx/endIdx); ScoreData resolves them to
         the exact notes in those measures off its own MIDI timeline, so the clip
         can't drift even where Verovio's rendered timeline runs ahead."""
         if not sel:
-            return  # nothing selected -> leave the current clip as-is
+            if self.status_bar is not None:
+                self.status_bar.update_status("Click a start and an end measure first.")
+            return
+        if not ClipDialog.ask(self):
+            return  # keep selecting
+        if self.status_bar is not None:
+            self.status_bar.update_status("")
         clip = self.score_data.note_index_range_for_measures(
             sel["startIdx"], sel["endIdx"])
         if clip is None:
             return
+        self.score_viewer.set_selection_mode(False)
         self.set_clip(clip, seek=True)
         self.clip_changed.emit(clip)  # mirror onto the other tab (global clip)
 
     def reset_clip(self):
-        """Clip menu 'Reset': drop the clip (mirrored onto the other tab)."""
+        """Clip menu 'Reset': drop the clip (mirrored onto the other tab) and
+        disarm any in-progress measure selection."""
+        self.score_viewer.set_selection_mode(False)
         self.set_clip(None)
         self.clip_changed.emit(None)
 

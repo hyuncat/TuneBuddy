@@ -1,7 +1,7 @@
 import threading
 import numpy as np
-import librosa
 from bisect import bisect_left, bisect_right
+from scipy.ndimage import gaussian_filter1d, median_filter
 from typing import TYPE_CHECKING
 
 from algorithms.Config import Config
@@ -61,26 +61,34 @@ class OnsetData:
  
 class OnsetDetector:
     """
-    Wraps librosa.onset.onset_detect for use with AudioData.
+    Explicit log-spectral-flux onset detector for use with AudioData.
+
+    Candidate generation is intentionally transparent: positive changes in a
+    log-magnitude STFT become a novelty curve, a rolling median/MAD supplies a
+    local adaptive baseline, and greedy non-maximum suppression keeps only
+    strong, separated peaks. These are candidates for score-guided correction,
+    not instructions to split every detected note.
  
     Usage
     -----
-        detector = OnsetDetector(config)
-        onsets = detector.detect(audio_data)
+        detector = OnsetDetector(recording)
+        onsets = detector.detect()
     """
  
-    HOP_LENGTH = 512
-    BACKTRACK = True       # snap each onset to the nearest preceding energy minimum
-    DELTA = 0.07           # threshold above local mean to count as a peak
-    WAIT = 10              # min frames between onsets (~10 * hop / sr seconds)
+    FRAME_LENGTH = 2048
+    HOP_LENGTH = 256
+    LOG_GAIN = 20.0
+    FFT_BLOCK_FRAMES = 512
+    SMOOTH_SIGMA_FRAMES = 1.0
  
     def __init__(self, recording: "Recording"):
         self.recording = recording
         self.config = recording.config
  
         # Inspection artifacts
-        self.onset_env_ = None    # the onset strength envelope
-        self.onset_frames_ = None # raw frame indices returned by librosa
+        self.onset_env_ = None     # raw positive log-spectral flux
+        self.onset_z_ = None       # locally standardized novelty
+        self.onset_frames_ = None  # selected frame indices
 
     def update_config(self, config: Config):
         self.config = config
@@ -88,7 +96,7 @@ class OnsetDetector:
     def detect(self) -> OnsetData:
         """Run onset detection on `audio_data` and return a populated OnsetData."""
         onset_data = OnsetData(self.config)
-        if self.recording.audio_data.end_index  == 0:
+        if self.recording.audio_data.end_index == 0:
             return onset_data
  
         # snapshot the recorded portion of the buffer under the lock
@@ -96,27 +104,104 @@ class OnsetDetector:
         sr = int(getattr(self.recording.audio_data, "sr", self.config.sr))
         t_origin = float(getattr(self.recording.audio_data, "t_origin", 0.0))
 
-        # Onset strength envelope (frame-rate signal of "how much is starting now")
-        self.onset_env_ = librosa.onset.onset_strength(
-            y=y, sr=sr, hop_length=self.HOP_LENGTH
+        y = np.asarray(y, dtype=np.float64)
+        if y.ndim > 1:
+            y = np.mean(y, axis=1)
+        if len(y) < self.FRAME_LENGTH:
+            return onset_data
+
+        self.onset_env_ = self._spectral_flux(y)
+        self.onset_env_ = gaussian_filter1d(
+            self.onset_env_,
+            self.SMOOTH_SIGMA_FRAMES,
+            mode="nearest",
         )
- 
-        # Peak-pick onsets from the envelope
-        self.onset_frames_ = librosa.onset.onset_detect(
-            onset_envelope=self.onset_env_,
-            sr=sr,
-            hop_length=self.HOP_LENGTH,
-            backtrack=self.BACKTRACK,
-            delta=self.DELTA,
-            wait=self.WAIT,
-            units='frames',
+
+        frame_rate = sr / self.HOP_LENGTH
+        adaptive_frames = max(
+            3,
+            int(round(self.config.onset_adaptive_window_sec * frame_rate)) | 1,
         )
- 
-        times = librosa.frames_to_time(
-            self.onset_frames_, sr=sr, hop_length=self.HOP_LENGTH
-        ) + t_origin
-        # Pull the envelope value at each onset frame as a "strength" score
-        strengths = self.onset_env_[self.onset_frames_] if len(self.onset_frames_) else np.array([])
+        baseline = median_filter(
+            self.onset_env_,
+            size=adaptive_frames,
+            mode="nearest",
+        )
+        deviation = median_filter(
+            np.abs(self.onset_env_ - baseline),
+            size=adaptive_frames,
+            mode="nearest",
+        )
+        nonzero_deviation = deviation[deviation > np.finfo(float).eps]
+        deviation_floor = (
+            0.05 * float(np.median(nonzero_deviation))
+            if len(nonzero_deviation)
+            else np.finfo(float).eps
+        )
+        self.onset_z_ = (self.onset_env_ - baseline) / np.maximum(
+            deviation,
+            max(deviation_floor, np.finfo(float).eps),
+        )
+
+        self.onset_frames_ = self._pick_peaks(self.onset_z_, frame_rate)
+        # Spectral flux is a forward difference between STFT frames, so the
+        # frame-start timestamp is the least-latent boundary estimate. It also
+        # avoids the opaque energy backtracking that used to move candidates by
+        # unrelated amounts.
+        times = (
+            self.onset_frames_ * self.HOP_LENGTH / sr
+            + t_origin
+        )
+        strengths = self.onset_z_[self.onset_frames_]
  
         onset_data.load(times, strengths)
         return onset_data
+
+    def _spectral_flux(self, y: np.ndarray) -> np.ndarray:
+        """Positive log-spectral flux in bounded-memory FFT blocks."""
+        n_frames = 1 + (len(y) - self.FRAME_LENGTH) // self.HOP_LENGTH
+        flux = np.zeros(n_frames, dtype=np.float64)
+        window = np.hanning(self.FRAME_LENGTH)
+        previous = None
+        for first in range(0, n_frames, self.FFT_BLOCK_FRAMES):
+            count = min(self.FFT_BLOCK_FRAMES, n_frames - first)
+            sample_start = first * self.HOP_LENGTH
+            sample_end = (
+                sample_start
+                + (count - 1) * self.HOP_LENGTH
+                + self.FRAME_LENGTH
+            )
+            frames = np.lib.stride_tricks.sliding_window_view(
+                y[sample_start:sample_end],
+                self.FRAME_LENGTH,
+            )[::self.HOP_LENGTH][:count]
+            magnitude = np.abs(np.fft.rfft(frames * window, axis=1))
+            spectrum = np.log1p(self.LOG_GAIN * magnitude)
+            if previous is not None:
+                flux[first] = np.mean(np.maximum(spectrum[0] - previous, 0.0))
+            if count > 1:
+                flux[first + 1:first + count] = np.mean(
+                    np.maximum(np.diff(spectrum, axis=0), 0.0),
+                    axis=1,
+                )
+            previous = spectrum[-1]
+        return flux
+
+    def _pick_peaks(self, novelty_z: np.ndarray, frame_rate: float) -> np.ndarray:
+        """Local maxima above threshold, greedily separated by confidence."""
+        if len(novelty_z) < 3:
+            return np.array([], dtype=np.int64)
+        candidates = np.flatnonzero(
+            (novelty_z[1:-1] >= novelty_z[:-2])
+            & (novelty_z[1:-1] > novelty_z[2:])
+            & (novelty_z[1:-1] >= self.config.onset_z_threshold)
+        ) + 1
+        min_frames = max(
+            1,
+            int(round(self.config.onset_min_spacing_sec * frame_rate)),
+        )
+        accepted = []
+        for candidate in candidates[np.argsort(novelty_z[candidates])[::-1]]:
+            if all(abs(int(candidate) - other) >= min_frames for other in accepted):
+                accepted.append(int(candidate))
+        return np.asarray(sorted(accepted), dtype=np.int64)

@@ -37,15 +37,9 @@ class TransitionDetector:
         WINDOW = 9
         HOP = 7
         SLOPE_THRESH = 0.5 / WINDOW
+        self.clear_transitions(pitches)
         if len(pitches) < WINDOW:
-            for p in pitches:
-                if p:
-                    p.is_transition = False
             return
-
-        for p in pitches:
-            if p:
-                p.is_transition = False
 
         frames = np.lib.stride_tricks.sliding_window_view(pitches, window_shape=WINDOW)[::HOP]
         
@@ -58,8 +52,20 @@ class TransitionDetector:
                     if p:
                         p.is_transition = True
 
+    @staticmethod
+    def clear_transitions(pitches: list[Pitch]):
+        """Remove derived transition flags, including ones restored from cache."""
+        for pitch in pitches:
+            if pitch:
+                pitch.is_transition = False
+
 
 class NoteDetector(QObject):
+
+    # A marginal PELT pitch split is kept only when an independently detected
+    # spectral onset lands close to it. Strong pitch steps remain self-evident.
+    AMBIGUOUS_PITCH_FACTOR = 1.5
+    ONSET_BOUNDARY_TOLERANCE_SEC = 0.10
 
     def __init__(self, recording: Recording, config: Config=None, parent: QObject=None) -> None:
         super().__init__(parent)
@@ -81,12 +87,15 @@ class NoteDetector(QObject):
 
     def get_pitch_runs(self, pitches: list[Pitch]) -> list[list[Pitch]]:
         """Returns a list of consecutive voiced pitch runs.
-        Splits notes when we've seen enough unvoiced frames.
+        Splits notes when an unvoiced run spans Config.min_gap_factor of the
+        score-derived minimum note length.
         """
         all_runs = []
         run = []
         MIN_RUN_FRAMES = max(1, round(0.5 * self.config.get_min_note_length(type="frames"))) # in frames
-        MIN_GAP_FRAMES = max(1, round(self.config.min_gap_length * (self.config.sr/self.config.h1))) # in frames
+        MIN_GAP_FRAMES = self.config.min_note_pitch_frames(
+            factor=self.config.min_gap_factor,
+        )
         n_gap_frames = 0
 
         def append_run():
@@ -169,10 +178,38 @@ class NoteDetector(QObject):
                     if nd.times
                     else None
                 )
-                # merge onto previous note if pitches are too close...
-                # ...but only if this isn't the first segment of a run!
-                if last_note and not is_first_segment and abs(last_note.midi_num[0] - midi_num) < self.PITCH_THRESH:
+                # Merge a definite same-pitch segment, plus a marginal pitch
+                # split that has no independent spectral-onset support. The
+                # latter is the common vibrato/settling failure: PELT finds two
+                # levels within one sustained note, but there was no new attack.
+                pitch_change = (
+                    abs(last_note.midi_num[0] - midi_num)
+                    if last_note is not None
+                    else float("inf")
+                )
+                merge = (
+                    last_note is not None
+                    and not is_first_segment
+                    and (
+                        pitch_change < self.PITCH_THRESH
+                        or (
+                            pitch_change < self.AMBIGUOUS_PITCH_FACTOR * self.PITCH_THRESH
+                            and not self._has_onset_near(start_time)
+                        )
+                    )
+                )
+                if merge:
                     last_note.end_time = end_time
+                    combined = self.recording.pitch_data.read(
+                        start_time=last_note.start_time,
+                        end_time=end_time,
+                        clean=True,
+                        include_transitions=False,
+                    )
+                    if combined:
+                        last_note.midi_num = [
+                            float(np.median([p.value for p in combined]))
+                        ]
                 else:
                     nd.write_note(
                         Note(
@@ -187,6 +224,17 @@ class NoteDetector(QObject):
                 is_first_segment = False
 
         return nd
+
+    def _has_onset_near(self, boundary_time: float) -> bool:
+        """Whether a high-confidence spectral candidate supports a PELT split."""
+        onset_data = getattr(self.recording, "onset_data", None)
+        if onset_data is None or not len(onset_data):
+            return False
+        tol = self.ONSET_BOUNDARY_TOLERANCE_SEC
+        return bool(len(onset_data.read(
+            start_time=boundary_time - tol,
+            end_time=boundary_time + tol,
+        )))
 
     @staticmethod
     def bisect_transition(run: list[Pitch], i: int) -> float:

@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
 )
 import logging
 from notebooks.archive.MidiData import MidiData
+from ui.combo import center_combo_items
 
 class SettingsPanel(QWidget):
     """basically a UI to control the following
@@ -232,6 +233,7 @@ class SettingsPanel(QWidget):
         self._layout.addWidget(QLabel("Select instrument"))
         self.instrument_selector = QComboBox()
         self.instrument_selector.addItems(self.INSTRUMENTS)
+        center_combo_items(self.instrument_selector)
         self.instrument_selector.currentTextChanged.connect(self.instrument_selected)
         self._layout.addWidget(self.instrument_selector)
 

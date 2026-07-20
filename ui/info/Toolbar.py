@@ -22,8 +22,8 @@ class Toolbar(QToolBar):
     folder_uploaded = pyqtSignal(str)
     save_recording_requested = pyqtSignal()
     show_settings = pyqtSignal(bool)
-    clip_requested = pyqtSignal() # apply the clip to the selected measure range
-    clip_reset = pyqtSignal()     # restore the full score
+    select_measures_requested = pyqtSignal() # arm measure selection in the score viewer
+    clip_reset = pyqtSignal()                # restore the full score
     user_audio_toggled = pyqtSignal(bool) # value = user audio on/off
     tempo_changed = pyqtSignal(int) # value = new tempo in BPM
 
@@ -72,18 +72,22 @@ class Toolbar(QToolBar):
 
     def init_clip_widget(self):
         """A 'Clip' button whose dropdown holds two items:
-          - 'Clip': clip to the measure range selected in the score viewer (click
-            a start + end measure anytime to highlight the range).
+          - 'Select measures': arm measure picking in the score viewer (click a
+            start + end measure to highlight the range, then right-click to clip).
           - 'Reset': restores the full score.
         """
         self.clip_button = QToolButton(self)
         self.clip_button.setText("Clip")
 
         self.clip_menu = QMenu(self)
-        self.clip_action = QAction("Clip", self)
-        self.clip_action.setStatusTip("Clip to the selected start/end measures")
-        self.clip_action.triggered.connect(self.clip_requested.emit)
-        self.clip_menu.addAction(self.clip_action)
+        self.clip_menu.setToolTipsVisible(True)
+        self.select_measures_action = QAction("Select measures", self)
+        tip = ("Select the first and last measures of your desired range, "
+               "then right-click to clip.")
+        self.select_measures_action.setToolTip(tip)
+        self.select_measures_action.setStatusTip(tip)
+        self.select_measures_action.triggered.connect(self.select_measures_requested.emit)
+        self.clip_menu.addAction(self.select_measures_action)
 
         self.reset_clip_action = QAction("Reset", self)
         self.reset_clip_action.setStatusTip("Restore the full score (undo the clip)")

@@ -27,7 +27,7 @@ from ui.info.RecordingTree import RecordingTree
 from ui.info.SettingsWidget import SettingsWidget
 from ui.info.MistakeWidget import MistakeWidget
 from ui.info.ToleranceWidget import ToleranceWidget
-from ui.info.Settings import SettingsDialog
+from ui.note.NotePanel import NotePanel
 
 # app logic imports
 from app_logic.user.ds.Recording import Recording
@@ -38,7 +38,6 @@ from app_logic.JsonHandler import JsonHandler
 # the two center "mode" tabs, each in its own file
 from perform import PerformTab
 from practice import PracticeTab
-
 
 class Attune(QMainWindow):
     """Each Attune instance is associated with a single score and multiple
@@ -69,7 +68,10 @@ class Attune(QMainWindow):
         # shared transport engines. The synth + wall clock are shared by both
         # tabs; each tab builds its OWN MidiPlayer on them (in attach_timekeeping)
         # so it plays its own independent score.
-        self.wall_clock = WallClock(hz=10)
+        # 30 Hz matches CountdownTimer.FPS: recording/playback scroll at the same
+        # rate as the count-in, and live pitch dots land within a tick (~33 ms)
+        # of detection instead of sitting invisible for up to 100 ms at 10 Hz.
+        self.wall_clock = WallClock(hz=30)
         self.SOUNDFONT = "resources/MuseScore_General.sf3"
         self.midi_synth = MidiSynth(self.SOUNDFONT)
         # the metronome count-in is shared by both tabs
@@ -92,6 +94,7 @@ class Attune(QMainWindow):
         # right column
         self.mistake_widget = MistakeWidget()
         self.tolerance_widget = ToleranceWidget()
+        self.note_panel = NotePanel()
 
         self.init_ui()
         self.init_signals()
@@ -139,16 +142,23 @@ class Attune(QMainWindow):
         self.center_tabs.addTab(self.practice_tab, "Practice")
 
         # ------> RIGHT COLUMN
-        # mistake widget - list mistakes 
-        # tolerance slider
-        self.right_column = QWidget()
-        self.right_column_layout = QVBoxLayout(self.right_column)
-        self.right_column_layout.setContentsMargins(0, 0, 0, 0)
-        self.right_column_layout.addWidget(self.mistake_widget)
-        self.right_column_layout.addWidget(self.tolerance_widget)
-        self.right_column_layout.setStretch(0, 1)  # yes MistakeWidget stretch!
-        self.right_column_layout.setStretch(1, 0)  # no ToleranceWidget stretch
+        # mistake widget + tolerance slider on top; the per-note inspector
+        # (NotePanel) below, behind a splitter so the two share the column
+        # height adjustably.
+        self.right_top = QWidget()
+        self.right_top_layout = QVBoxLayout(self.right_top)
+        self.right_top_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_top_layout.addWidget(self.mistake_widget)
+        self.right_top_layout.addWidget(self.tolerance_widget)
+        self.right_top_layout.setStretch(0, 1)  # yes MistakeWidget stretch!
+        self.right_top_layout.setStretch(1, 0)  # no ToleranceWidget stretch
         self.tolerance_widget.setFixedHeight(self.tolerance_widget.sizeHint().height())
+        self.right_column = QSplitter(Qt.Orientation.Vertical)
+        self.right_column.addWidget(self.right_top)
+        self.right_column.addWidget(self.note_panel)
+        self.right_column.setStretchFactor(0, 1)  # mistakes take the slack
+        self.right_column.setStretchFactor(1, 0)  # note panel keeps its size
+        self.right_column.setSizes([460, 300])
         # keep the column as narrow as the fixed-width MistakeWidget
         self.right_column.setMinimumWidth(self.mistake_widget.minimumWidth())
         self.right_column.setMaximumWidth(self.mistake_widget.maximumWidth())
@@ -184,24 +194,33 @@ class Attune(QMainWindow):
             status_bar=self.status_bar,
             midi_synth=self.midi_synth,
             mistake_widget=self.mistake_widget,
+            note_panel=self.note_panel,
         )
         self.practice_tab.attach_timekeeping(
             wall_clock=self.wall_clock,
             slider=self.slider,
             status_bar=self.status_bar,
             midi_synth=self.midi_synth,
+            note_panel=self.note_panel,
         )
         # --- DIALOGS ---
-        self.settings_dialog = SettingsDialog()
         self.show()  # run the show :)
 
     def init_shortcuts(self):
-        """Window-level keyboard shortcuts."""
-        save_action = QAction(self)
-        save_action.setShortcut(QKeySequence.StandardKey.Save)
-        save_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        save_action.triggered.connect(self.save_active_recording)
-        self.addAction(save_action)
+        """Window-level keyboard shortcuts, dispatched to the active tab like the
+        transport buttons they stand in for."""
+        self._add_shortcut(QKeySequence.StandardKey.Save, self.save_active_recording)
+        # Space arms/stops recording from anywhere in the window. A text field
+        # being edited (renaming a take, the tuning box) takes the key back for
+        # itself — Qt offers it the shortcut first — so typing a space still works.
+        self._add_shortcut(QKeySequence(Qt.Key.Key_Space), self.toggle_recording)
+
+    def _add_shortcut(self, key, slot):
+        action = QAction(self)
+        action.setShortcut(key)
+        action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        action.triggered.connect(slot)
+        self.addAction(action)
 
     def init_slider_layout(self):
         """Initialize the shared transport row: play/pause, record, time label,
@@ -258,10 +277,8 @@ class Attune(QMainWindow):
         self.toolbar.audio_uploaded.connect(self.load_audio)
         self.toolbar.folder_uploaded.connect(self.load_folder)
         self.toolbar.save_recording_requested.connect(self.save_active_recording)
-        # show settings
-        self.toolbar.show_settings.connect(self.settings_dialog.show)
         # clip stuff
-        self.toolbar.clip_requested.connect(self.on_clip_requested)
+        self.toolbar.select_measures_requested.connect(self.on_select_measures)
         self.toolbar.clip_reset.connect(self.on_clip_reset)
         # the clip is GLOBAL: a clip set in one tab mirrors onto the other (note
         # indices are tab-independent, so the same clip means the same measures).
@@ -332,7 +349,7 @@ class Attune(QMainWindow):
     def load_folder(self, folderpath: str):
         """Scan a folder into the RecordingTree and load its first score."""
         folder = Path(folderpath)
-        if not self._folder_contains_score(folder):
+        if not self.recordings_tree.folder_contains_score(folder):
             QMessageBox.warning(
                 self,
                 "No scores found",
@@ -404,6 +421,7 @@ class Attune(QMainWindow):
         self.active_recording = None
         self.active_recording_name = None
         self.recordings.clear()
+        self.note_panel.set_recording(None)
 
         self.base_score_data = self._new_score_data_for_path(filepath)
         self.score_data = self.base_score_data
@@ -481,16 +499,6 @@ class Attune(QMainWindow):
 
         rec.pitch_detector.offline_thread = threading.Thread(target=worker, daemon=True)
         rec.pitch_detector.offline_thread.start()
-
-    def _folder_contains_score(self, folder: Path) -> bool:
-        try:
-            return any(
-                path.is_file() and path.suffix.lower() in self.recordings_tree.SCORE_EXTENSIONS
-                for path in folder.rglob("*")
-            )
-        except OSError as e:
-            print(f"Could not scan folder '{folder}': {e}")
-            return False
 
     def _reset_transport_position(self):
         """Start a freshly loaded score from its own beginning, not the previous
@@ -754,14 +762,9 @@ class Attune(QMainWindow):
 
     def update_time_label(self, t: float):
         """Update the shared time label (current/total) from time `t`."""
-        def format_time(seconds: float) -> str:
-            mins = int(seconds // 60)
-            secs = seconds % 60
-            return f"{mins:02}:{secs:04.1f}"
-
-        current_time_str = format_time(t)
-        total_time_str = format_time(self.slider.get_total_time())
-        self.time_label.setText(f"{current_time_str} / {total_time_str}")
+        current = Slider.format_time(t)
+        total = Slider.format_time(self.slider.get_total_time())
+        self.time_label.setText(f"{current} / {total}")
 
     def time_changed(self, t: float):
         """Shared wall-clock tick: refresh the time label, then drive the active
@@ -804,6 +807,7 @@ class Attune(QMainWindow):
             if self.base_score_data is not None:
                 self._activate_perform_score(self.base_score_data, reload_tab=True)
             self.status_bar.update_name("untitled_recording")
+            self.note_panel.set_recording(None)
             self.sync_slider()
             return
         if recording_name not in self.recordings.keys():
@@ -832,6 +836,7 @@ class Attune(QMainWindow):
         # also pass to Performance Tab
         self.perform_tab.set_active_recording(rec)
         self.practice_tab.sync_clip(rec.score_data.clip)
+        self.note_panel.set_recording(rec)
         self.sync_slider()
 
     def on_score_file_selected(self, score_path: str, recording_path):
@@ -1113,6 +1118,9 @@ class Attune(QMainWindow):
         # ...and the transpose anchor reflects that tab's score's first note
         self._sync_transpose_input()
 
+        # the note panel follows the new tab's recording (Practice keeps its own)
+        self.note_panel.set_recording(self._active_slider_recording())
+
         # preserve the current time, re-range for the new tab, clamp, and render.
         t = self.slider.get_time()
         self.sync_slider()
@@ -1121,9 +1129,10 @@ class Attune(QMainWindow):
         self._active_tab().render_at(t)
 
     # --- CLIP (measure-range focus) ---
-    def on_clip_requested(self):
-        """Clip menu 'Clip': clip the active tab to the measures it has selected."""
-        self._active_tab().apply_clip()
+    def on_select_measures(self):
+        """Clip menu 'Select measures': arm measure selection in the active tab
+        (the user then picks a start + end measure and right-clicks to clip)."""
+        self._active_tab().start_clip_selection()
 
     def on_clip_reset(self):
         """Clip menu 'Reset': restore the active tab's full score."""

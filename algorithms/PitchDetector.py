@@ -9,6 +9,7 @@ from tqdm import tqdm
 from app_logic.user.ds.PitchData import Pitch
 from app_logic.user.ds.Recording import Recording
 from algorithms.Config import Config
+from algorithms.CQT import CQT
 
 class PitchDetector(QObject):
 
@@ -52,6 +53,9 @@ class PitchDetector(QObject):
         self.stop_event = threading.Event()
         self._stream_volume_peak = 0.0
         self._last_volume_gate_stats: dict[str, float | int] = {}
+        self.cqt = CQT(self.config)
+        self._cqt_frame_index = 0
+        self._cqt_offline = False
 
         # block variable for stalling buffer
         self.block = False
@@ -71,12 +75,16 @@ class PitchDetector(QObject):
         self.HOP_SIZE = config.h1
         self._stream_volume_peak = 0.0
         self._last_volume_gate_stats = {}
+        self.cqt = CQT(config)
+        self._cqt_frame_index = 0
+        self._cqt_offline = False
 
     def run(self, start_time: float=None):
         """keep trying to detect pitches while we can"""
         self.stop()
         self.stop_event.clear()
         self._stream_volume_peak = 0.0
+        self._cqt_frame_index = 0
         self.recording.a2p_queue.init_start_time(start_time)
         self.pda_thread = threading.Thread(
             target=self._run, daemon=True
@@ -141,6 +149,10 @@ class PitchDetector(QObject):
             x: the array of audio to perform pitch detection on
             start_time: median time of frame (in sec)
         """
+        # Timbre must see the RAW frame (including silence), before centering,
+        # filtering, peak normalization, or the pitch detector's volume gate.
+        self._write_timbre_frame(x, start_time)
+
         unvoiced_pitch = Pitch(
             time=start_time, candidates=[],
             volume=0.0, unvoiced_prob=1.0,
@@ -197,7 +209,10 @@ class PitchDetector(QObject):
         Returns a nested list of pitches, each corresponding to the freq estimates (probabilistic)
         for each timestep
         """
+        self._cqt_frame_index = 0
+        self._cqt_offline = True
         if len(x) < self.FRAME_SIZE:
+            self._cqt_offline = False
             return []
 
         # get memory efficient frames with np pointer c++ magic
@@ -254,15 +269,18 @@ class PitchDetector(QObject):
                 mininterval=0.25,
             )
 
-        for i, frame in frames_iter:
-            start_time = (i * self.HOP_SIZE + 0.5 * self.FRAME_SIZE) / self.SR
-            pitch = self.detect_pitch(frame, start_time)
-            # offline detection has no live playhead, so detect_pitch's per-frame
-            # distance (to the score's *current* note at a fixed cursor) is
-            # meaningless here. Leave it None so detected-but-unanalyzed pitches
-            # render neutral grey until analyze() assigns alignment distances.
-            pitch.live_distance = None
-            pitches.append(pitch)
+        try:
+            for i, frame in frames_iter:
+                start_time = (i * self.HOP_SIZE + 0.5 * self.FRAME_SIZE) / self.SR
+                pitch = self.detect_pitch(frame, start_time)
+                # offline detection has no live playhead, so detect_pitch's per-frame
+                # distance (to the score's *current* note at a fixed cursor) is
+                # meaningless here. Leave it None so detected-but-unanalyzed pitches
+                # render neutral grey until analyze() assigns alignment distances.
+                pitch.live_distance = None
+                pitches.append(pitch)
+        finally:
+            self._cqt_offline = False
 
         if verbose:
             print(
@@ -271,6 +289,30 @@ class PitchDetector(QObject):
                 flush=True,
             )
         return pitches
+
+    def _write_timbre_frame(self, raw_frame: np.ndarray, start_time: float | None):
+        """Write every configured stride-th raw frame to TimbreData."""
+        local_frame_i = self._cqt_frame_index
+        self._cqt_frame_index += 1
+        stride = int(getattr(self.config, "cqt_stride", 0) or 0)
+        if self.recording is None or stride <= 0:
+            return
+        # Offline frames are a dense array beginning at frame zero. Live
+        # streams may begin at a nonzero clip time (and Practice may stall on
+        # one time), so address their global PitchData grid from the emitted
+        # app-time instead of pretending every run begins at column zero.
+        if self._cqt_offline or start_time is None:
+            frame_i = local_frame_i
+        else:
+            frame_i = max(0, self.recording.pitch_data.time_to_index(start_time))
+        if frame_i % stride:
+            return
+        td = getattr(self.recording, "timbre_data", None)
+        if td is None:
+            return
+        if td.computed_until == 0:
+            td.t_origin = self.recording.audio_data.t_origin
+        td.write(frame_i // stride, self.cqt.power_db(raw_frame))
 
     def _frame_volumes(self, audio: np.ndarray, n_frames: int) -> np.ndarray:
         if n_frames <= 0:
