@@ -71,6 +71,8 @@
             pitchFrames={session.analysisResult.pitch_data?.pitches}
             pitchTolerance={session.pitchTolerance}
             currentTime={playback.currentTime}
+            selectedMistake={session.selectedMistake}
+            selectedMistakeOverridden={session.selectedMistake ? session.overridden.has(session.overrideKey(session.selectedMistake)) : false}
           />
         {:else}
           <div class="overlay-placeholder">

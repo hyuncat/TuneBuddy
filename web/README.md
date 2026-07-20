@@ -1,53 +1,68 @@
-# Attune Web (prototype)
+# Attune Web
 
 A web deployment of Attune, scoped to **upload-only** for now (no live
 in-browser recording, no real-time Practice-mode gating — see project
 history for why). This reuses the existing Python analysis pipeline
 (`algorithms/`, `app_logic/`) unchanged via a thin FastAPI wrapper, and a
-Svelte frontend for rendering/UI.
+Svelte frontend that mirrors the desktop app's actual layout (toolbar, left
+sidebar, center score + pitch overlay, right mistake table, transport bar).
 
-**Current status**: early prototype. The pieces below are individually built
-and verified working, but not yet wired into one integrated app:
-- Backend `/analyze` endpoint: done, runs the real pipeline end-to-end.
-- Frontend score rendering (`ScoreViewer.svelte` + Verovio): done.
-- Not yet built: MIDI playback, the real upload UI, results display,
-  deployment.
+**Current status**: functionally complete for the upload → analyze →
+review workflow. Upload a score + recording, get real notation rendering,
+mistake detection with adjustable pitch/timing tolerance, a live per-frame
+pitch overlay, click-to-highlight mistakes (mirrors GuitarHero's
+highlight-and-pan behavior), MIDI playback of the score with
+instrument/metronome muting, and Range/Tuning controls that default to the
+score's own pitch span. Not yet done: deployment (still runs locally only),
+and a few toolbar stubs (Settings, Save, Clip) that are either dead ends in
+the desktop app itself (Settings) or real features not yet built (Save,
+Clip) — see inline comments in `Toolbar.svelte` for the current state of
+each.
 
 ## Running it
 
-This is **two separate processes in two separate terminals** — the backend
-and frontend don't talk to each other yet (that wiring is still-pending task
-#4), so right now you're running and checking each independently, not one
-connected app.
-
-**Terminal 1 — backend** (first time only: create the venv and install
-requirements; see "Running the backend" below for the full commands):
-
-```bash
-source venv/bin/activate
-uvicorn web.api.analyze_api:app --reload --app-dir .
-```
-
-- Health check: `http://localhost:8000/health`
-- Try `/analyze` without writing any code: open `http://localhost:8000/docs`
-  (FastAPI's auto-generated interactive form) and upload a score + audio file
-  through the browser — e.g. `resources/demo/scales/major/major.mxl` +
-  `resources/demo/scales/major/evan.wav`.
-
-**Terminal 2 — frontend** (first time only: `npm install` and
-`npm run sync-verovio`; see "Running the frontend" below):
+**One command, one terminal:**
 
 ```bash
 cd web
-npm run dev
+npm run dev:all
 ```
 
-- Open the URL it prints (port varies — Vite picks another one automatically
-  if 5173 is already taken on your machine).
-- Click "Load test score (ScoreViewer verification)" to confirm the score
-  viewer renders.
+This starts both the backend (`uvicorn`, port 8000) and frontend (`vite`,
+usually port 5173 but falls back automatically if that's taken) as a single
+process group, with output prefixed `[backend]`/`[frontend]` so the two
+stay visually distinct. `Ctrl+C` stops both cleanly.
 
-Full one-time setup for each is below.
+Open the URL the `[frontend]` lines print, upload a score
+(`resources/demo/scales/major/major.mxl` is a good one to start with) and a
+recording (`resources/demo/scales/major/ashwin.wav`), and click Analyze.
+
+First-time setup (skip if you've already done this once):
+
+```bash
+cd web
+npm install
+npm run sync-verovio   # copies resources/verovio -> web-resources/
+npm run sync-icons     # copies resources/icons -> web-resources/
+npm run sync-synth     # copies the MuseScore soundfont + js-synthesizer's WASM runtime -> web-resources/
+python3.14 -m venv ../venv           # if you don't already have one at the project root
+source ../venv/bin/activate
+pip install -r api/requirements.txt
+```
+
+**If you'd rather run the two processes separately** (e.g. to restart just
+the backend without touching the frontend, or to watch their logs in
+separate windows), that still works exactly as before:
+
+```bash
+# Terminal 1 — from the project root
+source venv/bin/activate
+uvicorn web.api.analyze_api:app --app-dir . --port 8000
+
+# Terminal 2
+cd web
+npm run dev
+```
 
 ## Prerequisites
 
@@ -63,37 +78,29 @@ Full one-time setup for each is below.
   though `pip install` succeeds; `.wav`/`.flac`/`.ogg`/`.aif`/`.aiff` don't
   need it (handled by `soundfile` directly).
 
-## Running the backend
+## Notes on setup
 
-Run from the **Attune project root** (not from `web/api/` — the app needs to
-import `algorithms/` and `app_logic/`, which live at the root):
+Run the backend from the **Attune project root** (not from `web/api/` —
+the app needs to import `algorithms/` and `app_logic/`, which live at the
+root); `npm run backend` (and therefore `npm run dev:all`) already handles
+this by `cd`-ing up a level before invoking `uvicorn`.
 
-```bash
-python3.14 -m venv venv
-source venv/bin/activate
-pip install -r web/api/requirements.txt
-uvicorn web.api.analyze_api:app --reload --app-dir .
-```
+Note on the `python3.14 -m venv` pin: `python -m venv` accepts multiple
+directory arguments and creates a venv in each one, so if you add anything
+after the target directory on that line — including a trailing `#`
+comment, if whatever runs the command doesn't treat `#` as a shell comment
+— it'll silently create extra venv-shaped folders named after each word.
+Keep that line exactly as written, with nothing appended.
 
-On Windows, activate with `venv\Scripts\activate` instead of the `source`
-line above.
+`python3.14` specifically, not a generic `python3` — that's the only
+version this has actually been installed and run against. The pinned
+versions in `requirements.txt` (scipy, PyQt6, etc.) haven't been verified
+against older 3.x interpreters, and a plain `python3` could silently
+resolve to something else on a machine with multiple Python versions
+installed. If you only have an older 3.x available, it may well work, but
+treat it as unverified rather than assumed-fine.
 
-Note on the `python3.14` pin: `python -m venv` accepts multiple directory
-arguments and creates a venv in each one, so if you add anything after
-`venv` on that line — including a trailing `#` comment, if whatever runs the
-command doesn't treat `#` as a shell comment — it'll silently create extra
-venv-shaped folders named after each word. Keep that line exactly as written,
-with nothing appended.
-
-`python3.14` specifically, not a generic `python3` — that's the only version
-this has actually been installed and run against. The pinned versions in
-`requirements.txt` (scipy, PyQt6, etc.) haven't been verified against older
-3.x interpreters, and a plain `python3` could silently resolve to something
-else on a machine with multiple Python versions installed. If you only have
-an older 3.x available, it may well work, but treat it as unverified rather
-than assumed-fine.
-
-Verify it's up:
+Verify the backend's up on its own:
 
 ```bash
 curl http://localhost:8000/health
@@ -103,77 +110,59 @@ curl http://localhost:8000/health
 One thing worth knowing if you look at `requirements.txt`: it includes
 `PyQt6`. That's not a mistake — `algorithms/PitchDetector.py` and
 `algorithms/NoteDetector.py` subclass `QObject` for Qt signals the desktop
-app uses, so importing them pulls in PyQt6 even though this API never touches
-any GUI code. It imports and runs fine headless, no display needed.
+app uses, so importing them pulls in PyQt6 even though this API never
+touches any GUI code. It imports and runs fine headless, no display
+needed. It is real dead weight for a deployed container, though (see task
+#6 in project notes) — worth trimming when this gets containerized.
 
 CORS is set to allow any `localhost`/`127.0.0.1` port (not a fixed one) —
-deliberately, since Vite's dev port isn't stable on every machine (see the
-frontend section). Dev-only; tighten this to the real deployed frontend
-origin before shipping.
+deliberately, since Vite's dev port isn't stable on every machine. Dev-only;
+tighten this to the real deployed frontend origin before shipping.
 
-## Running the frontend
-
-```bash
-cd web
-npm install
-npm run sync-verovio   # REQUIRED before first run - see below
-npm run dev
-```
-
-Then open the URL it prints. That port is **not guaranteed to be 5173** —
-Vite falls back to another port automatically if 5173 is already in use on
-your machine, and the backend's CORS setting (above) already accounts for
-that, so nothing further to configure either way.
-
-**`npm run sync-verovio` is not optional on a fresh checkout.** The Verovio
-viewer assets (`resources/verovio/` at the project root — the same files the
-desktop app's score viewer uses) get copied into `web/web-resources/verovio/`
-by this script, which Vite then serves. `web/web-resources/` is gitignored
-(generated, not committed), so skipping this step means the score viewer will
-404 trying to load `/verovio/viewer.html`. It's deliberately not run
-automatically on every `npm run dev` (see the comment in
-`web/scripts/sync-verovio.mjs` for why) — re-run it manually if
-`resources/verovio` ever changes upstream.
-
-## Quick smoke test
-
-**Backend**, from the project root, using the real demo fixtures (or use
-`http://localhost:8000/docs` instead if you'd rather do this through a
-browser form than `curl`):
-
-```bash
-curl -X POST http://localhost:8000/analyze \
-  -F "score=@resources/demo/scales/major/major.mxl" \
-  -F "audio=@resources/demo/scales/major/evan.wav"
-```
-
-Should return a JSON payload with `pitch_data`, `note_data`, and `alignment`
-sections populated (not empty).
-
-**Frontend**: with `npm run dev` running, open the printed URL, click "Load
-test score (ScoreViewer verification)". A treble clef with a single note
-should render inside the frame below the button, and its status label
-(bottom-left of the frame) should read "Ready". That button and the score it
-loads are temporary verification scaffolding in `App.svelte`, not real app
-content yet — it'll be replaced once the actual upload UI (task #4) exists.
+**`npm run sync-verovio` / `sync-icons` / `sync-synth` are not optional on
+a fresh checkout.** They copy assets from the project root
+(`resources/verovio`, `resources/icons`, `resources/MuseScore_General.sf3`
++ the js-synthesizer WASM runtime) into `web/web-resources/`, which Vite
+serves as static files. `web/web-resources/` is gitignored (generated, not
+committed), so skipping any of these means the corresponding feature 404s
+at runtime — the score viewer, the toolbar/mistake-table icons, or MIDI
+playback, respectively. None of the three run automatically on `npm run
+dev` — re-run them manually if the underlying files in `resources/` ever
+change.
 
 ## Layout
 
 ```
 web/
-├── api/                   # FastAPI backend (the /analyze endpoint)
-│   ├── analyze_api.py
+├── api/                      # FastAPI backend
+│   ├── analyze_api.py        # POST /analyze, /notedata, /realign
 │   └── requirements.txt
 ├── scripts/
-│   └── sync-verovio.mjs   # copies resources/verovio -> web-resources/verovio
+│   ├── sync-verovio.mjs      # resources/verovio -> web-resources/verovio
+│   ├── sync-icons.mjs        # resources/icons -> web-resources/icons
+│   └── sync-synth.mjs        # soundfont + js-synthesizer WASM -> web-resources/synth
 ├── src/
-│   ├── App.svelte         # currently just the ScoreViewer test harness
-│   ├── ScoreViewer.svelte
+│   ├── App.svelte            # top-level layout: toolbar/sidebar/center/results/transport
+│   ├── Toolbar.svelte        # Upload/Settings/Save/Clip/Playback/Tempo/Metronome
+│   ├── RecordingTree.svelte  # left sidebar: score + recording tree
+│   ├── SettingsPanel.svelte  # left sidebar: Instrument/Range/Tuning/Transpose
+│   ├── ScoreViewer.svelte    # Verovio notation iframe
+│   ├── NoteOverlay.svelte    # GuitarHero-equivalent pitch overlay
+│   ├── ResultsView.svelte    # mistake table + tolerance controls
+│   ├── TransportBar.svelte   # play/pause/seek/Analyze
+│   ├── StatusBar.svelte
+│   ├── sessionState.svelte.js  # shared reactive app state (upload, analysis, mistakes)
+│   ├── playback.svelte.js      # MIDI playback engine (js-synthesizer + SMF)
+│   ├── smf.js                  # builds a Standard MIDI File from note_data
+│   ├── mistakes.js             # client-side mistake classification + note-name<->MIDI/Hz
+│   ├── noteDataCache.js        # content-hash-keyed cache for /notedata responses
+│   ├── realign.js              # debounced /realign calls for pitch-tolerance changes
+│   ├── theme.css               # dark theme, extracted from qdarktheme's real stylesheet
 │   └── main.js
-├── web-resources/         # generated by sync-verovio, gitignored
-├── PitchDetector.js       # JS port of the real-time pitch detector - NOT
-│                           # used yet (deferred; only needed if/when live
-│                           # Practice-mode recording comes back)
+├── web-resources/            # generated by the sync-* scripts, gitignored
+├── JSPitchDetector.js        # JS port of the real-time pitch detector - NOT
+│                              # used yet (deferred; only needed if/when live
+│                              # Practice-mode recording comes back)
 ├── index.html
 ├── package.json
 └── vite.config.js

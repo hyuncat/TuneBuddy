@@ -24,6 +24,8 @@
     pitchTolerance,
     pitchFrames = null,
     currentTime = null,
+    selectedMistake = null,
+    selectedMistakeOverridden = false,
   } = $props();
 
   // --- GuitarHero.MidiBackground, ported exactly ---
@@ -189,6 +191,30 @@
     }
     return lines;
   });
+
+  // GuitarHero.highlight_mistake: one box per note involved in the selected
+  // mistake (substitution/timing: both user+score notes; insertion: user
+  // only; deletion: score only), each independently positioned - not a
+  // single bounding box merging them, since a substitution's user/score
+  // notes can land at different times/pitches.
+  const HIGHLIGHT_HEIGHT = BAR_HEIGHT * 2.5;
+  let highlightRects = $derived.by(() => {
+    if (!selectedMistake) return [];
+    const notes =
+      selectedMistake.type === "substitution"
+        ? [selectedMistake.userNote, selectedMistake.scoreNote]
+        : selectedMistake.type === "insertion"
+          ? [selectedMistake.userNote]
+          : selectedMistake.type === "deletion"
+            ? [selectedMistake.scoreNote]
+            : [selectedMistake.userNote, selectedMistake.scoreNote]; // timing
+    return notes.filter(Boolean).map((n) => ({
+      x: xPos(n.startTime),
+      width: Math.max(1.5, xPos(n.endTime) - xPos(n.startTime)),
+      y: yPos(topPitch(n)) - HIGHLIGHT_HEIGHT / 2,
+      height: HIGHLIGHT_HEIGHT,
+    }));
+  });
 </script>
 
 <svg viewBox="0 0 {WIDTH} {HEIGHT}" class="overlay" role="img" aria-label="Pitch overlay">
@@ -228,6 +254,10 @@
   {#if currentTime != null && currentTime >= minTime && currentTime <= maxTime}
     <line x1={xPos(currentTime)} y1="0" x2={xPos(currentTime)} y2={HEIGHT} class="playhead" />
   {/if}
+
+  {#each highlightRects as r}
+    <rect x={r.x} y={r.y} width={r.width} height={r.height} class="mistake-highlight" class:overridden={selectedMistakeOverridden} />
+  {/each}
 </svg>
 
 <p class="legend">
@@ -255,6 +285,18 @@
   .playhead {
     stroke: rgb(0, 255, 0);
     stroke-width: 1.5;
+  }
+  /* GuitarHero.highlight_bar: red normally, green if the mistake is
+     overridden - exact brush/pen values (255,80,80)/(80,255,80), alpha
+     130/255. Drawn last (highest z, above the playhead even). */
+  .mistake-highlight {
+    fill: rgba(255, 80, 80, 0.51);
+    stroke: rgb(255, 80, 80);
+    stroke-width: 2;
+  }
+  .mistake-highlight.overridden {
+    fill: rgba(80, 255, 80, 0.51);
+    stroke: rgb(80, 255, 80);
   }
   .user-note {
     opacity: 0.95;

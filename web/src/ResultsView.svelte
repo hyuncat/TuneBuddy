@@ -72,7 +72,12 @@
           {/if}
           {#each session.visibleMistakes as m, idx}
             {@const isOverridden = session.overridden.has(session.overrideKey(m))}
-            <tr class:overridden={isOverridden}>
+            {@const isSelected = session.selectedMistakeKey === session.overrideKey(m)}
+            <tr
+              class:overridden={isOverridden}
+              class:selected={isSelected}
+              onclick={() => session.selectMistake(m)}
+            >
               <td>{idx}</td>
               <td>{mistakeTime(m) != null ? formatTime(mistakeTime(m)) : "—"}</td>
               {#if session.mode === "pitch"}
@@ -234,6 +239,12 @@
     border-bottom: 1px solid var(--table-gridline);
     font-weight: 600;
   }
+  .mistake-table tbody tr {
+    cursor: pointer;
+  }
+  .mistake-table tbody tr:hover td {
+    background: var(--bg-item-hover);
+  }
   .mistake-table td {
     text-align: center;
     padding: 4px 6px;
@@ -267,5 +278,12 @@
   tr.overridden td {
     background: rgba(0, 0, 0, 0.45);
     color: var(--text-disabled);
+  }
+  /* QAbstractItemView::item:selected - matches RecordingTree's selection
+     color. Comes after .overridden so a selected+overridden row still
+     reads as selected. */
+  tr.selected td {
+    background: var(--bg-item-selected);
+    color: var(--text);
   }
 </style>

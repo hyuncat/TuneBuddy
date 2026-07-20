@@ -43,7 +43,14 @@ function createPlaybackState() {
   let context = null;
   let synth = null;
   let sfontId = null;
-  let audioEl = null;
+  // Created eagerly (not inside ensureInit) since a plain <audio> element
+  // doesn't need a user gesture to exist or load a src - only .play() does.
+  // It used to be created lazily in ensureInit(), which only runs on the
+  // first Play click; loadUserAudio() (called the moment a recording file
+  // is picked, well before that) would see audioEl still null and silently
+  // drop the file, leaving nothing for "User" playback to actually play.
+  let audioEl = new Audio();
+  audioEl.preload = "auto";
   let pollHandle = null;
 
   let currentNoteData = null;
@@ -84,32 +91,40 @@ function createPlaybackState() {
     return maxEnd;
   }
 
-  async function ensureInit() {
-    if (synth) return;
-    loading = true;
-    error = "";
-    try {
-      context = new AudioContext();
-      await context.audioWorklet.addModule(LIBFLUIDSYNTH_URL);
-      await context.audioWorklet.addModule(WORKLET_URL);
+  // Guards against a second concurrent call starting a duplicate WASM/
+  // soundfont load if it's triggered twice before the first finishes (e.g.
+  // loadNoteData's pre-warm firing again because the user swapped scores
+  // quickly) - `synth` alone can't guard this since it's only set once the
+  // whole async chain resolves, well after a second call could have
+  // already started.
+  let initPromise = null;
+  function ensureInit() {
+    if (synth) return Promise.resolve();
+    if (initPromise) return initPromise;
+    initPromise = (async () => {
+      loading = true;
+      error = "";
+      try {
+        context = new AudioContext();
+        await context.audioWorklet.addModule(LIBFLUIDSYNTH_URL);
+        await context.audioWorklet.addModule(WORKLET_URL);
 
-      synth = new AudioWorkletNodeSynthesizer();
-      synth.init(context.sampleRate);
-      const node = synth.createAudioNode(context);
-      node.connect(context.destination);
+        synth = new AudioWorkletNodeSynthesizer();
+        synth.init(context.sampleRate);
+        const node = synth.createAudioNode(context);
+        node.connect(context.destination);
 
-      const sfontBuffer = await (await fetch(SOUNDFONT_URL)).arrayBuffer();
-      sfontId = await synth.loadSFont(sfontBuffer);
+        const sfontBuffer = await (await fetch(SOUNDFONT_URL)).arrayBuffer();
+        sfontId = await synth.loadSFont(sfontBuffer);
 
-      audioEl = new Audio();
-      audioEl.preload = "auto";
-
-      ready = true;
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
-    } finally {
-      loading = false;
-    }
+        ready = true;
+      } catch (err) {
+        error = err instanceof Error ? err.message : String(err);
+      } finally {
+        loading = false;
+      }
+    })();
+    return initPromise;
   }
 
   // Rebuilds the SMF from noteData + current mute/metronome state and loads
@@ -160,7 +175,18 @@ function createPlaybackState() {
     currentMetronomeChannel = noteData?.metronome_channel ?? null;
     duration = computeDuration(noteData);
     lastLoadedKey = null;
-    if (synth) await reload();
+    if (synth) {
+      await reload();
+    } else {
+      // Fire off the WASM/soundfont load now instead of waiting for the
+      // first Play click - none of this actually produces sound (that's
+      // gated behind context.resume() in play(), which only runs from a
+      // real click), so it doesn't need a user gesture and can run in the
+      // background while the user is still picking a recording / reading
+      // the score. By the time they hit Play, this has often already
+      // finished, hiding the ~4s soundfont fetch+WASM-init cost entirely.
+      ensureInit();
+    }
   }
 
   function loadUserAudio(file) {

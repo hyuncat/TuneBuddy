@@ -40,10 +40,17 @@
     class="icon-btn"
     onclick={togglePlay}
     disabled={!canPlay}
-    title={playback.error || (playback.loading ? "Loading soundfont..." : "Play/pause")}
+    title={playback.error || (playback.loading ? "Loading audio engine + soundfont..." : "Play/pause")}
   >
-    <img src="{ICONS}/{playback.isPlaying ? 'pause' : 'play'}.png" alt={playback.isPlaying ? "Pause" : "Play"} />
+    {#if playback.loading}
+      <span class="spinner" aria-label="Loading"></span>
+    {:else}
+      <img src="{ICONS}/{playback.isPlaying ? 'pause' : 'play'}.png" alt={playback.isPlaying ? "Pause" : "Play"} />
+    {/if}
   </button>
+  {#if playback.loading}
+    <span class="loading-label">Loading audio engine…</span>
+  {/if}
   <button class="icon-btn" disabled title="Recording isn't supported in the web version (upload-only)">
     <img src="{ICONS}/record.png" alt="Record" />
   </button>
@@ -111,6 +118,25 @@
   }
   .icon-btn:disabled img {
     opacity: 0.5;
+  }
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--text-disabled);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .loading-label {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    white-space: nowrap;
   }
   .time-label {
     min-width: 100px;

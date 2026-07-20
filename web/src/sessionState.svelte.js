@@ -68,6 +68,14 @@ function createSessionState() {
   // onset AND duration timing mistake.
   let overridden = $state(new Set());
 
+  // Mirrors MistakeWidget.selected -> perform.on_mistake_selected ->
+  // GuitarHero.highlight_mistake: clicking a mistake row highlights its
+  // note(s) in the pitch overlay and moves the shared time cursor there
+  // (which also drags the score viewer along, via the same currentTime
+  // effect that drives it during playback). Keyed the same way as
+  // `overridden` for a stable identity across re-renders.
+  let selectedMistakeKey = $state(null);
+
   // Transient StatusBar message (mirrors app.py's StatusBar.status_label).
   let statusMessage = $state("");
 
@@ -170,6 +178,43 @@ function createSessionState() {
     if (next.has(key)) next.delete(key);
     else next.add(key);
     overridden = next;
+  }
+
+  let selectedMistake = $derived(
+    selectedMistakeKey ? visibleMistakes.find((m) => overrideKey(m) === selectedMistakeKey) ?? null : null
+  );
+
+  // GuitarHero.highlight_mistake mean-of-midpoints: mean of each involved
+  // note's own (start+end)/2, not the midpoint of a bounding box spanning
+  // all of them - matters when a substitution's user/score notes land at
+  // different times.
+  function mistakeMedianTime(m) {
+    const notes =
+      m.type === "substitution"
+        ? [m.userNote, m.scoreNote]
+        : m.type === "insertion"
+          ? [m.userNote]
+          : m.type === "deletion"
+            ? [m.scoreNote]
+            : [m.userNote, m.scoreNote]; // timing mistakes: both
+    const times = notes.filter(Boolean).map((n) => 0.5 * (n.startTime + n.endTime));
+    if (times.length === 0) return null;
+    return times.reduce((a, b) => a + b, 0) / times.length;
+  }
+
+  function selectMistake(m) {
+    const key = overrideKey(m);
+    if (selectedMistakeKey === key) {
+      selectedMistakeKey = null;
+      return;
+    }
+    selectedMistakeKey = key;
+    const t = mistakeMedianTime(m);
+    if (t != null) playback.seek(t);
+  }
+
+  function clearMistakeSelection() {
+    selectedMistakeKey = null;
   }
 
   async function pickScore(file) {
@@ -288,7 +333,13 @@ function createSessionState() {
     get pitchTolerance() { return pitchTolerance; },
     get timingTolerance() { return timingTolerance; },
     get mode() { return mode; },
-    set mode(v) { mode = v; },
+    // Repopulating the tree on a mode switch clears the selection in
+    // MistakeWidget.py too (its comment: "so GuitarHero drops its
+    // highlight via cleared").
+    set mode(v) {
+      mode = v;
+      selectedMistakeKey = null;
+    },
     get realigning() { return realigning; },
     get realignError() { return realignError; },
     get overridden() { return overridden; },
@@ -304,6 +355,8 @@ function createSessionState() {
     get highNoteName() { return highNoteName; },
     get tuning() { return tuning; },
     get rangeError() { return rangeError; },
+    get selectedMistake() { return selectedMistake; },
+    get selectedMistakeKey() { return selectedMistakeKey; },
 
     pickScore,
     pickAudio,
@@ -315,6 +368,8 @@ function createSessionState() {
     setTuning,
     overrideKey,
     toggleOverride,
+    selectMistake,
+    clearMistakeSelection,
   };
 }
 

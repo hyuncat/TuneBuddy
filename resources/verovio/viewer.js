@@ -255,6 +255,15 @@ function bindMeasureClicks() {
 
 // --- INIT VEROVIO TOOLKIT ---
 // (hangs until WASM is ready. sets toolkit -> tk.)
+// pendingLoadScore: window.loadScore can be called before the WASM runtime
+// finishes initializing (a real race, not just theoretical - a host that
+// calls loadScore as soon as the page/iframe itself has loaded, rather than
+// waiting for Verovio's OWN readiness, can easily lose this race since WASM
+// compile+instantiate takes noticeably longer than plain DOM load). This
+// used to just drop the call silently (setStatus("Verovio not ready") and
+// nothing else) with no retry - queue the most recent call instead and
+// flush it once the toolkit is actually ready.
+let pendingLoadScore = null;
 (function init() {
     // make sure verovio was imported from verovio-toolkit-wasm.js
     if (typeof verovio === "undefined" || !verovio.module) {
@@ -265,12 +274,17 @@ function bindMeasureClicks() {
     verovio.module.onRuntimeInitialized = () => {
         tk = new verovio.toolkit();
         setStatus("Ready");
+        if (pendingLoadScore !== null) {
+            const b64 = pendingLoadScore;
+            pendingLoadScore = null;
+            window.loadScore(b64);
+        }
     };
 })();
 
 // --- PUBLIC API (called from python) ---
 window.loadScore = function(b64) {
-    if (!tk) { setStatus("Verovio not ready"); return; }
+    if (!tk) { pendingLoadScore = b64; setStatus("Verovio not ready"); return; }
     try {
         setStatus("Loading score...");
         // lay the score out one system (line) per "page" so that paging
