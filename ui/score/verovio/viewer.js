@@ -86,6 +86,14 @@ let bridge = null;
     });
 })();
 
+// Same-origin (browser) host wiring: the web port's Svelte ScoreViewer isn't
+// Qt, so it has no qt.webChannelTransport for initBridge above to find. It
+// calls this instead, straight after the iframe loads, with a plain object
+// shaped like the Qt bridge ({noteClicked(sec), annotationClicked(sec)}).
+window.setBridge = function (obj) {
+    bridge = obj || null;
+};
+
 // --- HELPERS ---
 function setStatus(msg) {
     // the visible status box was dropped; keep the hook (and standalone runs) alive

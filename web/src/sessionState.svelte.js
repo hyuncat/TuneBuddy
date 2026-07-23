@@ -9,7 +9,7 @@
 // so a singleton is simpler than threading context through every component.
 import { getNoteData } from "./noteDataCache.js";
 import { realign, debounce } from "./realign.js";
-import { classifyPitchMistakes, classifyTimingMistakes, noteName, noteNameToMidi, midiToHz } from "./mistakes.js";
+import { classifyPitchMistakes, classifyTimingMistakes, noteName, noteNameToMidi, midiToHz, mistakeCategory } from "./mistakes.js";
 import { playback } from "./playback.svelte.js";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -30,6 +30,11 @@ function createSessionState() {
   let pitchTolerance = $state(0.5);
   let timingTolerance = $state(0.25);
   let mode = $state("pitch"); // "pitch" | "timing" - mirrors MistakeWidget's mode dropdown
+
+  // ScoreViewer's own "Colors:" dropdown (perform.py's score_color_mode) -
+  // independent of `mode` above (MistakeWidget's table can show pitch rows
+  // while the score itself is colored by timing, and vice versa).
+  let scoreColorMode = $state("pitch"); // "pitch" | "timing" | "volume"
 
   // Range/Tuning (SettingsWidget) - these bound the server-side PYIN pitch
   // detector's search range (Config.fmin/fmax) and reference pitch
@@ -169,8 +174,13 @@ function createSessionState() {
     })
   );
 
+  // Keyed by the MISTAKE's own category, not the currently active mode tab -
+  // ResultsView only ever toggles mistakes matching the active tab so this is
+  // no different there, but the ScoreViewer annotation payload (annotations.js)
+  // combines pitch AND timing mistakes at once regardless of which tab is
+  // showing, and needs each one's override state checked correctly either way.
   function overrideKey(m) {
-    return `${mode}:${m.pairIndex}:${m.type}`;
+    return `${mistakeCategory(m.type)}:${m.pairIndex}:${m.type}`;
   }
   function toggleOverride(m) {
     const key = overrideKey(m);
@@ -340,6 +350,8 @@ function createSessionState() {
       mode = v;
       selectedMistakeKey = null;
     },
+    get scoreColorMode() { return scoreColorMode; },
+    set scoreColorMode(v) { scoreColorMode = v; },
     get realigning() { return realigning; },
     get realignError() { return realignError; },
     get overridden() { return overridden; },

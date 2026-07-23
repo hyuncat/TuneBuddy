@@ -1,16 +1,45 @@
 <script>
-  // Mirrors ui/ScoreViewer.py: owns the Verovio iframe, tracks readiness, and
-  // exposes the same JS-API wrapper methods Python calls via runJavaScript
+  // Mirrors ui/score/ScoreViewer.py: owns the Verovio iframe, tracks readiness,
+  // and exposes the same JS-API wrapper methods Python calls via runJavaScript
   // (window.loadScore, window.timeChanged, window.getMeasureTimemap,
   // window.getClipSelection, window.clearClipSelection, window.setClipRange,
-  // window.clearClipRange - see resources/verovio/viewer.js). Same-origin
+  // window.clearClipRange, window.setMistakeAnnotations,
+  // window.setAnnotationColorMode - see ui/score/verovio/viewer.js). Same-origin
   // iframe, so these are direct synchronous calls instead of Python's
-  // runJavaScript(..., callback) dance.
+  // runJavaScript(..., callback) dance. Note clicks push the other way (JS ->
+  // host) via window.setBridge, since there's no QWebChannel outside Qt.
+  // onNoteClicked/onAnnotationClicked: mirrors ScoreViewer.py's note_clicked/
+  // annotation_clicked signals (perform.py's on_note_clicked/on_annotation_clicked) -
+  // called with a time in seconds when a note or mistake annotation is clicked
+  // in the score. Wired to the iframe's window.bridge via the ported viewer.js's
+  // window.setBridge() (see ui/score/verovio/viewer.js), since a same-origin
+  // iframe has no QWebChannel to push through.
+  let { onNoteClicked = null, onAnnotationClicked = null } = $props();
+
+  // Mirrors ui/Colors.py's score_theme(): the --score-<role> custom
+  // properties viewer.css's mistake/insertion-marker rules read (see
+  // "!important" fill/stroke rules keyed on .mistake-<role>). Python computes
+  // these from MISTAKE_RGB/CURRENT_RGB (SCORE_DIM = 0.9, dimmed except
+  // 'current'); ported as a static constant here rather than recomputing,
+  // since this app has no theme switcher to make that dynamic yet.
+  const SCORE_THEME = {
+    substitution: "rgb(212, 130, 0)",
+    insertion: "rgb(198, 30, 0)",
+    timing: "rgb(198, 30, 0)",
+    deletion: "rgb(198, 30, 0)",
+    current: "rgb(0, 110, 154)",
+  };
+
   let ready = $state(false);
   let iframeEl;
 
   function handleLoad() {
     ready = true;
+    iframeEl.contentWindow.setThemeColors?.(SCORE_THEME);
+    iframeEl.contentWindow.setBridge?.({
+      noteClicked: (sec) => onNoteClicked?.(sec),
+      annotationClicked: (sec) => onAnnotationClicked?.(sec),
+    });
   }
 
   function callIframe(fnName, ...args) {
@@ -43,6 +72,17 @@
 
   export function setPlaybackTime(sec) {
     callIframe("timeChanged", sec);
+  }
+
+  // Mirrors ScoreViewer.py's set_mistake_annotations/set_annotation_color_mode:
+  // annotations is the {notes, insertions, noteMeta, volumes} shape built by
+  // web/src/annotations.js's buildAnnotations().
+  export function setMistakeAnnotations(annotations) {
+    callIframe("setMistakeAnnotations", annotations);
+  }
+
+  export function setAnnotationColorMode(mode) {
+    callIframe("setAnnotationColorMode", mode);
   }
 
   export function getMeasureTimemap() {

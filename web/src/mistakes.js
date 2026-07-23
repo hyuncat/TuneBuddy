@@ -111,6 +111,17 @@ export function classifyTimingMistakes(pairs, userNotes, scoreNotes, timingToler
   return mistakes;
 }
 
+// A mistake's own category, independent of whichever tab (pitch/timing) is
+// currently active in ResultsView - insertion/deletion/substitution are
+// pitch mistakes, early/late/long/short are timing ones. Needed anywhere a
+// mistake is looked at outside that active-tab context (e.g. the ScoreViewer
+// annotation payload combines both lists at once - see annotations.js).
+export function mistakeCategory(type) {
+  return type === "early" || type === "late" || type === "long" || type === "short"
+    ? "timing"
+    : "pitch";
+}
+
 // Mirrors Config.get_note_name(): converts a MIDI number to a letter name
 // like "C4"/"F#5". Rests/invalid pitches (null or negative) render as "—".
 const SHARP_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];

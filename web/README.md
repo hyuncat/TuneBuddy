@@ -10,14 +10,28 @@ sidebar, center score + pitch overlay, right mistake table, transport bar).
 **Current status**: functionally complete for the upload → analyze →
 review workflow. Upload a score + recording, get real notation rendering,
 mistake detection with adjustable pitch/timing tolerance, a live per-frame
-pitch overlay, click-to-highlight mistakes (mirrors GuitarHero's
-highlight-and-pan behavior), MIDI playback of the score with
-instrument/metronome muting, and Range/Tuning controls that default to the
-score's own pitch span. Not yet done: deployment (still runs locally only),
-and a few toolbar stubs (Settings, Save, Clip) that are either dead ends in
-the desktop app itself (Settings) or real features not yet built (Save,
-Clip) — see inline comments in `Toolbar.svelte` for the current state of
-each.
+pitch overlay, MIDI playback of the score with instrument/metronome muting,
+and Range/Tuning controls that default to the score's own pitch span.
+Mistakes are reachable from all three of the desktop app's interaction
+surfaces: the mistake table (click-to-highlight, mirrors GuitarHero's
+highlight-and-pan behavior), colored inline annotations directly on the
+rendered score (click a note/insertion marker for a popup - see
+`annotations.js`, ported from `ui/score/ScoreAnnotations.py`), and clicking a
+user note in the pitch overlay itself (a GuitarHero-style popup with
+pitch/cents/onset/duration/volume - see `NoteOverlay.svelte`, ported from
+`ui/guitarhero/GuitarHero.py`'s `select_note`). Pitch, timing, and volume are
+all wired up: a "Colors:" dropdown next to the score switches its annotation
+color mode (mirrors `perform.py`'s `score_color_mode`), and GuitarHero's own
+pitch/volume dot-coloring toggle is ported too (`colors.js` has the viridis
+ramp + take-relative volume math, ported from `ui/Colors.py` +
+`PitchData.mean_volume`/`volume_range_db`). Vibrato is the one NoteInfo field
+still unported (shows "—" - no vibrato detection client-side yet). Not yet
+done: deployment (still runs locally only), a proper ScoreTimeMap port (score clicks before
+any analysis has run use Verovio's own rendered timeline as a best-effort
+approximation - see `onNoteClicked` in `App.svelte`), and a few toolbar stubs
+(Settings, Save, Clip) that are either dead ends in the desktop app itself
+(Settings) or real features not yet built (Save, Clip) — see inline comments
+in `Toolbar.svelte` for the current state of each.
 
 ## Running it
 
@@ -138,7 +152,7 @@ web/
 │   ├── analyze_api.py        # POST /analyze, /notedata, /realign
 │   └── requirements.txt
 ├── scripts/
-│   ├── sync-verovio.mjs      # resources/verovio -> web-resources/verovio
+│   ├── sync-verovio.mjs      # ui/score/verovio -> web-resources/verovio
 │   ├── sync-icons.mjs        # resources/icons -> web-resources/icons
 │   └── sync-synth.mjs        # soundfont + js-synthesizer WASM -> web-resources/synth
 ├── src/
@@ -155,6 +169,9 @@ web/
 │   ├── playback.svelte.js      # MIDI playback engine (js-synthesizer + SMF)
 │   ├── smf.js                  # builds a Standard MIDI File from note_data
 │   ├── mistakes.js             # client-side mistake classification + note-name<->MIDI/Hz
+│   ├── annotations.js          # client-side port of ScoreAnnotations.py - builds the
+│   │                            # score-note-indexed mistake payload ScoreViewer's iframe renders
+│   ├── colors.js                # viridis ramp + volume math, ported from ui/Colors.py + PitchData
 │   ├── noteDataCache.js        # content-hash-keyed cache for /notedata responses
 │   ├── realign.js              # debounced /realign calls for pitch-tolerance changes
 │   ├── theme.css               # dark theme, extracted from qdarktheme's real stylesheet
