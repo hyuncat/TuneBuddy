@@ -52,22 +52,20 @@ Re-runs *only* the pitch-alignment step at a new tolerance, given note
 data the client already has (from `/analyze` or `/notedata`) — no
 re-upload of audio, no re-running pitch/note detection.
 
-**Why call back into Python instead of porting the DP to JS:** pitch
-tolerance isn't a post-hoc filter on a fixed alignment — it's baked into
-`MistakeDetector._substitution_cost`'s cost matrix, so changing it can
-change *which* notes pair with which, not just relabel a fixed pairing.
-A hand-ported JS version risks silently diverging from what the desktop
-app would actually produce. Calling the real
-`MistakeDetector.detect_pitch_mistakes()` (the same `onset_aware=False`
-path `Recording.detect_mistakes()` uses by default) makes that
-divergence impossible by construction.
+**Why call back into Python instead of porting the DP to JS:** the production
+pairs come from weighted absolute pitch/onset/duration string editing, while
+pitch tolerance classifies those fixed diagonal pairs as matches or
+substitutions. Calling the real
+`MistakeDetector.detect_mistakes()` (the same symbolic score-time-aware path
+`Recording.detect_mistakes()` uses) makes that divergence impossible by
+construction.
 
 **Scope is deliberately narrow — pitch only.** We can actually
 realign timing mistakes without having to go through all the same call
 structures, but pitch requires much deeper system calls.
 
 **Kept separate from `/analyze`, not merged.** Considered folding
-`/realign`'s logic into `/analyze` itself (e.g. giving `_align` a
+`/realign`'s logic into `/analyze` itself (e.g. giving `string_edit` a
 tolerance parameter it could be called with directly) — reverted that
 attempt (see `git log` around `algorithms/MistakeDetector.py`) once it
 became clear the actual ask was de-duplicating logic *within*

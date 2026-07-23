@@ -120,14 +120,6 @@ class PitchBenchmarker:
             unv_thresh=PYIN_DEFAULT_UNV_THRESH,
             min_volume=PYIN_DEFAULT_MIN_VOLUME,
             max_volume=PYIN_DEFAULT_MAX_VOLUME,
-            pitch_thresh=0.5,
-            # PELT jump: 5 in the benchmark for parity with the other note-detection
-            # methods (the app keeps Config's default of 1).
-            h2=5,
-            ins_cost=5,
-            del_cost=5,
-            pitch_tolerance=1,
-            timing_tolerance=0.05,
         )
 
     def config_for(self, fmin: float, fmax: float, **overrides: Any) -> Config:

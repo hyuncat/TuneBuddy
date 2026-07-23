@@ -32,9 +32,10 @@ class PitchDetector(QObject):
 
         # --- pitch config variables ---
         # ensure max lag is big enough to detect lowest f0 (largest period)
-        # defaults to violin min
-        padded_fmin = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmin) - 0.5)
-        padded_fmax = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmax) + 0.5)
+        # defaults to score's min/max pitch range, can be overridden
+        self.PADDING = 2.0 # whole step padding
+        padded_fmin = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmin) - self.PADDING)
+        padded_fmax = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmax) + self.PADDING)
         self.tau_max = int(self.config.sr / padded_fmin)
         self.tau_min = int(self.config.sr / padded_fmax)
 
@@ -65,8 +66,8 @@ class PitchDetector(QObject):
         """re-initialize the tuning parameters"""
         self.config = config
         self.SR = config.sr
-        padded_fmin = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmin) - 0.5)
-        padded_fmax = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmax) + 0.5)
+        padded_fmin = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmin) - self.PADDING)
+        padded_fmax = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmax) + self.PADDING)
         self.tau_max = int(self.SR / padded_fmin)
         self.tau_min = int(self.SR / padded_fmax)
 

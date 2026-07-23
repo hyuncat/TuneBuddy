@@ -42,7 +42,7 @@ function pitchDistance(userNote, scoreNote) {
 // Classifies each pair as a deletion (score note never played), insertion
 // (extra user note), or substitution (paired but too far in pitch); a clean
 // match produces no entry. Mirrors the classification half of
-// MistakeDetector._align()'s traceback - note the >= boundary (a distance
+// MistakeDetector.build_mistakes() - note the >= boundary (a distance
 // exactly AT tolerance counts as a mistake), matching the Python original.
 export function classifyPitchMistakes(pairs, userNotes, scoreNotes, pitchTolerance) {
   const mistakes = [];
@@ -67,8 +67,8 @@ export function classifyPitchMistakes(pairs, userNotes, scoreNotes, pitchToleran
 }
 
 // Derives early/late/short/long timing mistakes from the same fixed pairs -
-// a pure threshold check, no alignment involved. Mirrors
-// MistakeDetector.detect_timing_mistakes() exactly, including its strict >
+// a pure threshold check, no alignment involved. Mirrors the Python alignment
+// builder exactly, including its strict >
 // boundary (distinct from the pitch check's >= above - preserved as-is from
 // the Python original, not an inconsistency I introduced). A single pair can
 // produce up to two mistakes (onset AND duration), independently.

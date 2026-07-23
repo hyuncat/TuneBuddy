@@ -63,7 +63,7 @@ class Alignment:
             self.pairs_1, self.pairs_2 = {}, {}
             self.times_1, self.times_2 = [], []
             self.match_user, self.match_score = {}, {}
-        self.THRESH = self.config.pitch_tolerance # same as MistakeDetector.TOLERANCE
+        self.THRESH = self.config.pitch_tolerance
         self.reindex_mistakes()
 
     @property

@@ -1,11 +1,9 @@
 // Calls POST /realign to re-run pitch-mistake alignment at a new tolerance,
 // reusing the real algorithms/MistakeDetector.py rather than a JS port.
-// Pitch tolerance is baked into the alignment's own DP cost matrix (not just
-// a post-hoc filter on fixed pairs), so a tolerance change can genuinely
-// change which notes pair with which - a hand-ported version risks silently
-// diverging from what the desktop app would produce. Timing-mistake
-// reclassification doesn't need this: it's a simple fixed-pairs threshold
-// check, so that stays purely client-side against /analyze's existing pairs.
+// The DP pairing uses weighted pitch/onset/duration costs; pitch tolerance then
+// classifies its diagonal operations as correct or substituted. Calling Python
+// keeps those pairs identical to the desktop app. Timing reclassification stays
+// client-side because it is a fixed-pairs threshold check.
 export async function realign(userNotes, scoreNotes, pitchTolerance, apiBaseUrl) {
   const response = await fetch(`${apiBaseUrl}/realign`, {
     method: "POST",

@@ -46,17 +46,21 @@ NOTE_CACHE_VERSION: int = 1
 def _cpd_note_methods() -> dict[str, NoteMethodConfig]:
     """Change-point-detection note families.
 
-    The current production row calls ``Recording.detect_notes()`` directly. The
-    other change-point methods keep the benchmark adapter path so their ruptures
-    variants remain comparable. Kernel-CPD kernels map through ruptures' cost
-    name: linear<-l2, gaussian<-rbf, cosine. ``dynp`` needs a target segment
-    count, which it takes from the score (a real input in-app), so it is the one
-    score-informed / "oracle" row.
+    Every change-point method goes through the benchmark adapter so the rows
+    differ ONLY in the search/cost model. Kernel-CPD kernels map through
+    ruptures' cost name: linear<-l2, gaussian<-rbf, cosine. ``dynp`` needs a
+    target segment count, which it takes from the score (a real input in-app),
+    so it is the one score-informed / "oracle" row.
+
+    ``pelt-l2`` used to carry ``current_notedetector=True`` (route to production
+    ``Recording.detect_notes()``). That row stopped measuring PELT once the
+    production detector became KernelCPD — it silently duplicated
+    kernelcpd-linear, and it was the only row skipping the transition
+    post-pass, so it was never comparable to the rest anyway.
     """
     bases: list[tuple[str, NoteMethodConfig]] = [
         ("pelt-l1", dict(method="ruptures", ruptures_algorithm="pelt", model="l1")),
-        ("pelt-l2", dict(method="ruptures", ruptures_algorithm="pelt", model="l2",
-                         current_notedetector=True)),
+        ("pelt-l2", dict(method="ruptures", ruptures_algorithm="pelt", model="l2")),
         ("pelt-rbf", dict(method="ruptures", ruptures_algorithm="pelt", model="rbf")),
         ("dynp", dict(method="ruptures", ruptures_algorithm="dynp", model="l2",
                       oracle_note_count=True)),
@@ -72,9 +76,8 @@ def _cpd_note_methods() -> dict[str, NoteMethodConfig]:
         config = dict(base_config)
         config.setdefault("current_notedetector", False)
         config.update(
-            exclude_transitions=True,
-            refined_with_onsets=False,
-            postprocess_transitions=True,
+            exclude_transitions=False,
+            postprocess_transitions=False,
             benchmark_group="cpd",
             base_method=label,
         )
@@ -89,18 +92,8 @@ def _moreover_note_methods() -> dict[str, NoteMethodConfig]:
     scored as-is: the transition re-median / prune post-pass is deliberately NOT
     applied (per spec, only the CPD families get it)."""
     return {
-        "onset-only": dict(
-            method="onset_only",
-            exclude_transitions=False,
-            refined_with_onsets=False,
-            postprocess_transitions=False,
-            uses_onsets=True,
-            benchmark_group="moreover",
-            base_method="onset-only",
-        ),
         "basic-pitch": dict(
             method="basic_pitch",
-            refined_with_onsets=False,
             postprocess_transitions=False,
             external_baseline=True,
             benchmark_group="moreover",
@@ -108,7 +101,6 @@ def _moreover_note_methods() -> dict[str, NoteMethodConfig]:
         ),
         "tony": dict(
             method="tony_pyin",
-            refined_with_onsets=False,
             postprocess_transitions=False,
             external_baseline=True,
             benchmark_group="moreover",
@@ -116,7 +108,6 @@ def _moreover_note_methods() -> dict[str, NoteMethodConfig]:
         ),
         "crepe-notes": dict(
             method="crepe_notes",
-            refined_with_onsets=False,
             postprocess_transitions=False,
             external_baseline=True,
             uses_onsets=True,
@@ -155,7 +146,6 @@ class NoteBenchmarker(PitchBenchmarker):
     OPTIONAL_NOTE_METHODS: ClassVar[dict[str, NoteMethodConfig]] = {
         "mt3": dict(
             method="mt3",
-            refined_with_onsets=False,
             external_baseline=True,
             benchmark_group="external",
             base_method="mt3",
@@ -201,8 +191,6 @@ class NoteBenchmarker(PitchBenchmarker):
         recording: Recording, method: str = "pelt",
         model: str = "l2", do_transitions: bool = True,
         jump: int | None = None,
-        refine_with_onsets: bool | None = None,
-        onset_data=None,
         **kwargs: Any,
     ) -> NoteData:
         method_config = dict(kwargs)
@@ -215,13 +203,7 @@ class NoteBenchmarker(PitchBenchmarker):
             method_config.setdefault("exclude_transitions", bool(do_transitions))
         if jump is not None:
             method_config.setdefault("jump", jump)
-        if refine_with_onsets is not None:
-            method_config["refined_with_onsets"] = bool(refine_with_onsets)
-
-        notes = BenchmarkNoteDetector(recording).detect(
-            onset_data=onset_data,
-            **method_config,
-        )
+        notes = BenchmarkNoteDetector(recording).detect(**method_config)
         recording.note_data = notes
         return notes
 
@@ -229,7 +211,7 @@ class NoteBenchmarker(PitchBenchmarker):
     def prepare_for_note_detection(
         recording: Recording, 
         resize_score_to_pitch: bool=True,
-        detect_transitions: bool=True,
+        detect_transitions: bool=False,
     ) -> Recording:
         if detect_transitions:
             recording.transition_detector.detect_transitions(recording.pitch_data.data)
@@ -259,8 +241,6 @@ class NoteBenchmarker(PitchBenchmarker):
         self, recording: Recording, method: str="pelt", 
         model: str="l2", do_transitions: bool=True,
         jump: int | None = None,
-        refine_with_onsets: bool | None = None,
-        onset_data=None,
         **kwargs: Any,
     ) -> tuple[NoteData, float]:
         start = time.perf_counter()
@@ -270,8 +250,6 @@ class NoteBenchmarker(PitchBenchmarker):
             model=model,
             do_transitions=do_transitions,
             jump=jump,
-            refine_with_onsets=refine_with_onsets,
-            onset_data=onset_data,
             **kwargs,
         )
         return notes, time.perf_counter() - start
@@ -279,10 +257,9 @@ class NoteBenchmarker(PitchBenchmarker):
     def analyze_recording(
         self, recording: Recording,  method: str="pelt",
         model: str="l2", truncate: bool=False,
-        refine_with_onsets: bool | None = None,
         **_unused,
     ) -> dict[str, float]:
-        del method, model, refine_with_onsets
+        del method, model
         recording.reset_analysis()
         _, note_compute_time = self.detect_recording_notes_timed(recording)
         if truncate:
@@ -332,10 +309,10 @@ class NoteBenchmarker(PitchBenchmarker):
         if not det_voiced or not ref_voiced:
             return
         det_voiced[0].start_time = det_voiced[0].end_time - (
-            ref_voiced[0].end_time - ref_voiced[0].start_time
+            ref_voiced[0].duration()
         )
         det_voiced[-1].end_time = det_voiced[-1].start_time + (
-            ref_voiced[-1].end_time - ref_voiced[-1].start_time
+            ref_voiced[-1].duration()
         )
         # the first note's start_time (its dict key) changed -> re-key the whole
         # NoteData so the sorted-times index stays in sync.
@@ -359,11 +336,22 @@ class NoteBenchmarker(PitchBenchmarker):
         }
 
     @staticmethod
-    def _note_from_payload(payload: dict[str, Any]) -> Note:
+    def _compatible_note_end_time(
+        payload: dict[str, Any],
+        start_time: float,
+    ) -> float:
+        """Accept both current end-time and legacy duration-only caches."""
+        if payload.get("end_time") is not None:
+            return float(payload["end_time"])
+        return start_time + max(0.0, float(payload.get("duration", 0.0)))
+
+    @classmethod
+    def _note_from_payload(cls, payload: dict[str, Any]) -> Note:
+        start_time = float(payload["start_time"])
         return Note(
             i=int(payload["id"]),
-            start_time=float(payload["start_time"]),
-            end_time=float(payload["end_time"]),
+            start_time=start_time,
+            end_time=cls._compatible_note_end_time(payload, start_time),
             midi_num=[float(m) for m in payload["midi_num"]],
             velocity=payload.get("velocity"),
             instrument=payload.get("instrument"),
@@ -459,32 +447,18 @@ class NoteBenchmarker(PitchBenchmarker):
         method = cls._normalized_method_name(method_config)
         return bool(
             method_config.get("uses_onsets", False)
-            or method_config.get("refined_with_onsets", False)
-            or method_config.get("refine_with_onsets", False)
-            or method in {"crepe_notes", "onset_only", "onset_pitch_hybrid"}
-        )
-
-    @classmethod
-    def _method_needs_attune_onsets(cls, method_config: NoteMethodConfig) -> bool:
-        method = cls._normalized_method_name(method_config)
-        return bool(
-            method_config.get("uses_attune_onsets", False)
-            or method_config.get("refined_with_onsets", False)
-            or method_config.get("refine_with_onsets", False)
-            or method in {"onset_only", "onset_pitch_hybrid"}
+            or method == "crepe_notes"
         )
 
     @classmethod
     def _method_needs_audio(cls, method_config: NoteMethodConfig) -> bool:
-        """True when a method reads the raw waveform (external transcribers) or the
-        spectral onsets derived from it. Pure change-point methods run on the
-        cached pitch track alone, so their recordings can skip the audio load."""
+        """True when a method reads the raw waveform. Pure change-point methods
+        run on the cached pitch track alone, so their recordings skip audio."""
         method = cls._normalized_method_name(method_config)
         return bool(
             method_config.get("current_notedetector", False)
             or method_config.get("external_baseline", False)
-            or cls._method_uses_onsets(method_config)
-            or method in {"basic_pitch", "tony_pyin", "crepe_notes", "onset_only", "onset_pitch_hybrid"}
+            or method in {"basic_pitch", "tony_pyin", "crepe_notes"}
         )
 
     @classmethod
@@ -497,14 +471,13 @@ class NoteBenchmarker(PitchBenchmarker):
             "external_baseline",
             "postprocess_transitions",
             "uses_onsets",
-            "uses_attune_onsets",
+            "refined_with_onsets",
+            "refine_with_onsets",
         ):
             config.pop(key, None)
         config["method"] = cls._normalized_method_name(config)
         if config["method"] == "ruptures":
             config.setdefault("ruptures_algorithm", "pelt")
-        config["refined_with_onsets"] = False
-        config.pop("refine_with_onsets", None)
         return config
 
     @staticmethod
@@ -528,7 +501,6 @@ class NoteBenchmarker(PitchBenchmarker):
         payload = {
             key: cls._jsonable_method_value(value)
             for key, value in sorted(base.items())
-            if key != "onset_data"
         }
         return json.dumps(payload, sort_keys=True)
 
@@ -550,12 +522,9 @@ class NoteBenchmarker(PitchBenchmarker):
             ),
             "ruptures_model": method_config.get("model"),
             "ruptures_cost": method_config.get("cost", method_config.get("model")),
-            "refined_with_onsets": bool(
-                method_config.get(
-                    "refined_with_onsets",
-                    method_config.get("refine_with_onsets", False),
-                )
-            ),
+            # Kept as an always-false compatibility column for older result
+            # notebooks; Attune onset refinement is no longer a live method.
+            "refined_with_onsets": False,
             "transition_excluding": (
                 bool(method_config.get("exclude_transitions"))
                 if "exclude_transitions" in method_config
@@ -573,7 +542,6 @@ class NoteBenchmarker(PitchBenchmarker):
         recording: Recording,
         method_config: NoteMethodConfig,
         method_cache: dict[str, tuple[NoteData, float]],
-        onset_data=None,
     ) -> tuple[NoteData, dict[str, float]]:
         cache_key = self._method_cache_key(method_config)
         if bool(method_config.get("current_notedetector", False)):
@@ -595,26 +563,12 @@ class NoteBenchmarker(PitchBenchmarker):
             base_config = self._base_detection_config(method_config)
             base_notes, base_time = self.detect_notes_timed(
                 recording,
-                onset_data=onset_data,
                 **base_config,
             )
             method_cache[cache_key] = (clone_note_data(base_notes), base_time)
 
         base_notes, base_time = method_cache[cache_key]
         notes = clone_note_data(base_notes)
-        refinement_time = 0.0
-        if bool(
-            method_config.get(
-                "refined_with_onsets",
-                method_config.get("refine_with_onsets", False),
-            )
-        ):
-            start = time.perf_counter()
-            notes = BenchmarkNoteDetector(recording).refine_with_onsets(
-                notes,
-                onset_data=onset_data,
-            )
-            refinement_time = time.perf_counter() - start
 
         # Production cleanup (perform.py::analyze): re-median each note over its
         # non-transition frames, then drop phantom slide notes. Applied to the
@@ -628,9 +582,9 @@ class NoteBenchmarker(PitchBenchmarker):
         recording.note_data = notes
         return notes, {
             "base_note_compute_time": base_time,
-            "onset_refinement_compute_time": refinement_time,
+            "onset_refinement_compute_time": 0.0,
             "transition_postprocess_compute_time": postprocess_time,
-            "note_compute_time": base_time + refinement_time + postprocess_time,
+            "note_compute_time": base_time + postprocess_time,
         }
 
     @staticmethod
@@ -818,7 +772,7 @@ class NoteBenchmarker(PitchBenchmarker):
         self.prepare_for_note_detection(
             recording,
             resize_score_to_pitch=(align == "resize"),
-            detect_transitions=True,
+            detect_transitions=False,
         )
         ref_iv, ref_pi = self.notedata_to_intervals(
             recording.score_data.clipped_note_data(channel=recording.active_instrument),
@@ -851,16 +805,10 @@ class NoteBenchmarker(PitchBenchmarker):
             needs_audio=self._method_needs_audio(method_config),
         )
         row_meta = self._method_row_metadata(method_label, method_config)
-        onset_data = None
-        onset_time = 0.0
-        if self._method_needs_attune_onsets(method_config):
-            start = time.perf_counter()
-            onset_data = BenchmarkNoteDetector(recording)._onset_data()
-            onset_time = time.perf_counter() - start
 
         try:
             notes, note_timing = self._detect_notes_for_method(
-                recording, method_config, method_cache={}, onset_data=onset_data,
+                recording, method_config, method_cache={},
             )
         except Exception as exc:  # noqa: BLE001 -- isolate a bad method/track
             return {
@@ -869,7 +817,7 @@ class NoteBenchmarker(PitchBenchmarker):
                 "Average Overlap Ratio": np.nan,
                 "Estimated Notes": 0, "Reference Notes": int(len(ref_iv)),
                 **self._timing_columns(float("nan"), audio_seconds),
-                "onset_compute_time": onset_time,
+                "onset_compute_time": 0.0,
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
@@ -898,7 +846,7 @@ class NoteBenchmarker(PitchBenchmarker):
             "Estimated Notes": int(len(est_iv)),
             "Reference Notes": int(len(ref_iv)),
             **self._timing_columns(note_compute_time, audio_seconds),
-            "onset_compute_time": onset_time,
+            "onset_compute_time": 0.0,
             "error": None,
         }
 
@@ -907,7 +855,6 @@ class NoteBenchmarker(PitchBenchmarker):
         methods: dict[str, NoteMethodConfig]=None,
         align: str="identity", latency_align: bool=True,
         trim_boundaries: bool=True, write_note_cache: bool=True,
-        refine_with_onsets: bool=False,
         progress: bool=False,
     ) -> dict[str, Any]:
         """Benchmark note detection on one synthesized etude.
@@ -932,7 +879,7 @@ class NoteBenchmarker(PitchBenchmarker):
         effective_onset_tolerance = (
             self.onset_tolerance if onset_tolerance is None else onset_tolerance
         )
-        effective_methods = self._effective_note_methods(methods, refine_with_onsets)
+        effective_methods = self._effective_note_methods(methods)
         # create the Recording with the prereq data from the etude MIDI
         midi_path = Path(midi_path)
         score_data = OneInstrumentScoreData(midi_path)
@@ -958,7 +905,7 @@ class NoteBenchmarker(PitchBenchmarker):
         self.prepare_for_note_detection(
             recording,
             resize_score_to_pitch=(align == "resize"),
-            detect_transitions=True,
+            detect_transitions=False,
         )
 
         def read_reference():
@@ -973,18 +920,6 @@ class NoteBenchmarker(PitchBenchmarker):
         reference_intervals, reference_pitches = read_reference()
         out: dict[str, Any] = {"_reference_notes": len(reference_intervals)}
         method_cache: dict[str, tuple[NoteData, float]] = {}
-        shared_onset_data = None
-        shared_onset_time = 0.0
-
-        def method_onsets(method_config: NoteMethodConfig):
-            nonlocal shared_onset_data, shared_onset_time
-            if not self._method_needs_attune_onsets(method_config):
-                return None
-            if shared_onset_data is None:
-                start = time.perf_counter()
-                shared_onset_data = BenchmarkNoteDetector(recording)._onset_data()
-                shared_onset_time = time.perf_counter() - start
-            return shared_onset_data
 
         for label, method_config in effective_methods.items():
             method_start = time.perf_counter()
@@ -994,19 +929,17 @@ class NoteBenchmarker(PitchBenchmarker):
                 **self._method_row_metadata(label, method_config),
                 **pitch_timing,
             }
-            onset_data = method_onsets(method_config)
             try:
                 notes, note_timing = self._detect_notes_for_method(
                     recording,
                     method_config,
                     method_cache=method_cache,
-                    onset_data=onset_data,
                 )
             except Exception as exc:  # noqa: BLE001 -- keep one baseline from killing a run
                 out[label] = {
                     **row_base,
                     **self._failed_method_row(exc),
-                    "onset_compute_time": shared_onset_time if onset_data is not None else 0.0,
+                    "onset_compute_time": 0.0,
                 }
                 if progress:
                     print(
@@ -1056,7 +989,7 @@ class NoteBenchmarker(PitchBenchmarker):
                     "F-measure": 0.0,
                     "Average Overlap Ratio": 0.0,
                     "Estimated Notes": 0,
-                    "onset_compute_time": shared_onset_time if onset_data is not None else 0.0,
+                    "onset_compute_time": 0.0,
                     **note_timing,
                     "error": None,
                 }
@@ -1106,7 +1039,7 @@ class NoteBenchmarker(PitchBenchmarker):
                 "F-measure": f_measure,
                 "Average Overlap Ratio": average_overlap_ratio,
                 "Estimated Notes": len(est_iv),
-                "onset_compute_time": shared_onset_time if onset_data is not None else 0.0,
+                "onset_compute_time": 0.0,
                 **note_timing,
                 "error": None,
             }
@@ -1124,7 +1057,6 @@ class NoteBenchmarker(PitchBenchmarker):
         max_tracks: int | None = None,
         onset_tolerance: float | None = None,
         methods: dict[str, NoteMethodConfig] = None,
-        refine_with_onsets: bool = False,
         align: str = "identity",
         latency_align: bool = True,
         trim_boundaries: bool = True,
@@ -1134,7 +1066,7 @@ class NoteBenchmarker(PitchBenchmarker):
     ) -> pd.DataFrame:
         import pandas as pd
 
-        effective_methods = self._effective_note_methods(methods, refine_with_onsets)
+        effective_methods = self._effective_note_methods(methods)
         tracks = self._limit(list(self.iter_etudes(dataset)), max_tracks)
         rows = []
         for i, (title, midi_path) in enumerate(tracks):
@@ -1142,7 +1074,6 @@ class NoteBenchmarker(PitchBenchmarker):
                 midi_path,
                 onset_tolerance=onset_tolerance,
                 methods=effective_methods,
-                refine_with_onsets=False,
                 align=align,
                 latency_align=latency_align,
                 trim_boundaries=trim_boundaries,
@@ -1169,32 +1100,14 @@ class NoteBenchmarker(PitchBenchmarker):
             self.write_dataset_result(df, "note", dataset, index=False)
         return df
 
-    @staticmethod
-    def _methods_refine_with_onsets(methods: dict[str, NoteMethodConfig]) -> bool:
-        return any(
-            bool(
-                method_config.get(
-                    "refined_with_onsets",
-                    method_config.get("refine_with_onsets", False),
-                )
-            )
-            for method_config in methods.values()
-        )
-
     def _effective_note_methods(
         self,
         methods: dict[str, NoteMethodConfig] | None,
-        refine_with_onsets: bool,
     ) -> dict[str, NoteMethodConfig]:
-        effective = {
+        return {
             label: dict(method_config)
             for label, method_config in (methods or self.NOTE_METHODS).items()
         }
-        if refine_with_onsets and methods is not None:
-            for method_config in effective.values():
-                method_config["refined_with_onsets"] = True
-                method_config.pop("refine_with_onsets", None)
-        return effective
 
 
 class OneInstrumentScoreData(ScoreData):

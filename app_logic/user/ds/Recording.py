@@ -36,7 +36,6 @@ class Recording:
         from algorithms.PitchDetector import PitchDetector
         from algorithms.PitchSmoother import PitchSmoother
         from algorithms.NoteDetector import NoteDetector, TransitionDetector
-        from app_logic.user.ds.OnsetData import OnsetDetector, OnsetData
         from algorithms.MistakeDetector import MistakeDetector
         from algorithms.MistakeChecker import MistakeChecker
         from algorithms.VibratoDetector import VibratoDetector
@@ -55,8 +54,6 @@ class Recording:
         self.vibrato_data = VibratoData(config=self.config)
         self.timbre_data = TimbreData(config=self.config)
         self.note_data = NoteData()
-        self.onset_data = OnsetData(config=self.config)
-        self.onset_detector = OnsetDetector(recording=self)
         self.alignment: Alignment = Alignment(config=self.config) # filled in later
         self.overridden_mistake_indices = set()
 
@@ -93,10 +90,6 @@ class Recording:
             self.pitch_smoother.update_config(self.config)
         if hasattr(self, 'note_detector'):
             self.note_detector.update_config(self.config)
-        if hasattr(self, 'onset_detector') and self.onset_detector is not None:
-            self.onset_detector.update_config(self.config)
-        if hasattr(self, 'onset_data') and self.onset_data is not None:
-            self.onset_data.config = self.config
         if hasattr(self, 'mistake_detector'):
             self.mistake_detector.update_config(self.config)
         if hasattr(self, 'mistake_checker'):
@@ -216,7 +209,6 @@ class Recording:
     def reset_analysis(self):
         """Re-init analysis-derived data structures. Called before re-analyze() in app."""
         self.note_data = NoteData()
-        self.onset_data = None
         self.alignment = Alignment(config=self.config)
         self.overridden_mistake_indices = set()
 
@@ -293,32 +285,25 @@ class Recording:
 
         return stop
 
-    def update_min_note_length(self):
-        """Sync Config to the resized score so the detector's frame thresholds track tempo."""
+    def update_min_note_length(self) -> float:
+        """Sync score-derived segment thresholds to the current score timeline."""
         notes = self.score_data.clipped_note_data(channel=self.active_instrument)
         self.config.set_min_note_length(
             notes.get_min_note_length(default=self.config.get_min_note_length(), clean=True)
         )
+        return self.config.min_note_length
 
-    def detect_notes(self, use_transitions=False):
-        """Run PELT note detection on the current pitch data."""
-        if use_transitions:
-            self.transition_detector.detect_transitions(self.pitch_data.data)
-        else:
-            # Transition flags are derived analysis and are persisted with pitch
-            # frames. Do not let flags from an older cached run affect a pipeline
-            # that explicitly disabled transition-based segmentation.
-            self.transition_detector.clear_transitions(self.pitch_data.data)
+    def detect_notes(self):
+        """Run the fixed frame-dense linear-KernelCPD production detector."""
+        # Transition flags are legacy/benchmark-derived data persisted with pitch
+        # frames. Production segmentation never uses them, and clearing them also
+        # keeps downstream vibrato/coloring independent of a stale cached run.
+        self.transition_detector.clear_transitions(self.pitch_data.data)
         # resize to the stable pitch span so score-derived note-length heuristics
-        # use a tempo close to the take before PELT runs.
+        # use a tempo close to the take before segmentation runs.
         self.resize_score(to_span="pitch", include_transitions=False)
         self.update_min_note_length()
-        self.onset_data = self.onset_detector.detect()
-        if use_transitions:    
-            self.transition_detector.detect_transitions(self.pitch_data.data)
-        # PELT is the only initial note-boundary generator. Spectral onsets are
-        # retained in onset_data for MistakeChecker, which may use one to repair
-        # a score-note deletion, but they never create speculative notes here.
+        # Voicing gaps and change points are the only initial boundary sources.
         self.note_data = self.note_detector.detect_notes(self.pitch_data.data)
         # Replace the provisional whole-track/live vibrato pass. Detected note
         # spans are hard boundaries even when transition-based note segmentation
@@ -335,50 +320,19 @@ class Recording:
         return self.vibrato_data
 
 
-    def recompute_note_pitches(self, verbose: bool = False):
-        """Re-median detected notes over non-transition frames."""
-        self.note_detector.recompute_note_pitches(
-            self.note_data,
-            self.pitch_data,
-            verbose=verbose,
-        )
-
-    def prune_transition_notes(self, verbose: bool = False):
-        """Drop detected notes that are mostly transition frames."""
-        pass # prune_transition_notes was deleted
-        self.note_data = self.note_detector.prune_transition_notes(
-            self.note_data,
-            self.pitch_data,
-            verbose=verbose,
-        )
-
-    def detect_mistakes(self, onset_aware: bool = False, verbose: bool = False):
+    def detect_mistakes(self, verbose: bool = False):
         # The MistakeDetector only ever sees the clip's score notes (the full
         # NoteData when unclipped) — see ScoreData.clipped_note_data.
-        # onset_aware swaps in the time-anchored aligner (A/B against pitch-only).
         user_notes = self.note_data
-        midi_notes = self.score_data.clipped_note_data(channel=self.active_instrument)
-        detect = (
-            self.mistake_detector.detect_pitch_mistakes_onset_aware
-            if onset_aware
-            else self.mistake_detector.detect_pitch_mistakes
+        score_notes = self.score_data.clipped_note_data(
+            channel=self.active_instrument
         )
-        notes, mistakes = detect(
-            user_string=user_notes,
-            midi_string=midi_notes,
+        self.alignment = self.mistake_detector.detect_mistakes(
+            user_notes=user_notes,
+            score_notes=score_notes,
             verbose=verbose,
         )
-        self.alignment.load_alignment(notes, pitch_mistakes=mistakes)
         self.alignment.reapply_overrides(self.overridden_mistake_indices)
-
-    def correct_mistakes(self, verbose: bool = False):
-        nd, alignment = self.mistake_checker.check_mistakes(
-            recording=self,
-            verbose=verbose,
-        )
-        self.note_data = nd
-        self.alignment = alignment
-        self.reindex_mistakes()
 
     def reindex_mistakes(self):
         """Refresh mistake -> alignment-pair indices after note correction
@@ -525,6 +479,9 @@ class Recording:
         # off the take's even when the spans were measured perfectly.
         new_bpm = max(1.0, sd.bpm * score_span / target_span)
         sd.change_tempo(new_bpm)
+        # change_tempo rebuilds score notes, so refresh every score-derived
+        # segmentation threshold before any subsequent detection/correction.
+        self.update_min_note_length()
 
         score_bounds = sd.get_bounds(
             channel=self.active_instrument,
@@ -545,12 +502,16 @@ class Recording:
         return True
 
     def resize_score_to_aligned_onsets(self, respect_clip: bool = True) -> bool:
-        """Fit tempo from user onsets actually paired with score notes.
+        """Robustly fit the score timeline from pitch-consistent matched onsets.
 
-        Unlike ``resize_score(to_span="onset")``, insertion fragments at either
-        edge cannot become the fit endpoints.  Prefer exact matches for the
-        first/last clipped score notes; when an endpoint was deleted, fall back
-        to the outermost two matched score notes and fit that shared sub-span.
+        A first/last-onset fit gives either endpoint complete control over the
+        tempo.  That is especially damaging when a release or vibrato fragment
+        is aligned to the final score note.  Instead, use matches whose played
+        pitch agrees with the score, estimate the timeline scale from the median
+        slope between every pair of those anchors (a Theil-Sen fit), then use
+        the median anchor offset for translation.  A small number of bad edge
+        matches can therefore remain local alignment errors rather than moving
+        the entire score.
         """
         if self.alignment is None or not self.alignment.pairs:
             return False
@@ -577,37 +538,103 @@ class Recording:
             return False
 
         matches.sort(key=lambda pair: pair[1].start_time)
-        by_score_id = {score_note.id: (user_note, score_note)
-                       for user_note, score_note in matches}
-        first_score = score_notes.read_note(i=0)
-        last_score = score_notes.read_note(i=len(score_notes.times) - 1)
-        first_pair = by_score_id.get(first_score.id, matches[0])
-        last_pair = by_score_id.get(last_score.id, matches[-1])
-        first_user, first_matched_score = first_pair
-        last_user, last_matched_score = last_pair
 
-        user_span = last_user.start_time - first_user.start_time
-        score_span = last_matched_score.start_time - first_matched_score.start_time
-        if user_span <= 0 or score_span <= 0:
+        # Substitutions should not decide where the score timeline lands.
+        anchors = [
+            (user_note, score_note)
+            for user_note, score_note in matches
+            if abs(user_note.midi_num[0] - score_note.midi_num[0])
+            < self.config.pitch_tolerance
+        ]
+        if len(anchors) < 2:
+            return False
+
+        slopes = []
+        for i, (left_user, left_score) in enumerate(anchors[:-1]):
+            for right_user, right_score in anchors[i + 1:]:
+                score_span = right_score.start_time - left_score.start_time
+                user_span = right_user.start_time - left_user.start_time
+                if score_span > 0 and user_span > 0:
+                    slopes.append(user_span / score_span)
+        if not slopes:
+            return False
+
+        time_scale = float(np.median(slopes))
+        if not np.isfinite(time_scale) or time_scale <= 0:
             return False
 
         sd = self.score_data
-        sd.change_tempo(max(1.0, sd.bpm * score_span / user_span))
+        sd.change_tempo(max(1.0, sd.bpm / time_scale))
+        # Stabilization can resize the score once per outer correction loop.
+        # Each rebuilt timeline must drive the next KernelCPD minimum length.
+        self.update_min_note_length()
 
-        # change_tempo rebuilds score Note objects. Resolve the anchor by its
-        # stable id, then land that score onset on the fixed user timeline.
+        # change_tempo rebuilds score Note objects. Resolve every anchor by its
+        # stable id and translate by the median residual, not by one endpoint.
         current_notes = sd.note_datas.get(self.active_instrument)
         current_by_id = current_notes.notes_by_id() if current_notes else {}
-        current_first = current_by_id.get(first_matched_score.id)
-        if current_first is None:
+        offsets = [
+            user_note.start_time - current_by_id[score_note.id].start_time
+            for user_note, score_note in anchors
+            if score_note.id in current_by_id
+        ]
+        if not offsets:
             return False
-        sd.transpose(dx=first_user.start_time - current_first.start_time)
+        sd.transpose(dx=float(np.median(offsets)))
         self._update_pitch_distances()
         return True
+
+    def stabilize_score_alignment(self, verbose: bool = False) -> None:
+        """Converge score-time fitting, string editing, and boundary correction.
+
+        The raw first/last detected onsets can include an insertion or miss a
+        deletion, biasing the provisional tempo fit. Once an alignment exists,
+        refit from matched note onsets, then re-run the same time-aware edit and
+        correction algorithms on that corrected timeline. Repeat only while the
+        note boundaries or pairing structure change; a seen-state guard prevents
+        oscillation without introducing another tuning parameter.
+        """
+        def state() -> tuple:
+            note_state = tuple(
+                (
+                    note.id,
+                    note.start_time,
+                    note.end_time,
+                    tuple(note.midi_num),
+                )
+                for note in self.note_data.data.values()
+            )
+            pair_state = tuple(
+                (
+                    user_note.id if user_note is not None else None,
+                    score_note.id if score_note is not None else None,
+                )
+                for user_note, score_note in self.alignment.pairs
+            )
+            return note_state, pair_state
+
+        seen = set()
+        while True:
+            before = state()
+            if before in seen:
+                return
+            seen.add(before)
+
+            # Keep the provisional timeline when there are too few reliable
+            # pitch anchors. Repeating the raw endpoint fit here would restore
+            # the exact edge sensitivity this stabilization pass avoids.
+            self.resize_score_to_aligned_onsets()
+            self.detect_mistakes(verbose=verbose)
+            self.mistake_checker.check_mistakes(verbose=verbose)
+
+            after = state()
+            if after == before:
+                return
 
     def change_tempo(self, new_bpm: float):
         """Change the tempo of the recording by changing the BPM of the score data, which will automatically update the note timings and pitch distances."""
         self.score_data.change_tempo(new_bpm)
+        self.update_min_note_length()
         self._update_pitch_distances()
 
     def _update_pitch_distances(self):

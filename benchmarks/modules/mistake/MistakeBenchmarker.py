@@ -34,6 +34,7 @@ from benchmarks.modules.pitch.PitchBenchmarker import PathLike, PitchBenchmarker
 
 MistakeMode: TypeAlias = Literal["symbolic", "audio"]
 MistakeCounts: TypeAlias = dict[str, tuple[int, int, int]]
+_SOURCE_SCORE_ID_UNSET = object()
 
 
 class MistakeScore(TypedDict, total=False):
@@ -272,12 +273,10 @@ class MistakeBenchmarker(NoteBenchmarker):
         method: str = "pelt",
         model: str = "l2",
         do_correction: bool = False,
-        detect_timing: bool = True,
         update_distances: bool = True,
         truncate: bool = False,
         note_cache_path: PathLike | None = None,
         trim_reference: NoteData | None = None,
-        onset_aware: bool = True,
     ) -> dict[str, float]:
         recording.reset_analysis()
         if note_cache_path is not None and Path(note_cache_path).exists():
@@ -311,21 +310,14 @@ class MistakeBenchmarker(NoteBenchmarker):
             recording.resize_score(to_span="note")
 
         mistake_start = time.perf_counter()
-        recording.detect_mistakes(onset_aware=onset_aware)
-        if detect_timing:
-            recording.mistake_detector.detect_timing_mistakes()
+        recording.detect_mistakes()
         mistake_detection_compute_time = time.perf_counter() - mistake_start
 
         mistake_check_compute_time = 0.0
         if do_correction:
             check_start = time.perf_counter()
-            recording.mistake_checker.mistake_correction_loop()
-            recording.reindex_mistakes()
+            recording.mistake_checker.check_mistakes()
             mistake_check_compute_time = time.perf_counter() - check_start
-            if detect_timing:
-                timing_start = time.perf_counter()
-                recording.mistake_detector.detect_timing_mistakes()
-                mistake_detection_compute_time += time.perf_counter() - timing_start
 
         if update_distances:
             recording.update_alignment_distances()
@@ -346,7 +338,6 @@ class MistakeBenchmarker(NoteBenchmarker):
         mode: MistakeMode = "symbolic",
         max_sec: float | None = None,
         correct_symbolic: bool = False,
-        onset_aware: bool = True,
         canonical: bool = True,
     ) -> pd.DataFrame:
         return self.aggregate(
@@ -357,7 +348,6 @@ class MistakeBenchmarker(NoteBenchmarker):
                 mode,
                 max_sec,
                 correct_symbolic,
-                onset_aware,
                 canonical,
             ),
             canonical=canonical,
@@ -372,7 +362,6 @@ class MistakeBenchmarker(NoteBenchmarker):
         max_tracks: int | None = None,
         max_sec: float | None = None,
         correct_symbolic: bool = False,
-        onset_aware: bool = True,
         canonical: bool = True,
         verbose: bool = True,
         write: bool = False,
@@ -387,7 +376,6 @@ class MistakeBenchmarker(NoteBenchmarker):
                 mode,
                 max_sec,
                 correct_symbolic,
-                onset_aware,
                 canonical,
             )
             if verbose:
@@ -455,7 +443,6 @@ class MistakeBenchmarker(NoteBenchmarker):
         mode: MistakeMode,
         max_sec: float | None,
         correct_symbolic: bool = False,
-        onset_aware: bool = True,
         canonical: bool = True,
     ) -> list[MistakeScore]:
         midi_path = Path(midi_path)
@@ -474,17 +461,20 @@ class MistakeBenchmarker(NoteBenchmarker):
                 )
                 recording.note_data = performance_notes
                 mistake_detection_start = time.perf_counter()
-                recording.detect_mistakes(onset_aware=onset_aware)
+                recording.detect_mistakes()
                 mistake_detection_compute_time = time.perf_counter() - mistake_detection_start
                 mistake_check_compute_time = 0.0
                 if correct_symbolic:
                     mistake_start = time.perf_counter()
-                    recording.mistake_checker.mistake_correction_loop()
-                    recording.reindex_mistakes()
+                    recording.mistake_checker.check_mistakes()
                     mistake_check_compute_time = time.perf_counter() - mistake_start
-                # PolyTune labels no timing mistakes, so the symbolic benchmark
-                # scores pitch mistakes (substitution/deletion/insertion) only.
-                detected_mistakes = recording.alignment.pitch_mistakes
+                has_duration_truth = any(
+                    event["type"] in {"short", "long"} for event in truth
+                )
+                detected_mistakes = [
+                    *recording.alignment.pitch_mistakes,
+                    *(recording.alignment.timing_mistakes if has_duration_truth else []),
+                ]
                 scores.append(
                     MistakeScore(
                         counts=self.score_symbolic(
@@ -540,12 +530,13 @@ class MistakeBenchmarker(NoteBenchmarker):
                     smooth=True,
                     write_cache=True,
                 )
+                has_duration_truth = any(
+                    event["type"] in {"short", "long"} for event in truth
+                )
                 analyze_timing = self.analyze_recording(
                     recording,
                     note_cache_path=paths["note_data"],
                     trim_reference=performance_notes,
-                    detect_timing=False,
-                    onset_aware=onset_aware,
                 )
                 self.write_truth_data(
                     paths["truth"],
@@ -563,7 +554,10 @@ class MistakeBenchmarker(NoteBenchmarker):
                         )
                     },
                 )
-                detected_mistakes = recording.alignment.pitch_mistakes
+                detected_mistakes = [
+                    *recording.alignment.pitch_mistakes,
+                    *(recording.alignment.timing_mistakes if has_duration_truth else []),
+                ]
                 scores.append(
                     MistakeScore(
                         counts=self.score_onset(
@@ -661,7 +655,7 @@ class MistakeBenchmarker(NoteBenchmarker):
         pairs: Sequence[tuple[Note | None, Note | None]] | None = None,
         canonical: bool = True,
     ) -> MistakeCounts:
-        """Score substitution/deletion/insertion (+correct) for the symbolic bench.
+        """Score pitch edits plus explicit short/long duration mistakes.
 
         `canonical` maps substitution losslessly onto PolyTune's missed/extra space:
         a wrong note is the intended score note MISSED (a deletion) plus the played
@@ -734,8 +728,24 @@ class MistakeBenchmarker(NoteBenchmarker):
             sorted(insertion_truth_times),
             onset_tolerance,
         )
-        # No early/late/short/long: PolyTune treats timing/duration jitter as
-        # unlabeled realism, so there is no timing truth to score against.
+        for duration_type in ("short", "long"):
+            truth_ids = {
+                event["score_note_id"]
+                for event in truth
+                if event["type"] == duration_type
+            }
+            detected_ids = {
+                mistake.midi_note.id
+                for mistake in mistakes
+                if mistake.type == duration_type and mistake.midi_note is not None
+            }
+            if truth_ids or detected_ids:
+                tp = len(truth_ids & detected_ids)
+                counts_by_type[duration_type] = (
+                    tp,
+                    len(detected_ids) - tp,
+                    len(truth_ids) - tp,
+                )
         if pairs is not None:
             counts_by_type["correct"] = cls.score_correct_alignment(
                 pairs,
@@ -794,6 +804,15 @@ class MistakeBenchmarker(NoteBenchmarker):
         counts_by_type["insertion"] = cls._match_onsets(
             insertion_detected, insertion_truth, onset_tolerance
         )
+        for duration_type in ("short", "long"):
+            duration_truth = truth_times(duration_type)
+            duration_detected = detected_times(duration_type, "user_note")
+            if duration_truth or duration_detected:
+                counts_by_type[duration_type] = cls._match_onsets(
+                    duration_detected,
+                    duration_truth,
+                    onset_tolerance,
+                )
         if pairs is not None:
             counts_by_type["correct"] = cls.score_correct_alignment(
                 pairs,
@@ -806,11 +825,21 @@ class MistakeBenchmarker(NoteBenchmarker):
     def aggregate(scores: Sequence[MistakeScore], canonical: bool = True) -> pd.DataFrame:
         import pandas as pd
 
-        mistake_types = ("substitution", "deletion", "insertion")
+        pitch_types = ("substitution", "deletion", "insertion")
+        duration_types = tuple(
+            mistake_type
+            for mistake_type in ("short", "long")
+            if any(mistake_type in score["counts"] for score in scores)
+        )
+        mistake_types = (*pitch_types, *duration_types)
         # Under canonical scoring substitution is already folded into deletion
         # (missed) + insertion (extra), so it is reported as an informational row
         # but excluded from OVERALL to avoid double-counting.
-        overall_types = ("deletion", "insertion") if canonical else mistake_types
+        overall_types = (
+            ("deletion", "insertion", *duration_types)
+            if canonical
+            else mistake_types
+        )
         include_correct = any("correct" in score["counts"] for score in scores)
         row_types = (*mistake_types, "correct") if include_correct else mistake_types
         aggregate_counts = {mistake_type: [0, 0, 0] for mistake_type in row_types}

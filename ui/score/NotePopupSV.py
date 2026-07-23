@@ -67,11 +67,11 @@ class NotePopupSV:
                 "rows": [
                     {
                         "label": "Target duration",
-                        "value": cls._seconds(cls._duration(mistake.midi_note)),
+                        "value": cls._seconds(mistake.midi_note.duration()),
                     },
                     {
                         "label": "Played duration",
-                        "value": cls._seconds(cls._duration(mistake.user_note)),
+                        "value": cls._seconds(mistake.user_note.duration()),
                     },
                 ],
             }
@@ -84,10 +84,6 @@ class NotePopupSV:
             return None
         midi = note.midi_num[0]
         return None if midi is None or midi < 0 else float(midi)
-
-    @staticmethod
-    def _duration(note) -> float:
-        return max(0.0, float(note.end_time - note.start_time)) if note is not None else 0.0
 
     @staticmethod
     def _seconds(value: float) -> str:

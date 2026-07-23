@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox
 from PyQt6.QtGui import QCursor
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 import pyqtgraph as pg
 import qdarktheme
 
@@ -86,6 +86,15 @@ class GuitarHero(QWidget):
         self.init_objects()
         self.init_view()
         self.init_legend()
+
+        # Live pitch signals are independent of the 30 Hz transport. Coalesce
+        # their ~344 Hz stream into display-rate redraws so a detected pitch is
+        # visible on the next frame without rebuilding the plot hundreds of
+        # times per second.
+        self._live_pitch_refresh = QTimer(self)
+        self._live_pitch_refresh.setSingleShot(True)
+        self._live_pitch_refresh.setInterval(16)
+        self._live_pitch_refresh.timeout.connect(self._refresh_live_pitches)
 
         # left-clicking a detected user note selects it: highlight + seek + a popup
         # of its characteristics, whose arrow keys then walk the take (_step_note)
@@ -256,6 +265,19 @@ class GuitarHero(QWidget):
         mouse move over the notes doesn't cost a full rebuild of every item."""
         self.user_pitches.update_view(*self._view_window(), mode=self.color_mode,
                                       hover=self._hover_span())
+
+    def schedule_live_pitch_refresh(self):
+        """Show newly emitted live pitches on the next display frame."""
+        if not self._live_pitch_refresh.isActive():
+            self._live_pitch_refresh.start()
+
+    def _refresh_live_pitches(self):
+        """Refresh only the pitch layer; transport ticks handle the other layers."""
+        self.user_pitches.sync(
+            self.recording.pitch_data if self.recording else None
+        )
+        self.update_pitches()
+        self.plot.viewport().update()
 
     def _active_score_note_data(self):
         """The active instrument's current NoteData, or None."""

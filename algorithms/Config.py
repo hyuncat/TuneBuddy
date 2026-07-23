@@ -18,12 +18,20 @@ class Config:
     # so a changed default must invalidate cached notes/alignment instead of
     # being silently replaced by an older sidecar value.
     NOTE_SEGMENTATION_FIELDS: ClassVar[tuple[str, ...]] = (
+        "unv_thresh",
         "pitch_thresh",
-        "h2",
-        "min_gap_factor",
-        "onset_z_threshold",
-        "onset_min_spacing_sec",
-        "onset_adaptive_window_sec",
+        "min_note_length_factor",
+        "min_silence_duration_ms",
+    )
+    # These are likewise production-owned rather than per-take preferences.
+    # Cached sidecars must not silently restore weights from an older cost model.
+    ALIGNMENT_FIELDS: ClassVar[tuple[str, ...]] = (
+        "ins_cost",
+        "del_cost",
+        "alignment_alpha_onset",
+        "alignment_alpha_duration",
+        "alignment_gamma_pitch",
+        "alignment_gamma_time",
     )
 
     # note-name spellings indexed by pitch class (midi % 12)
@@ -47,25 +55,39 @@ class Config:
     max_volume: float = 0.95  # %th percentile (as a fraction) of frame RMS used as the loud reference
 
     # --- NOTE DETECTION PARAMETERS ---
-    pitch_thresh: float = 0.5  # in semitones, min diff b/w 2 notes to consider them distinct
-    min_note_length: float = 0.03  # in sec
-    h2: int = 1  # PELT jump parameter
-    # A consecutive unvoiced run this fraction of the score-derived shortest
-    # note starts a new pitch run. 0.25 catches intentional ~20 ms sung breaks
-    # when the shortest score note is ~80 ms, while ignoring isolated dropouts.
-    min_gap_factor: float = 0.25
-    # Custom log-spectral-flux candidate picker. The threshold is in robust
-    # local MAD units; spacing suppresses closely repeated peaks; the adaptive
-    # window establishes the rolling median/MAD baseline.
-    onset_z_threshold: float = 4.0
-    onset_min_spacing_sec: float = 0.16
-    onset_adaptive_window_sec: float = 0.31
-    # Legacy sidecar/notebook compatibility; no longer used by NoteDetector.
-    min_gap_length: float = 0.1
+    # Smallest idealized pitch step worth a KernelCPD boundary. It determines
+    # beta = 0.5 * min_segment_frames * pitch_thresh**2.
+    pitch_thresh: float = 0.75
+    # Score-derived shortest-note duration. Recording.update_min_note_length()
+    # refreshes this after every score-to-take fit and before correction.
+    min_note_length: float = 0.03  # seconds
+    # Minimum detected segment length as a fraction of the shortest score note.
+    min_note_length_factor: float = 0.75
+    # Width of the local decoded-silence majority window. At sr=44100 and
+    # h1=128, 10 ms maps to three frames and requires two unvoiced frames.
+    min_silence_duration_ms: float = 10.0
 
     # --- STRING EDIT PARAMETERS ---
     ins_cost: float = 5
     del_cost: float = 5
+    # Time-aware string-edit weights:
+    #   C_time = alpha_onset*|onset error| + alpha_duration*|duration error|
+    #   C_pair = gamma_pitch*|pitch error| + gamma_time*C_time
+    #   C_ins  = ins_cost + gamma_time*user duration
+    #   C_del  = del_cost + gamma_time*score duration
+    # alpha_onset + alpha_duration must equal 1. The gamma weights convert the
+    # raw semitone and second-valued terms into a common edit-cost scale. Gap
+    # operations use the full unmatched duration because no paired onset exists
+    # with which to blend it.
+    # Production defaults selected by the runner-v2 seed-0 CocoChorales sweep
+    # after full-duration gap costs were introduced. Robust score-time fitting
+    # handles the global onset placement before string editing; duration then
+    # supplies the local temporal evidence without letting expressive onset
+    # shifts manufacture insertion/deletion cascades.
+    alignment_alpha_onset: float = 0.0
+    alignment_alpha_duration: float = 1.0
+    alignment_gamma_pitch: float = 2.0
+    alignment_gamma_time: float = 1.0
     pitch_tolerance: float = 0.5   # semitones
     timing_tolerance: float = 0.25  # sec
 
@@ -171,5 +193,10 @@ class Config:
 
     def __repr__(self):
         return (f"Config\n---\n   sr={self.sr}, w1={self.w1}, h1={self.h1}, fmin={self.fmin}, fmax={self.fmax}, tuning={self.tuning}, unv_thresh={self.unv_thresh}, min_volume={self.min_volume}, max_volume={self.max_volume},\n"
-                f"   pitch_thresh={self.pitch_thresh}, min_note_length={self.min_note_length:.3f}, h2={self.h2},\n"
-                f"   ins_cost={self.ins_cost}, del_cost={self.del_cost}, pitch_tolerance={self.pitch_tolerance}, timing_tolerance={self.timing_tolerance}")
+                f"   pitch_thresh={self.pitch_thresh}, min_note_length={self.min_note_length:.3f}, "
+                f"min_note_length_factor={self.min_note_length_factor}, "
+                f"min_silence_duration_ms={self.min_silence_duration_ms},\n"
+                f"   ins_cost={self.ins_cost}, del_cost={self.del_cost}, "
+                f"alignment_alpha_onset={self.alignment_alpha_onset}, alignment_alpha_duration={self.alignment_alpha_duration}, "
+                f"alignment_gamma_pitch={self.alignment_gamma_pitch}, alignment_gamma_time={self.alignment_gamma_time}, "
+                f"pitch_tolerance={self.pitch_tolerance}, timing_tolerance={self.timing_tolerance}")

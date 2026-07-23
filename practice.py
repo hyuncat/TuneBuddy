@@ -364,8 +364,10 @@ class PracticeTab(QWidget):
             return True
 
         p = self.recording.pitch_data.read_pitch(t)
-        unv_thresh = self.recording.pitch_data.UNVOICED_THRESHOLD
-        if p is None or not p.candidate_pitches or p.unvoiced_prob >= unv_thresh:
+        if (
+            not self.recording.pitch_data.is_voiced_pitch(p)
+            or not p.candidate_pitches
+        ):
             self.status_bar.update_status(f"Waiting for note: {m:.1f}…")
             return False
 

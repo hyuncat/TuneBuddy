@@ -33,7 +33,29 @@ class JsonHandler:
     # v3: unvoiced pitch-run splitting follows min_gap_factor * min_note_length.
     # v4: explicit adaptive spectral-flux candidates plus onset-corroborated
     # marginal PELT boundaries.
-    NOTE_ANALYSIS_VERSION = 4
+    # v5: adjacent KernelCPD segments are no longer merged after segmentation.
+    # v6: spectral onsets removed; any unvoiced frame initially split a run.
+    # v7: pitch runs instead require a majority-unvoiced three-frame gap.
+    # v8: mistake detection/correction consistently uses duration-scaled,
+    # score-time-aware string editing.
+    # v9: matched-onset refits are re-aligned/corrected to convergence; deletion
+    # recovery can jointly repartition both neighbors across unvoiced dropouts.
+    # v10: time-aware string editing uses the primary user pitch plus weighted
+    # absolute onset/duration errors; gap operations add unmatched durations.
+    # v11: score-time stabilization uses a robust matched-onset fit, so a stray
+    # release/vibrato fragment cannot dictate the tempo from one endpoint;
+    # score-aware correction also folds contiguous same-pitch fragments into
+    # their aligned neighbor and leaves excess length as a timing error.
+    # v12: insertion/deletion timing cost uses the full unmatched duration;
+    # alpha_duration applies only when onset and duration errors can be blended.
+    # v13: production alignment weights follow the runner-v2 holdout result.
+    # v14: deletion recovery may preserve a near-pitch substitution and jointly
+    # repartition following repeated notes instead of cascading the alignment.
+    # v15: KernelCPD uses explicit score-relative minimum segment length and a
+    # millisecond-valued strict-majority silence window.
+    # v16: production selects pitch_thresh=0.75 and removes the obsolete PELT
+    # stride from Config.
+    NOTE_ANALYSIS_VERSION = 17
     CACHE_SUFFIX = ".json.xz"
     GZIP_CACHE_SUFFIX = ".json.gz"
     LEGACY_CACHE_SUFFIX = ".json"
@@ -241,16 +263,21 @@ class JsonHandler:
             recording.active_instrument = recording.score_data.active_instrument
 
         # Per-take/user-facing settings still come from the sidecar, but note
-        # segmentation settings are code-owned defaults.  Otherwise changing
-        # pitch_thresh in Config appears to do nothing for every cached take.
+        # segmentation and alignment-model settings are code-owned defaults.
+        # Otherwise changing production costs in Config appears to do nothing
+        # for every cached take.
         runtime_config = recording.config
         cached_config = self._config_from_payload(payload.get("config") or {})
-        changed_segmentation = []
-        for name in Config.NOTE_SEGMENTATION_FIELDS:
+        changed_analysis_config = []
+        code_owned_fields = (
+            *Config.NOTE_SEGMENTATION_FIELDS,
+            *Config.ALIGNMENT_FIELDS,
+        )
+        for name in code_owned_fields:
             effective = getattr(runtime_config, name)
             cached = getattr(cached_config, name)
             if cached != effective:
-                changed_segmentation.append((name, cached, effective))
+                changed_analysis_config.append((name, cached, effective))
                 setattr(cached_config, name, effective)
         recording.update_config(cached_config)
 
@@ -269,7 +296,7 @@ class JsonHandler:
             note_meta.get("version", 0)
         )
         invalidate_notes = (
-            bool(changed_segmentation)
+            bool(changed_analysis_config)
             or cached_analysis_version != self.NOTE_ANALYSIS_VERSION
         )
         effective = recording.config.note_segmentation_config()
@@ -278,7 +305,7 @@ class JsonHandler:
             recording.reset_analysis()
             details = ", ".join(
                 f"{name} {old:g} -> {new:g}"
-                for name, old, new in changed_segmentation
+                for name, old, new in changed_analysis_config
             )
             if cached_analysis_version != self.NOTE_ANALYSIS_VERSION:
                 details = (details + ", " if details else "") + "analysis version changed"
@@ -473,6 +500,8 @@ class JsonHandler:
 
     def _config_from_payload(self, payload: dict) -> Config:
         payload = dict(payload)
+        if "pitch_thresh" not in payload and "pitch_step_semitones" in payload:
+            payload["pitch_thresh"] = payload["pitch_step_semitones"]
         if "pitch_tolerance" not in payload and "tolerance" in payload:
             payload["pitch_tolerance"] = payload["tolerance"]
         if "timing_tolerance" not in payload:
@@ -493,10 +522,9 @@ class JsonHandler:
             elif isinstance(default_value, int):
                 value = int(round(value))
             kwargs[k] = value
-        # note_detection_pelt_jump was renamed to Config.h2 (default 1). Old
-        # sidecars that stored the pre-rename key (including the jump=5 regression
-        # that quantized PELT into short transition notes) fall through the `valid`
-        # filter above, so h2 defaults back to 1 for them.
+        # Removed legacy fields such as h2 and note_detection_pelt_jump fall
+        # through the valid-field filter. The short-lived explicit pitch-step
+        # spelling is migrated to pitch_thresh above.
         return Config(**kwargs)
 
     def _pitch_data_to_payload(self, recording: Recording) -> dict:
@@ -685,7 +713,56 @@ class JsonHandler:
             self._pack_number(note.base_end_time),
         ]
 
-    def _note_from_payload(self, payload: list) -> Note:
+    def _compatible_note_end_time(
+        self,
+        payload: dict,
+        start_time: float,
+        *,
+        end_key: str = "end_time",
+        duration_key: str = "duration",
+    ) -> float:
+        """Read an end time, accepting legacy duration-only note payloads."""
+        end_time = self._unpack_number(payload.get(end_key), default=None)
+        if end_time is not None:
+            return end_time
+        duration = self._unpack_number(payload.get(duration_key), default=0.0)
+        return start_time + max(0.0, duration)
+
+    def _note_from_payload(self, payload: list | dict) -> Note:
+        if isinstance(payload, dict):
+            start_time = self._unpack_number(
+                payload.get("start_time"),
+                default=0.0,
+            )
+            end_time = self._compatible_note_end_time(payload, start_time)
+            note = Note(
+                i=int(payload.get("id", 0)),
+                start_time=start_time,
+                end_time=end_time,
+                midi_num=[
+                    self._unpack_number(m, default=-1)
+                    for m in payload.get("midi_num", [])
+                ],
+                velocity=payload.get("velocity"),
+                instrument=payload.get("instrument"),
+            )
+            note.base_start_time = self._unpack_number(
+                payload.get("base_start_time"),
+                default=note.start_time,
+            )
+            note.base_end_time = self._compatible_note_end_time(
+                payload,
+                note.base_start_time,
+                end_key="base_end_time",
+                duration_key="base_duration",
+            )
+            if (
+                payload.get("base_end_time") is None
+                and payload.get("base_duration") is None
+            ):
+                note.base_end_time = note.end_time
+            return note
+
         note = Note(
             i=int(payload[0]),
             start_time=self._unpack_number(payload[1], default=0.0),

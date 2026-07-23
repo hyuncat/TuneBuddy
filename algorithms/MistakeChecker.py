@@ -1,613 +1,750 @@
+from __future__ import annotations
+
+from copy import copy
+
 import numpy as np
-from itertools import combinations
 
 from algorithms.Config import Config
-from app_logic.user.ds.Recording import Recording
-from app_logic.NoteData import Note, NoteData
 from app_logic.Alignment import Alignment, Mistake
+from app_logic.NoteData import Note, NoteData
+from app_logic.user.ds.Recording import Recording
+
+
+Edit = tuple[list[Note], list[Note], float]
 
 
 class MistakeChecker:
-    """Post-processes a recording's alignment to fix mistakes caused by
-    *incomplete note detection* — e.g. two played notes detected as one, which
-    pitch-mistake detection then reports as a deletion. Splits the merged note back into
-    two and re-aligns. Returns brand new NoteData / Alignment (never mutates the
-    recording's own data)."""
+    """Repair segmentation errors when doing so lowers string-edit cost."""
 
-    # shortest-note factor for the split viability check (used to sit on Config as
-    # mistake_checker_min_note_factor; it's checker-internal, so it's a constant).
-    MIN_NOTE_FACTOR = 0.25
-    # A score-guided split must still expose a real change in the observed
-    # pitch. This is intentionally below NoteDetector.pitch_thresh because the
-    # two target-supporting medians can sit near opposite tolerance edges.
-    MIN_SPLIT_PITCH_CHANGE = 0.5
+    COST_EPSILON = 1e-9
 
-    def __init__(self, recording: Recording = None, config: Config = None, verbose: bool = False):
+    def __init__(
+        self,
+        recording: Recording = None,
+        config: Config = None,
+        verbose: bool = False,
+    ):
         self.recording = recording
         self.config = recording.config if recording else config
         self.pd = self.nd = self.alignment = None
-        self.verbose = verbose  # print step-by-step edit diagnostics
+        self.verbose = verbose
 
     def update_config(self, config: Config):
-        """update the config and all relevant parameters"""
         self.config = config
 
     def check_mistakes(
         self,
-        recording: Recording=None,
-        verbose: bool | None = None,
+        recording: Recording = None,
+        verbose: bool = None,
     ) -> tuple[NoteData, Alignment]:
-        """Walk the mistakes, gather note edits, apply them, and re-align.
-        Returns the new (NoteData, Alignment)."""
+        """Apply correction passes while total string-edit cost decreases."""
         if recording is not None:
             self.recording = recording
+            self.config = recording.config
+        rec = self.recording
+        if rec is None or rec.alignment is None:
+            return None, None
+
         old_verbose = self.verbose
         if verbose is not None:
             self.verbose = verbose
-        if not self.recording or not self.recording.alignment:
-            self.verbose = old_verbose
-            return None, None
-        try:
-            self.pd = self.recording.pitch_data
 
-            note_data = self.recording.note_data
-            alignment = self.recording.alignment
+        try:
+            # Cached Config values may predate the current score fit. Correction
+            # segmentation must always use the current score-note durations.
+            rec.update_min_note_length()
+            self.pd = rec.pitch_data
+            note_data = rec.note_data
+            alignment = rec.alignment
+            detector = rec.mistake_detector
+            current_cost = detector.get_alignment_cost(alignment)
+            notes_changed = False
+
+            if self.verbose:
+                print(f"initial alignment cost: {current_cost:.3f}")
+
             while True:
-                new_nd, new_alignment, n_edits = self._check_mistakes_once(note_data, alignment)
-                if n_edits == 0 or len(new_alignment.pitch_mistakes) >= len(alignment.pitch_mistakes):
-                    return note_data, alignment
-                note_data, alignment = new_nd, new_alignment
+                new_data, new_alignment, edit_count = self._check_mistakes(
+                    note_data,
+                    alignment,
+                )
+                new_cost = detector.get_alignment_cost(new_alignment)
+                if self.verbose:
+                    print(
+                        f" > {edit_count} edit(s), alignment cost: "
+                        f"{new_cost:.3f}"
+                    )
+
+                if (
+                    edit_count == 0
+                    or new_cost >= current_cost - self.COST_EPSILON
+                ):
+                    break
+
+                note_data = new_data
+                alignment = new_alignment
+                current_cost = new_cost
+                notes_changed = True
+
+            rec.note_data = note_data
+            rec.alignment = alignment
+            if notes_changed:
+                rec.reindex_mistakes()
+                rec.recompute_vibrato(note_aware=True)
+            return note_data, alignment
         finally:
             self.verbose = old_verbose
 
-    def _check_mistakes_once(self, note_data: NoteData, alignment: Alignment) -> tuple[NoteData, Alignment, int]:
-        """Apply one non-overlapping correction pass to the supplied state."""
+    def _check_mistakes(
+        self,
+        note_data: NoteData,
+        alignment: Alignment,
+    ) -> tuple[NoteData, Alignment, int]:
+        """Build one non-overlapping split/merge pass, then realign it."""
         self.nd = note_data
         self.alignment = alignment
 
-        mistakes = sorted(
-            alignment.pitch_mistakes,
-            key=lambda m: 0 if m.type == "deletion" else 1 if m.type == "insertion" else 2,
-        )
-        edits = []  # each edit is (notes_to_remove, notes_to_add)
-        edited_note_times = set()
-        handled_deletion_ids = set()
+        def consecutive_groups(mistakes: list[Mistake]) -> list[list[Mistake]]:
+            groups: list[list[Mistake]] = []
+            for mistake in sorted(mistakes, key=lambda item: item.pair_index):
+                if (
+                    groups
+                    and mistake.pair_index == groups[-1][-1].pair_index + 1
+                ):
+                    groups[-1].append(mistake)
+                else:
+                    groups.append([mistake])
+            return groups
 
-        # Consecutive deletions can be several real notes swallowed by one long
-        # detected host. Solve their boundaries jointly; repairing only the
-        # first deletion greedily tends to consume the onset needed by the next.
-        deletions = sorted(
-            (m for m in mistakes if m.type == "deletion"),
-            key=lambda m: m.pair_index,
+        pitch_mistakes = alignment.pitch_mistakes
+        deletion_groups = consecutive_groups(
+            [m for m in pitch_mistakes if m.type == "deletion"]
         )
-        groups = []
-        for deletion in deletions:
-            if (
-                groups
-                and deletion.pair_index == groups[-1][-1].pair_index + 1
-            ):
-                groups[-1].append(deletion)
-            else:
-                groups.append([deletion])
-        for group in groups:
-            if len(group) < 2:
-                continue
-            edit = self.handle_deletion_group(group)
-            if edit is None:
-                continue
-            removed, added = edit
-            removed_times = {n.start_time for n in removed}
-            if removed_times & edited_note_times:
+        insertion_groups = consecutive_groups(
+            [m for m in pitch_mistakes if m.type == "insertion"]
+        )
+
+        proposals: list[tuple[Edit, list[Mistake]]] = []
+        work = [
+            *[(self.handle_deletion, group) for group in deletion_groups],
+            *[(self.handle_insertion, group) for group in insertion_groups],
+        ]
+        for handler, group in work:
+            edit = handler(group)
+            if edit is not None:
+                proposals.append((edit, group))
+            elif self.verbose:
+                print(
+                    f"  [check_mistakes] no {group[0].type} edit "
+                    f"for pairs {[mistake.pair_index for mistake in group]}"
+                )
+
+        # When two otherwise-valid proposals need the same source note, keep the
+        # one with the larger reduction in the detector's edit cost.
+        proposals.sort(key=lambda item: item[0][2], reverse=True)
+        edits: list[Edit] = []
+        edited_notes: set[int] = set()
+        for edit, group in proposals:
+            removed, added, saving = edit
+            removed_ids = {id(note) for note in removed}
+            if removed_ids & edited_notes:
+                if self.verbose:
+                    print(
+                        "  [check_mistakes] skipped lower-saving overlapping "
+                        f"{group[0].type} edit"
+                    )
                 continue
             edits.append(edit)
-            edited_note_times.update(removed_times)
-            handled_deletion_ids.update(id(m) for m in group)
+            edited_notes.update(removed_ids)
             if self.verbose:
                 print(
-                    "  [check_mistakes] joint deletion edit for "
-                    f"pairs {[m.pair_index for m in group]}: "
-                    f"remove {[round(n.start_time, 2) for n in removed]} -> "
-                    f"add {[round(n.start_time, 2) for n in added]}"
+                    f"  [check_mistakes] {group[0].type} pairs "
+                    f"{[mistake.pair_index for mistake in group]} "
+                    f"(saves {saving:.3f}): remove "
+                    f"{[round(n.start_time, 2) for n in removed]} -> add "
+                    f"{[round(n.start_time, 2) for n in added]}"
                 )
 
-        for mistake in mistakes:
-            edit = None
-            if id(mistake) in handled_deletion_ids:
-                continue
-            if mistake.type == "deletion":
-                edit = self.handle_deletion(mistake)
-            elif mistake.type == "insertion":
-                edit = self.handle_insertion(mistake)
-            else:
-                continue  # substitutions aren't correctable here
+        if not edits:
+            return note_data, alignment, 0
 
-            if edit is not None:
-                removed, _ = edit
-                removed_times = {n.start_time for n in removed}
-                if removed_times & edited_note_times:
-                    if self.verbose:
-                        print(f"  [check_mistakes] skipping overlapping edit for {mistake}")
-                    edit = None
-                else:
-                    edits.append(edit)
-                    edited_note_times.update(removed_times)
+        removed_ids = {
+            id(note)
+            for removed, _, _ in edits
+            for note in removed
+        }
+        notes = [
+            copy(note)
+            for note in note_data.data.values()
+            if id(note) not in removed_ids
+        ]
+        for _, replacements, _ in edits:
+            notes.extend(replacements)
+        notes.sort(key=lambda note: note.start_time)
 
-            if self.verbose:
-                if edit is None:
-                    print(f"  [check_mistakes] no edit for {mistake}")
-                else:
-                    removed, added = edit
-                    print(f"  [check_mistakes] edit for {mistake}: "
-                          f"remove {[round(n.start_time, 2) for n in removed]} -> "
-                          f"add {[round(n.start_time, 2) for n in added]}")
+        new_data = NoteData()
+        for note_id, note in enumerate(notes):
+            note.id = note_id
+            new_data.write_note(note)
 
-        if self.verbose:
-            print(f"[check_mistakes] {len(mistakes)} mistakes -> {len(edits)} edits applied")
-        new_nd = self._apply_edits(edits)
-        new_alignment = self._realign(new_nd)
-        return new_nd, new_alignment, len(edits)
-
-    def mistake_correction_loop(self, verbose: bool | None = None):
-        """Repeatedly apply mistake correction until it stops reducing the mistake
-        count, leaving the recording on its best-scoring note_data/alignment.
-
-        Each pass calls recording.correct_mistakes() (which routes back through
-        this checker's check_mistakes); a pass that doesn't lower the count is
-        rolled back, so a regression never sticks. Called from the Perform tab's
-        analyze()."""
-        old_verbose = self.verbose
-        if verbose is not None:
-            self.verbose = verbose
-        rec = self.recording
-        if not rec or not rec.alignment:
-            if self.verbose:
-                print("No active recording or alignment to correct mistakes on.")
-            self.verbose = old_verbose
-            return
-        try:
-            n_mistakes = len(rec.alignment.pitch_mistakes)
-            notes_changed = False
-            if self.verbose:
-                print(f"initial mistakes: {n_mistakes}")
-            while True:
-                # keep the current (best-so-far) state in case this pass regresses
-                prev_nd = rec.note_data
-                prev_alignment = rec.alignment
-
-                rec.correct_mistakes(verbose=self.verbose)
-                new_n_mistakes = len(rec.alignment.pitch_mistakes)
-                if self.verbose:
-                    print(f" > mistakes after correction: {new_n_mistakes}")
-
-                if new_n_mistakes >= n_mistakes:
-                    # correction stopped helping -> revert to the better previous state
-                    rec.note_data = prev_nd
-                    rec.alignment = prev_alignment
-                    if self.verbose:
-                        print("no improvement after correction, breaking loop")
-                    break
-                notes_changed = True
-                n_mistakes = new_n_mistakes  # made progress -> raise the baseline
-        finally:
-            self.verbose = old_verbose
-        if notes_changed:
-            # Split/merge correction changes the only legal analysis span and
-            # median baseline for vibrato. Rebuild from the final note set so
-            # the feature cannot remain stale against pre-correction boundaries.
-            rec.recompute_vibrato(note_aware=True)
-
-    # --- mistake handlers ---------------------------------------------------
-    def handle_deletion(self, mistake: Mistake):
-        """A deletion means a score note had no match. If the user actually played
-        it but it got merged into a neighbor, split that neighbor in two.
-        Returns an edit ([merged_note], [first, second]) or None."""
-        intended = mistake.midi_note
-        prev_note = mistake.user_note  # None for a deletion at the very start of the piece
-        next_id = (prev_note.id + 1) if prev_note else 0
-        next_note = self.nd.read_note(i=next_id)
-
-        host, targets = self._pick_host(prev_note, next_note, intended)
-        if host is None:
-            return None
-
-        pitches = self.pd.read(start_time=host.start_time, end_time=host.end_time, clean=True)
-        split = self._split_note(host, pitches, *targets)
-        if split is None:
-            if self.verbose:
-                print(
-                    f"      [split-fail] host@{host.start_time:.2f}: "
-                    f"no corroborated boundary ({len(pitches)} frames)"
-                )
-            return None
-        self._remedian_notes(split, targets)
-        ok = self._split_resembles_score(split, targets)
-        if self.verbose:
-            print(f"      [split] host@{host.start_time:.2f} -> "
-                  f"halves=[{split[0].midi_num[0]:.1f}, {split[1].midi_num[0]:.1f}] "
-                  f"targets=({targets[0]:.1f}, {targets[1]:.1f}) resembles={ok} (tol={self.config.pitch_tolerance})")
-        if not ok:
-            return None
-        return [host], split
-
-    def handle_deletion_group(self, mistakes: list[Mistake]):
-        """Split one host across a consecutive run of deleted score notes."""
-        if len(mistakes) < 2:
-            return None
-        intended = [mistake.midi_note for mistake in mistakes]
-        prev_note = mistakes[0].user_note
-        next_id = (prev_note.id + 1) if prev_note else 0
-        next_note = self.nd.read_note(i=next_id)
-
-        candidates = []
-        for host, at_start in ((prev_note, False), (next_note, True)):
-            if host is None:
-                continue
-            support = sum(self._count_close(host, target) for target in intended)
-            if all(
-                self._count_close(host, target) >= self._min_close_frames()
-                for target in intended
-            ):
-                candidates.append((support, host, at_start))
-        if not candidates:
-            return None
-        _, host, at_start = max(candidates, key=lambda item: item[0])
-        intended_pitches = [note.midi_num[0] for note in intended]
-        targets = (
-            [*intended_pitches, self._score_pitch(host)]
-            if at_start
-            else [self._score_pitch(host), *intended_pitches]
+        score_notes = self.recording.score_data.clipped_note_data(
+            channel=self.recording.active_instrument
         )
-        pitches = self.pd.read(
-            start_time=host.start_time,
-            end_time=host.end_time,
-            clean=True,
+        new_alignment = self.recording.mistake_detector.detect_mistakes(
+            user_notes=new_data,
+            score_notes=score_notes,
+            verbose=self.verbose,
         )
-        split = self._split_note_multiple(host, pitches, targets)
-        if split is None:
-            return None
-        self._remedian_notes(split, targets)
-        if not self._split_resembles_score(split, targets):
-            return None
-        return [host], split
+        return new_data, new_alignment, len(edits)
 
-    def handle_insertion(self, mistake: Mistake):
-        """An insertion means a user note had no match in the score. If the note
-        detector over-segmented one played note into several, the spurious fragment
-        sits right beside (and at the same pitch as) the note it broke off from.
-        Merge it back into whichever neighbor it's closer to in pitch.
-        Returns an edit ([inserted, neighbor], [merged]) or None."""
-        inserted = mistake.user_note
-        prev_note = self.nd.read_note(i=inserted.id - 1) if inserted.id > 0 else None
-        next_note = self.nd.read_note(i=inserted.id + 1)
-
-        neighbor = self._pick_merge_neighbor(inserted, prev_note, next_note)
-        if neighbor is None:
+    def handle_deletion(
+        self,
+        mistakes: Mistake | list[Mistake],
+    ) -> Edit | None:
+        """Recover deletions from neighbors, repeated runs, or edge pitch."""
+        mistakes = [mistakes] if isinstance(mistakes, Mistake) else mistakes
+        mistakes = sorted(mistakes, key=lambda mistake: mistake.pair_index)
+        deleted = [
+            mistake.midi_note
+            for mistake in mistakes
+            if mistake.midi_note is not None
+        ]
+        if self.pd is None or not deleted:
             return None
 
-        merged = self._merge_notes(inserted, neighbor)
-        self._remedian_notes([merged])
-        target = self._score_pitch(neighbor)
-        if abs(merged.midi_num[0] - target) > self.config.pitch_tolerance:
-            if self.verbose:
-                print(f"      [merge-fail] merged={merged.midi_num[0]:.1f} "
-                      f"target={target:.1f} (tol={self.config.pitch_tolerance})")
-            return None
-        return [inserted, neighbor], [merged]
+        detector = self.recording.mistake_detector
+        pairs = self.alignment.pairs
+        first_index = mistakes[0].pair_index
+        last_index = mistakes[-1].pair_index
+        previous = pairs[first_index - 1] if first_index > 0 else (None, None)
+        following = (
+            pairs[last_index + 1]
+            if last_index + 1 < len(pairs)
+            else (None, None)
+        )
+        partition_cache: dict[tuple, list[Note] | None] = {}
 
-
-    # --- helpers ------------------------------------------------------------
-    def _pick_host(self, prev_note: Note, next_note: Note, intended: Note):
-        """Decide which neighbor (if any) actually swallowed the intended note,
-        based on how many of its pitch frames land on the intended pitch.
-        Returns (host_note, (target_first, target_second)) or (None, None).
-        Both targets are *score* pitches: the score note the host aligns to and
-        the deleted score note. (Targeting the score, not the host's own observed
-        pitch, places the split boundary where the score says the two notes meet.)"""
-        n_prev = self._count_close(prev_note, intended) if prev_note else 0
-        n_next = self._count_close(next_note, intended) if next_note else 0
-        min_close = self._min_close_frames()
-
-        if self.verbose:
-            pp = f"{prev_note.midi_num[0]:.1f}@{prev_note.start_time:.2f}" if prev_note else "—"
-            nn = f"{next_note.midi_num[0]:.1f}@{next_note.start_time:.2f}" if next_note else "—"
-            print(f"      [split?] intended={intended.midi_num[0]:.1f} | prev({pp}) close={n_prev}"
-                  f" next({nn}) close={n_next} | need>={min_close}")
-
-        if max(n_prev, n_next) < min_close:
-            return None, None
-
-        if n_prev >= n_next:
-            # intended note merged into the END of prev_note
-            return prev_note, (self._score_pitch(prev_note), intended.midi_num[0])
-        # intended note merged into the START of next_note
-        return next_note, (intended.midi_num[0], self._score_pitch(next_note))
-
-    def _score_pitch(self, user_note: Note) -> float:
-        """The pitch of the score note `user_note` aligns to, or its own observed
-        pitch if it has no match (e.g. the host is itself an insertion)."""
-        alignment = self.alignment or self.recording.alignment
-        score_note = alignment.get_match(user_note=user_note)
-        return score_note.midi_num[0] if score_note else user_note.midi_num[0]
-
-    def _pick_merge_neighbor(self, inserted: Note, prev_note: Note, next_note: Note):
-        """Decide which neighbor (if any) the inserted note most likely broke off
-        from: the closest in pitch among neighbors that are both
-            (a) within tolerance of the inserted note (the 'same note'), and
-            (b) themselves a good match to the score note they align to.
-        Requiring (b) means a genuinely extra note isn't force-merged into a
-        neighbor just because their pitches happen to line up — we only dissolve a
-        fragment back into a note we're confident was played correctly.
-        An unvoiced neighbor is excluded by both checks. Returns the neighbor or None."""
-        pitch = inserted.midi_num[0]
-        candidates = []
-        for label, neighbor in (("prev", prev_note), ("next", next_note)):
-            if neighbor is None:
-                if self.verbose:
-                    print(f"      [merge?] inserted={pitch:.1f} | {label}=— ")
-                continue
-            dist = abs(neighbor.midi_num[0] - pitch)
-            aligned = self._is_well_aligned(neighbor)
-            if self.verbose:
-                print(f"      [merge?] inserted={pitch:.1f} | {label}({neighbor.midi_num[0]:.1f}"
-                      f"@{neighbor.start_time:.2f}) dist={dist:.2f} (<={self.config.pitch_tolerance}?)"
-                      f" well_aligned={aligned}")
-            if dist <= self.config.pitch_tolerance and aligned:
-                candidates.append((dist, neighbor))
-
-        if not candidates:
-            return None
-        return min(candidates, key=lambda c: c[0])[1]
-
-    def _is_well_aligned(self, user_note: Note) -> bool:
-        """True if `note` is paired with a score note and sits within tolerance of
-        it — a 'good' match, not a substitution, insertion, or unvoiced note. We
-        only merge an insertion into such a note (a fragment that broke off a
-        correctly-played note); if the neighbor is itself off, the insertion may be
-        a genuine extra note, so we leave it alone."""
-        alignment = self.alignment or self.recording.alignment
-        score_note = alignment.get_match(user_note=user_note)
-        if score_note is None:
-            return False
-        return abs(user_note.midi_num[0] - score_note.midi_num[0]) <= self.config.pitch_tolerance
-
-    def _count_close(self, note: Note, intended: Note) -> int:
-        """How many of `note`'s voiced pitch frames sit within tolerance of the
-        intended pitch. (clean=True drops unvoiced frames, which have no
-        candidates after pitch smoothing.)"""
-        pitches = self.pd.read(start_time=note.start_time, end_time=note.end_time, clean=True)
-        target = intended.midi_num[0]
-        return sum(1 for p in pitches
-                   if p.value != -1 and abs(p.value - target) <= self.config.pitch_tolerance)
-
-    def _min_close_frames(self) -> int:
-        """Minimum close pitch frames needed to treat a split as viable."""
-        seconds = getattr(self.config, "min_note_length", Config.DEFAULT_MIN_NOTE_LENGTH)
-        if self.recording is not None:
-            try:
-                note_data = self.recording.score_data.clipped_note_data(
-                    channel=self.recording.active_instrument
-                )
-                seconds = note_data.get_min_note_length(default=float(seconds), clean=True)
-            except (AttributeError, KeyError, TypeError):
-                pass
-        frame_rate = self.config.sr / self.config.h1
-        return max(1, int(np.ceil(max(0.0, float(seconds) * self.MIN_NOTE_FACTOR) * frame_rate)))
-
-    def _split_resembles_score(self, split: list, targets: tuple) -> bool:
-        """Accept a split only if each half resembles the score note it would
-        align to. `targets` are the (host, intended) / (intended, host) pitches
-        in the same order as the split halves, so each half must land within
-        tolerance of its target. (`< tol` matches MistakeDetector's "same note"
-        convention.)"""
-        tol = self.config.pitch_tolerance
-        return all(abs(note.midi_num[0] - target) <= tol
-                   for note, target in zip(split, targets))
-
-    def _split_note(self, note: Note, pitches: list, target_first: float, target_second: float):
-        """Split a deleted score note back out of its detected host.
-
-        Prefer a spectral onset inside the host and use that exact time. If no
-        viable onset exists, fall back to the score-guided pitch breakpoint only
-        when its two sides have a real median-pitch discontinuity. A smooth or
-        same-pitch host with neither cue is deliberately left unsplit.
-        """
-        min_frames = self._min_close_frames()
-        if len(pitches) < 2 * min_frames:
-            return None
-
-        midis = np.array([p.value for p in pitches])
-        times = np.array([p.time for p in pitches])
-
-        # When several spectral onsets lie inside the host, choose the viable
-        # onset whose ordered halves best resemble the two score targets.
-        onset_data = getattr(self.recording, "onset_data", None)
-        onset_candidates = []
-        if onset_data is not None:
-            for onset_time in onset_data.read(
-                start_time=note.start_time,
-                end_time=note.end_time,
-            ):
-                onset_time = float(onset_time)
-                if not note.start_time < onset_time < note.end_time:
-                    continue
-                k = int(np.searchsorted(times, onset_time, side="left"))
-                if min_frames <= k <= len(pitches) - min_frames:
-                    onset_candidates.append((
-                        self._split_cost(midis, k, target_first, target_second),
-                        onset_time,
-                        k,
-                    ))
-
-        if onset_candidates:
-            for _, split_time, k in sorted(
-                onset_candidates,
-                key=lambda candidate: candidate[0],
-            ):
-                if self._has_pitch_change(midis, k):
-                    return self._notes_at_split(note, midis, k, split_time)
-
-        # No onset: find the score-target-optimal pitch boundary, then require a
-        # real change in the observed median pitch. This avoids the former flat-
-        # cost k=1 split on repeated/same-pitch material.
-        left_cost = np.concatenate([[0.0], np.cumsum(np.abs(midis - target_first))])
-        right_cost = np.concatenate([np.cumsum(np.abs(midis - target_second)[::-1])[::-1], [0.0]])
-        cost = left_cost + right_cost
-        valid_cost = cost[min_frames:len(pitches) - min_frames + 1]
-        if valid_cost.size == 0:
-            return None
-        k = int(np.argmin(valid_cost) + min_frames)
-        left_median = float(np.median(midis[:k]))
-        right_median = float(np.median(midis[k:]))
-        if abs(left_median - right_median) < max(
-            self.MIN_SPLIT_PITCH_CHANGE,
-            self.config.pitch_thresh,
-        ):
-            return None
-
-        split_time = 0.5 * (pitches[k - 1].time + pitches[k].time)
-        return self._notes_at_split(note, midis, k, split_time)
-
-    def _has_pitch_change(self, midis: np.ndarray, k: int) -> bool:
-        """Reject onset candidates whose two spans are the same flat note."""
-        if not 0 < k < len(midis):
-            return False
-        return abs(
-            float(np.median(midis[:k]))
-            - float(np.median(midis[k:]))
-        ) >= self.MIN_SPLIT_PITCH_CHANGE
-
-    def _split_note_multiple(self, note: Note, pitches: list,
-                             targets: list[float]) -> list[Note] | None:
-        """Jointly place len(targets)-1 score-guided spectral boundaries."""
-        n_boundaries = len(targets) - 1
-        min_frames = self._min_close_frames()
-        if n_boundaries < 1 or len(pitches) < len(targets) * min_frames:
-            return None
-        midis = np.asarray([p.value for p in pitches], dtype=float)
-        times = np.asarray([p.time for p in pitches], dtype=float)
-        onset_data = getattr(self.recording, "onset_data", None)
-        if onset_data is None:
-            return None
-        candidate_indices = []
-        for onset_time in onset_data.read(
-            start_time=note.start_time,
-            end_time=note.end_time,
-        ):
-            k = int(np.searchsorted(times, float(onset_time), side="left"))
-            if min_frames <= k <= len(pitches) - min_frames:
-                candidate_indices.append((k, float(onset_time)))
-
-        best = None
-        for chosen in combinations(candidate_indices, n_boundaries):
-            indices = [0, *(item[0] for item in chosen), len(pitches)]
-            if any(b - a < min_frames for a, b in zip(indices, indices[1:])):
-                continue
-            medians = [
-                float(np.median(midis[a:b]))
-                for a, b in zip(indices, indices[1:])
-            ]
-            if any(
-                abs(a - b) < self.MIN_SPLIT_PITCH_CHANGE
-                for a, b in zip(medians, medians[1:])
-            ):
-                continue
-            cost = sum(
-                float(np.abs(midis[a:b] - target).sum())
-                for a, b, target in zip(indices, indices[1:], targets)
+        def region_for(
+            hosts: list[Note],
+            region_bounds: tuple[float, float] | None = None,
+        ) -> Note:
+            template = hosts[0]
+            start_time, end_time = region_bounds or (
+                min(host.start_time for host in hosts),
+                max(host.end_time for host in hosts),
             )
-            if best is None or cost < best[0]:
-                best = (cost, chosen, indices)
-        if best is None:
+            return Note(
+                i=-1,
+                start_time=start_time,
+                end_time=end_time,
+                midi_num=[template.midi_num[0]],
+                velocity=template.velocity,
+                instrument=template.instrument,
+            )
+
+        def split_option(
+            hosts: list[Note],
+            anchors: list[tuple[Note, Note]],
+            score_targets: list[Note],
+            recovered_count: int,
+            label: str,
+            region_bounds: tuple[float, float] | None = None,
+        ) -> dict | None:
+            segment_count = len(anchors) + recovered_count
+            region = region_for(hosts, region_bounds)
+            cache_key = (
+                "kernel",
+                tuple(id(host) for host in hosts),
+                segment_count,
+                region.start_time,
+                region.end_time,
+            )
+            if cache_key not in partition_cache:
+                partition_cache[cache_key] = self._partition_region(
+                    region,
+                    segment_count,
+                )
+            split = partition_cache[cache_key]
+            if split is None:
+                return None
+
+            old_cost = (
+                sum(
+                    detector.get_substitution_cost(user_note, score_note)
+                    for user_note, score_note in anchors
+                )
+                + sum(
+                    detector.get_deletion_cost(target)
+                    for target in deleted
+                )
+            )
+            local_alignment = detector.get_string_edit_alignment(
+                split,
+                score_targets,
+            )
+            paired_scores = {
+                id(score_note)
+                for user_note, score_note in local_alignment.pairs
+                if user_note is not None and score_note is not None
+            }
+            if (
+                any(
+                    id(score_note) not in paired_scores
+                    for _, score_note in anchors
+                )
+                or any(
+                    user_note is not None and score_note is None
+                    for user_note, score_note in local_alignment.pairs
+                )
+            ):
+                return None
+            new_cost = detector.get_alignment_cost(local_alignment)
+            saving = old_cost - new_cost
+            if self.verbose:
+                print(
+                    f"      [split?] {label}, recover {recovered_count}/"
+                    f"{len(deleted)} deletion(s): "
+                    f"{old_cost:.3f} -> {new_cost:.3f}"
+                )
+            if saving <= self.COST_EPSILON:
+                return None
+            return {
+                "removed": hosts,
+                "added": split,
+                "saving": saving,
+            }
+
+        def repeated_split_option(
+            hosts: list[Note],
+            anchors: list[tuple[Note, Note]],
+            score_targets: list[Note],
+            label: str,
+            region_bounds: tuple[float, float] | None = None,
+        ) -> dict | None:
+            """Recover every deletion using score-timed repeated-note splits."""
+            has_repeat = any(
+                left.midi_num[0] == right.midi_num[0]
+                for left, right in zip(score_targets, score_targets[1:])
+            )
+            if not has_repeat:
+                return None
+
+            region = region_for(hosts, region_bounds)
+            cache_key = (
+                "repeat",
+                tuple(id(host) for host in hosts),
+                tuple(id(target) for target in score_targets),
+                region.start_time,
+                region.end_time,
+            )
+            if cache_key not in partition_cache:
+                partition_cache[cache_key] = self._partition_repeated_region(
+                    region,
+                    score_targets,
+                )
+            split = partition_cache[cache_key]
+            if split is None:
+                return None
+
+            old_cost = (
+                sum(
+                    detector.get_substitution_cost(user_note, score_note)
+                    for user_note, score_note in anchors
+                )
+                + sum(
+                    detector.get_deletion_cost(target)
+                    for target in deleted
+                )
+            )
+            local_alignment = detector.get_string_edit_alignment(
+                split,
+                score_targets,
+            )
+            # This path constructs one segment for every target. If string edit
+            # would still prefer a gap operation, it is not a valid recovery.
+            if any(
+                user_note is None or score_note is None
+                for user_note, score_note in local_alignment.pairs
+            ):
+                return None
+
+            new_cost = detector.get_alignment_cost(local_alignment)
+            saving = old_cost - new_cost
+            if self.verbose:
+                print(
+                    f"      [repeat split?] {label}, recover "
+                    f"{len(deleted)}/{len(deleted)} deletion(s): "
+                    f"{old_cost:.3f} -> {new_cost:.3f}"
+                )
+            if saving <= self.COST_EPSILON:
+                return None
+            return {
+                "removed": hosts,
+                "added": split,
+                "saving": saving,
+            }
+
+        previous_user, previous_score = previous
+        following_user, following_score = following
+        options = []
+        if previous_user is not None and previous_score is not None:
+            max_recovered = min(
+                len(deleted),
+                self._segment_capacity([previous_user]) - 1,
+            )
+            for recovered_count in range(1, max_recovered + 1):
+                option = split_option(
+                    [previous_user],
+                    [(previous_user, previous_score)],
+                    [previous_score, *deleted],
+                    recovered_count,
+                    "previous",
+                )
+                if option is not None:
+                    options.append(option)
+            option = repeated_split_option(
+                [previous_user],
+                [(previous_user, previous_score)],
+                [previous_score, *deleted],
+                "previous",
+            )
+            if option is not None:
+                options.append(option)
+
+        if following_user is not None and following_score is not None:
+            max_recovered = min(
+                len(deleted),
+                self._segment_capacity([following_user]) - 1,
+            )
+            for recovered_count in range(1, max_recovered + 1):
+                option = split_option(
+                    [following_user],
+                    [(following_user, following_score)],
+                    [*deleted, following_score],
+                    recovered_count,
+                    "following",
+                )
+                if option is not None:
+                    options.append(option)
+            option = repeated_split_option(
+                [following_user],
+                [(following_user, following_score)],
+                [*deleted, following_score],
+                "following",
+            )
+            if option is not None:
+                options.append(option)
+
+        if (
+            previous_user is not None
+            and previous_score is not None
+            and following_user is not None
+            and following_score is not None
+        ):
+            # A short played note can be discarded by initial segmentation and
+            # survive only as pitch frames in the gap between its neighbors.
+            max_recovered = min(
+                len(deleted),
+                self._segment_capacity(
+                    [previous_user, following_user],
+                )
+                - 2,
+            )
+            for recovered_count in range(1, max_recovered + 1):
+                option = split_option(
+                    [previous_user, following_user],
+                    [
+                        (previous_user, previous_score),
+                        (following_user, following_score),
+                    ],
+                    [previous_score, *deleted, following_score],
+                    recovered_count,
+                    "previous+following",
+                )
+                if option is not None:
+                    options.append(option)
+            option = repeated_split_option(
+                [previous_user, following_user],
+                [
+                    (previous_user, previous_score),
+                    (following_user, following_score),
+                ],
+                [previous_score, *deleted, following_score],
+                "previous+following",
+            )
+            if option is not None:
+                options.append(option)
+
+        # Repeated score pitches contain no pitch changepoint. Extend only
+        # through the immediately adjacent equal-pitch score run, then use
+        # KernelCPD between distinct pitch blocks and score-proportional timing
+        # within each repeated block.
+        if previous_user is not None and previous_score is not None:
+            previous_run = [previous]
+            index = first_index - 2
+            while index >= 0:
+                user_note, score_note = pairs[index]
+                if (
+                    user_note is None
+                    or score_note is None
+                    or score_note.midi_num[0] != previous_score.midi_num[0]
+                ):
+                    break
+                previous_run.append((user_note, score_note))
+                index -= 1
+            previous_run.reverse()
+            if len(previous_run) > 1:
+                option = repeated_split_option(
+                    [user_note for user_note, _ in previous_run],
+                    previous_run,
+                    [
+                        *[score_note for _, score_note in previous_run],
+                        *deleted,
+                    ],
+                    "previous repeated run",
+                )
+                if option is not None:
+                    options.append(option)
+
+        if following_user is not None and following_score is not None:
+            following_run = [following]
+            index = last_index + 2
+            while index < len(pairs):
+                user_note, score_note = pairs[index]
+                if (
+                    user_note is None
+                    or score_note is None
+                    or score_note.midi_num[0] != following_score.midi_num[0]
+                ):
+                    break
+                following_run.append((user_note, score_note))
+                index += 1
+            if len(following_run) > 1:
+                option = repeated_split_option(
+                    [user_note for user_note, _ in following_run],
+                    following_run,
+                    [
+                        *deleted,
+                        *[score_note for _, score_note in following_run],
+                    ],
+                    "following repeated run",
+                )
+                if option is not None:
+                    options.append(option)
+
+        # Initial note detection intentionally drops voiced runs shorter than
+        # its minimum note length. At score edges there is no outer detected
+        # neighbor, so include otherwise-unassigned edge pitch in the one
+        # available neighbor's correction region.
+        voiced_bounds = self.pd.get_voiced_range()
+        if (
+            voiced_bounds is not None
+            and first_index == 0
+            and following_user is not None
+            and following_score is not None
+            and voiced_bounds[0] < following_user.start_time
+        ):
+            edge_bounds = (voiced_bounds[0], following_user.end_time)
+            max_recovered = min(
+                len(deleted),
+                self._segment_capacity(
+                    [following_user],
+                    region_bounds=edge_bounds,
+                )
+                - 1,
+            )
+            for recovered_count in range(1, max_recovered + 1):
+                option = split_option(
+                    [following_user],
+                    [(following_user, following_score)],
+                    [*deleted, following_score],
+                    recovered_count,
+                    "leading pitch+following",
+                    region_bounds=edge_bounds,
+                )
+                if option is not None:
+                    options.append(option)
+            option = repeated_split_option(
+                [following_user],
+                [(following_user, following_score)],
+                [*deleted, following_score],
+                "leading pitch+following",
+                region_bounds=edge_bounds,
+            )
+            if option is not None:
+                options.append(option)
+
+        if (
+            voiced_bounds is not None
+            and last_index == len(pairs) - 1
+            and previous_user is not None
+            and previous_score is not None
+            and voiced_bounds[1] > previous_user.end_time
+        ):
+            edge_bounds = (previous_user.start_time, voiced_bounds[1])
+            max_recovered = min(
+                len(deleted),
+                self._segment_capacity(
+                    [previous_user],
+                    region_bounds=edge_bounds,
+                )
+                - 1,
+            )
+            for recovered_count in range(1, max_recovered + 1):
+                option = split_option(
+                    [previous_user],
+                    [(previous_user, previous_score)],
+                    [previous_score, *deleted],
+                    recovered_count,
+                    "previous+trailing pitch",
+                    region_bounds=edge_bounds,
+                )
+                if option is not None:
+                    options.append(option)
+            option = repeated_split_option(
+                [previous_user],
+                [(previous_user, previous_score)],
+                [previous_score, *deleted],
+                "previous+trailing pitch",
+                region_bounds=edge_bounds,
+            )
+            if option is not None:
+                options.append(option)
+
+        if not options:
             return None
 
-        _, chosen, indices = best
-        boundaries = [note.start_time, *(item[1] for item in chosen), note.end_time]
-        split = []
-        for start, end, a, b in zip(
-            boundaries,
-            boundaries[1:],
-            indices,
-            indices[1:],
-        ):
-            split.append(Note(
-                i=-1,
-                start_time=float(start),
-                end_time=float(end),
-                midi_num=[float(np.median(midis[a:b]))],
-                velocity=note.velocity,
-                instrument=note.instrument,
-            ))
-        return split
-
-    @staticmethod
-    def _split_cost(midis: np.ndarray, k: int,
-                    target_first: float, target_second: float) -> float:
-        """Ordered score-target cost for one candidate split index."""
-        return float(
-            np.abs(midis[:k] - target_first).sum()
-            + np.abs(midis[k:] - target_second).sum()
+        selected = max(options, key=lambda option: option["saving"])
+        return (
+            selected["removed"],
+            selected["added"],
+            selected["saving"],
         )
 
-    @staticmethod
-    def _notes_at_split(note: Note, midis: np.ndarray, k: int,
-                        split_time: float) -> list[Note]:
-        """Build two replacement notes around a validated split boundary."""
-
-        first = Note(
-            i=-1, 
-            start_time=note.start_time, 
-            end_time=split_time,
-            midi_num=[float(np.median(midis[:k]))],
-            velocity=note.velocity, 
-            instrument=note.instrument
+    def _segment_capacity(
+        self,
+        notes: list[Note],
+        region_bounds: tuple[float, float] | None = None,
+    ) -> int:
+        """Maximum fixed-count KernelCPD segments supported by a region."""
+        if not notes or self.pd is None:
+            return 0
+        start_time, end_time = region_bounds or (
+            min(note.start_time for note in notes),
+            max(note.end_time for note in notes),
         )
-        second = Note(
-            i=-1, 
-            start_time=split_time, 
-            end_time=note.end_time,
-            midi_num=[float(np.median(midis[k:]))],
-            velocity=note.velocity,
-            instrument=note.instrument
-        )
-        return [first, second]
-
-    def _merge_notes(self, inserted: Note, neighbor: Note) -> Note:
-        """Fuse the inserted note and its neighbor into one note spanning both
-        (they're contiguous, so the union is just min start → max end). The merged
-        pitch is the median over the combined voiced frames, so the longer/dominant
-        note's pitch wins; falls back to the neighbor's pitch if no voiced frames."""
-        start_time = min(inserted.start_time, neighbor.start_time)
-        end_time = max(inserted.end_time, neighbor.end_time)
-
-        pitches = self.pd.read(start_time=start_time, end_time=end_time, clean=True)
-        midis = [p.value for p in pitches]
-        midi_num = float(np.median(midis)) if midis else neighbor.midi_num[0]
-
-        return Note(
-            i=-1,
+        frames = self.pd.read(
             start_time=start_time,
             end_time=end_time,
-            midi_num=[midi_num],
-            velocity=neighbor.velocity,
-            instrument=neighbor.instrument,
+            clean=True,
         )
+        min_frames = self.config.min_note_pitch_frames(
+            factor=self.config.min_note_length_factor,
+        )
+        return len(frames) // min_frames
 
-    def _remedian_notes(self, notes: list[Note], targets: tuple | list | None = None) -> None:
-        """Recompute replacement-note pitches after split/merge edits.
+    def _crosses_blocking_silence(
+        self,
+        source_notes: list[Note],
+        replacements: list[Note],
+    ) -> bool:
+        """Whether a replacement joins notes across a note-length silence."""
+        ordered = sorted(source_notes, key=lambda note: note.start_time)
+        minimum_silence = self.config.min_note_seconds(
+            factor=self.config.min_note_length_factor,
+        )
+        # NoteDetector stores the final voiced frame's time as a run's end.
+        # Include its frame interval when comparing the half-open gap duration.
+        frame_duration = self.config.h1 / self.config.sr
 
-        MistakeChecker edits are score-guided, so when a target score pitch is
-        known, median only the frames in that replacement span that support that
-        target. This prevents a short corrected note from being pulled back to the
-        neighboring pitch by slide/transition frames. If no target-supporting
-        frames exist, fall back to the span's full voiced median.
-        """
-        targets = targets or [None] * len(notes)
-        for note, target in zip(notes, targets):
-            self._remedian_note(note, target)
+        for left, right in zip(ordered, ordered[1:]):
+            gap_duration = (
+                right.start_time - left.end_time + frame_duration
+            )
+            if gap_duration < minimum_silence - self.COST_EPSILON:
+                continue
+            if any(
+                replacement.start_time <= left.end_time + self.COST_EPSILON
+                and replacement.end_time >= right.start_time - self.COST_EPSILON
+                for replacement in replacements
+            ):
+                return True
+        return False
 
-    def _remedian_note(self, note: Note, target: float | None = None) -> None:
-        if note is None or self.pd is None:
-            return
+    def _partition_region(
+        self,
+        note: Note,
+        segment_count: int,
+    ) -> list[Note] | None:
+        """Split one note with fixed-count production KernelCPD segmentation."""
+        pitches = self.pd.read(
+            start_time=note.start_time,
+            end_time=note.end_time,
+            clean=True,
+        )
+        if not pitches:
+            return None
+
+        signal = np.asarray(
+            [pitch.value for pitch in pitches],
+            dtype=float,
+        ).reshape(-1, 1)
+        breakpoints = self.recording.note_detector.segment_breakpoints(
+            signal,
+            segment_count=segment_count,
+        )
+        if breakpoints is None:
+            return None
+
+        indices = [0, *breakpoints]
+        boundaries = [note.start_time]
+        boundaries.extend(
+            self.recording.note_detector.get_boundary_time(pitches, index)
+            for index in breakpoints[:-1]
+        )
+        boundaries.append(note.end_time)
+
+        split = []
+        for start, end, start_time, end_time in zip(
+            indices,
+            indices[1:],
+            boundaries,
+            boundaries[1:],
+        ):
+            if end <= start or end_time <= start_time:
+                return None
+            split.append(
+                Note(
+                    i=-1,
+                    start_time=float(start_time),
+                    end_time=float(end_time),
+                    midi_num=[float(np.median(signal[start:end, 0]))],
+                    velocity=note.velocity,
+                    instrument=note.instrument,
+                )
+            )
+        return split if len(split) == segment_count else None
+
+    def _partition_repeated_region(
+        self,
+        note: Note,
+        score_targets: list[Note],
+    ) -> list[Note] | None:
+        """Use pitch changes between blocks and score timing within repeats."""
+        if len(score_targets) < 2:
+            return None
+
+        score_blocks: list[list[Note]] = []
+        for target in score_targets:
+            if (
+                score_blocks
+                and target.midi_num[0] == score_blocks[-1][-1].midi_num[0]
+            ):
+                score_blocks[-1].append(target)
+            else:
+                score_blocks.append([target])
+        if all(len(block) == 1 for block in score_blocks):
+            return None
 
         pitches = self.pd.read(
             start_time=note.start_time,
@@ -615,67 +752,270 @@ class MistakeChecker:
             clean=True,
         )
         if not pitches:
-            return
+            return None
 
-        target_support = []
-        if target is not None:
-            target_support = [
-                p for p in pitches
-                if p.value != -1
-                and abs(p.value - target) <= self.config.pitch_tolerance
-            ]
-
-        medians = self._median_pitches(target_support or pitches)
-        if medians[0] != -1:
-            note.midi_num = medians
-
-    @staticmethod
-    def _median_pitches(pitches: list) -> list[float]:
-        medians = [-1, -1, -1]
-        cols = [[] for _ in medians]
-        for p in pitches:
-            if p is None or p.value == -1:
-                continue
-            cols[0].append(p.value)
-            for i in range(1, min(len(cols), len(p.candidate_pitches))):
-                midi = p.candidate_pitches[i][0]
-                if midi != -1:
-                    cols[i].append(midi)
-
-        for i, col in enumerate(cols):
-            if col:
-                medians[i] = float(np.median(col))
-        return medians
-
-    def _apply_edits(self, edits: list) -> NoteData:
-        """Build a fresh NoteData: drop the notes each edit replaces, add its
-        replacements, then re-sort by time and re-assign sequential ids."""
-        removed = {n.start_time for removed_notes, _ in edits for n in removed_notes}
-        notes = [n for n in self.nd.data.values() if n.start_time not in removed]
-        for _, added in edits:
-            notes.extend(added)
-
-        notes.sort(key=lambda n: n.start_time)
-        new_nd = NoteData()
-        for i, note in enumerate(notes):
-            note.id = i
-            new_nd.write_note(note)
-        return new_nd
-
-    def _realign(self, note_data: NoteData) -> Alignment:
-        """Re-run pitch-mistake detection against the score to produce a fresh Alignment.
-        Uses the CLIPPED score notes (the full NoteData when unclipped) — the same
-        set detect_mistakes aligns against — so the correction loop stays within
-        the clip and never merges the note after the clip into a clipped neighbor."""
-        midi_notes = self.recording.score_data.clipped_note_data(
-            channel=self.recording.active_instrument)
-        notes, mistakes = self.recording.mistake_detector.detect_pitch_mistakes(
-            user_string=note_data, midi_string=midi_notes, verbose=self.verbose)
-        alignment = Alignment(self.config)
-        alignment.load_alignment(notes, pitch_mistakes=mistakes)
-        if self.verbose:
-            print(
-                f"[check_mistakes] realigned: {len(mistakes)} pitch mistake(s)",
-                flush=True,
+        signal = np.asarray(
+            [pitch.value for pitch in pitches],
+            dtype=float,
+        ).reshape(-1, 1)
+        if len(score_blocks) == 1:
+            block_indices = [0, len(pitches)]
+            block_boundaries = [note.start_time, note.end_time]
+        else:
+            breakpoints = self.recording.note_detector.segment_breakpoints(
+                signal,
+                segment_count=len(score_blocks),
             )
-        return alignment
+            if breakpoints is None:
+                return None
+            block_indices = [0, *breakpoints]
+            block_boundaries = [note.start_time]
+            block_boundaries.extend(
+                self.recording.note_detector.get_boundary_time(pitches, index)
+                for index in breakpoints[:-1]
+            )
+            block_boundaries.append(note.end_time)
+
+        min_duration = self.config.min_note_seconds(
+            factor=self.config.min_note_length_factor,
+        )
+        split: list[Note] = []
+        for block_index, (
+            targets,
+            frame_start,
+            frame_end,
+            block_start,
+            block_end,
+        ) in enumerate(
+            zip(
+                score_blocks,
+                block_indices,
+                block_indices[1:],
+                block_boundaries,
+                block_boundaries[1:],
+            )
+        ):
+            target_durations = [target.duration() for target in targets]
+            target_total = sum(target_durations)
+            if target_total <= 0 or block_end <= block_start:
+                return None
+
+            boundaries = [block_start]
+            elapsed = 0.0
+            for duration in target_durations[:-1]:
+                elapsed += duration
+                boundaries.append(
+                    block_start
+                    + (block_end - block_start) * elapsed / target_total
+                )
+            boundaries.append(block_end)
+
+            block_pitches = pitches[frame_start:frame_end]
+            for target_index, (start_time, end_time) in enumerate(
+                zip(boundaries, boundaries[1:])
+            ):
+                if end_time - start_time < min_duration - self.COST_EPSILON:
+                    return None
+                segment_pitches = [
+                    pitch
+                    for pitch in block_pitches
+                    if pitch.time >= start_time
+                    and (
+                        pitch.time < end_time
+                        or (
+                            block_index == len(score_blocks) - 1
+                            and target_index == len(targets) - 1
+                            and pitch.time <= end_time
+                        )
+                    )
+                ]
+                if not segment_pitches:
+                    return None
+                split.append(
+                    Note(
+                        i=-1,
+                        start_time=float(start_time),
+                        end_time=float(end_time),
+                        midi_num=[
+                            float(np.median(
+                                [pitch.value for pitch in segment_pitches]
+                            ))
+                        ],
+                        velocity=note.velocity,
+                        instrument=note.instrument,
+                    )
+                )
+
+        return split if len(split) == len(score_targets) else None
+
+    def handle_insertion(
+        self,
+        mistakes: Mistake | list[Mistake],
+    ) -> Edit | None:
+        """Resegment insertion groups while retaining any supported note count."""
+        mistakes = [mistakes] if isinstance(mistakes, Mistake) else mistakes
+        mistakes = sorted(mistakes, key=lambda mistake: mistake.pair_index)
+        inserted = [
+            mistake.user_note
+            for mistake in mistakes
+            if mistake.user_note is not None
+        ]
+        if self.pd is None or not inserted:
+            return None
+
+        detector = self.recording.mistake_detector
+        pairs = self.alignment.pairs
+        first_index = mistakes[0].pair_index
+        last_index = mistakes[-1].pair_index
+        previous = pairs[first_index - 1] if first_index > 0 else (None, None)
+        following = (
+            pairs[last_index + 1]
+            if last_index + 1 < len(pairs)
+            else (None, None)
+        )
+        partition_cache: dict[
+            tuple[tuple[int, ...], int],
+            list[Note] | None,
+        ] = {}
+
+        def resegment_option(
+            hosts: list[Note],
+            anchors: list[tuple[Note, Note]],
+            score_targets: list[Note],
+            retained_count: int,
+            label: str,
+        ) -> dict | None:
+            segment_count = len(score_targets) + retained_count
+            cache_key = (
+                tuple(id(host) for host in hosts),
+                segment_count,
+            )
+            if cache_key not in partition_cache:
+                template = hosts[0]
+                region = Note(
+                    i=-1,
+                    start_time=min(host.start_time for host in hosts),
+                    end_time=max(host.end_time for host in hosts),
+                    midi_num=[template.midi_num[0]],
+                    velocity=template.velocity,
+                    instrument=template.instrument,
+                )
+                partition_cache[cache_key] = self._partition_region(
+                    region,
+                    segment_count,
+                )
+            split = partition_cache[cache_key]
+            if split is None:
+                return None
+            if self._crosses_blocking_silence(hosts, split):
+                if self.verbose:
+                    print(
+                        f"      [merge?] {label}: rejected across "
+                        "minimum-note-length silence"
+                    )
+                return None
+
+            old_cost = (
+                sum(
+                    detector.get_substitution_cost(user_note, score_note)
+                    for user_note, score_note in anchors
+                )
+                + sum(
+                    detector.get_insertion_cost(note) for note in inserted
+                )
+            )
+            local_alignment = detector.get_string_edit_alignment(
+                split,
+                score_targets,
+            )
+            # This handler may retain insertions, but it must not manufacture a
+            # score deletion while trying to remove over-segmentation.
+            if any(user_note is None for user_note, _ in local_alignment.pairs):
+                return None
+            new_cost = detector.get_alignment_cost(local_alignment)
+            saving = old_cost - new_cost
+            if self.verbose:
+                print(
+                    f"      [merge?] {label}, retain {retained_count}/"
+                    f"{len(inserted)} insertion(s): "
+                    f"{old_cost:.3f} -> {new_cost:.3f}"
+                )
+            if saving <= self.COST_EPSILON:
+                return None
+            return {
+                "removed": hosts,
+                "added": split,
+                "saving": saving,
+            }
+
+        previous_user, previous_score = previous
+        following_user, following_score = following
+        options = []
+        if previous_user is not None and previous_score is not None:
+            hosts = [previous_user, *inserted]
+            max_retained = min(
+                len(inserted) - 1,
+                self._segment_capacity(hosts) - 1,
+            )
+            for retained_count in range(max_retained + 1):
+                option = resegment_option(
+                    hosts,
+                    [(previous_user, previous_score)],
+                    [previous_score],
+                    retained_count,
+                    "previous",
+                )
+                if option is not None:
+                    options.append(option)
+
+        if following_user is not None and following_score is not None:
+            hosts = [*inserted, following_user]
+            max_retained = min(
+                len(inserted) - 1,
+                self._segment_capacity(hosts) - 1,
+            )
+            for retained_count in range(max_retained + 1):
+                option = resegment_option(
+                    hosts,
+                    [(following_user, following_score)],
+                    [following_score],
+                    retained_count,
+                    "following",
+                )
+                if option is not None:
+                    options.append(option)
+
+        if (
+            previous_user is not None
+            and previous_score is not None
+            and following_user is not None
+            and following_score is not None
+        ):
+            hosts = [previous_user, *inserted, following_user]
+            max_retained = min(
+                len(inserted) - 1,
+                self._segment_capacity(hosts) - 2,
+            )
+            for retained_count in range(max_retained + 1):
+                option = resegment_option(
+                    hosts,
+                    [
+                        (previous_user, previous_score),
+                        (following_user, following_score),
+                    ],
+                    [previous_score, following_score],
+                    retained_count,
+                    "previous+following",
+                )
+                if option is not None:
+                    options.append(option)
+
+        if not options:
+            return None
+
+        selected = max(options, key=lambda option: option["saving"])
+        return (
+            selected["removed"],
+            selected["added"],
+            selected["saving"],
+        )

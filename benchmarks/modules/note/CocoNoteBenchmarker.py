@@ -128,7 +128,7 @@ class CocoNoteBenchmarker(NoteBenchmarker, CocoChoralesBenchmarker):
         self.prepare_for_note_detection(
             recording,
             resize_score_to_pitch=(align == "resize"),
-            detect_transitions=True,
+            detect_transitions=False,
         )
         ref_iv, ref_pi = self.notedata_to_intervals(
             recording.score_data.clipped_note_data(channel=recording.active_instrument),
