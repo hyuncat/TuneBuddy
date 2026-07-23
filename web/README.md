@@ -24,9 +24,26 @@ all wired up: a "Colors:" dropdown next to the score switches its annotation
 color mode (mirrors `perform.py`'s `score_color_mode`), and GuitarHero's own
 pitch/volume dot-coloring toggle is ported too (`colors.js` has the viridis
 ramp + take-relative volume math, ported from `ui/Colors.py` +
-`PitchData.mean_volume`/`volume_range_db`). Vibrato is the one NoteInfo field
-still unported (shows "—" - no vibrato detection client-side yet). Not yet
-done: deployment (still runs locally only), a proper ScoreTimeMap port (score clicks before
+`PitchData.mean_volume`/`volume_range_db`).
+
+The right column also has a per-note inspector (`NotePanel.svelte`, ported
+from `ui/note/NotePanel.py`) below the mistake table, continuously tracking
+whichever note the playback cursor is currently inside and charting it - both
+tabs are fully wired: Volume (dBFS curve + pitch contour, `VolumeChart.svelte`,
+ported from `ui/note/VolumeWidget.py`) and Vibrato (Width/Speed metric
+toggle, viridis-colored scatter+line, `VibratoChart.svelte`, ported from
+`ui/note/VibratoWidget.py`). Vibrato itself is computed in Python
+unconditionally as a side effect of note detection (`Recording.detect_notes()`
+already called `recompute_vibrato()` before this - the web port was only
+ever missing the serialization step) and shipped as a `"vibrato"` key
+`/analyze` adds to its response after `to_cache_payload()` returns
+(`JsonHandler._vibrato_to_payload`) - deliberately NOT part of the shared
+desktop cache format, since vibrato is never persisted there either (cheap
+to recompute on load). All the windowing/smoothing (the 3-point median,
+per-note vs. take-wide ranges) happens client-side in `noteCurve.js`, off
+the raw grid, the same architecture as the Volume/pitch curves. The
+GuitarHero-style click popup's Vibrato row (`NoteOverlay.svelte`) is filled
+in from the same data too. Not yet done: deployment (still runs locally only), a proper ScoreTimeMap port (score clicks before
 any analysis has run use Verovio's own rendered timeline as a best-effort
 approximation - see `onNoteClicked` in `App.svelte`), and a few toolbar stubs
 (Settings, Save, Clip) that are either dead ends in the desktop app itself
@@ -163,6 +180,9 @@ web/
 │   ├── ScoreViewer.svelte    # Verovio notation iframe
 │   ├── NoteOverlay.svelte    # GuitarHero-equivalent pitch overlay
 │   ├── ResultsView.svelte    # mistake table + tolerance controls
+│   ├── NotePanel.svelte       # per-note inspector (Volume/Vibrato), below ResultsView
+│   ├── VolumeChart.svelte     # NotePanel's Volume tab chart
+│   ├── VibratoChart.svelte    # NotePanel's Vibrato tab chart
 │   ├── TransportBar.svelte   # play/pause/seek/Analyze
 │   ├── StatusBar.svelte
 │   ├── sessionState.svelte.js  # shared reactive app state (upload, analysis, mistakes)
@@ -172,6 +192,7 @@ web/
 │   ├── annotations.js          # client-side port of ScoreAnnotations.py - builds the
 │   │                            # score-note-indexed mistake payload ScoreViewer's iframe renders
 │   ├── colors.js                # viridis ramp + volume math, ported from ui/Colors.py + PitchData
+│   ├── noteCurve.js             # "note under the cursor" window + curve extraction for NotePanel
 │   ├── noteDataCache.js        # content-hash-keyed cache for /notedata responses
 │   ├── realign.js              # debounced /realign calls for pitch-tolerance changes
 │   ├── theme.css               # dark theme, extracted from qdarktheme's real stylesheet

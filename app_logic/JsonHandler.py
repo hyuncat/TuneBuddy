@@ -574,6 +574,45 @@ class JsonHandler:
         td.load_quantized(np.frombuffer(raw, dtype=np.uint8), int(payload.get("n_cols", 0)))
         return td
 
+    @staticmethod
+    def _vibrato_to_payload(vibrato_data) -> dict:
+        """Per-grid-point [time, rate_hz, extent_cents, quality] rows (see
+        VibratoData's uniform grid) for the web API only - deliberately NOT
+        part of to_cache_payload()/load_cache_payload(), since vibrato is
+        never persisted to the desktop app's local cache either (cheap to
+        recompute from pitch+note data on load; see Recording.recompute_vibrato,
+        called unconditionally from detect_notes()). web/api/analyze_api.py
+        adds this key to its response directly, after to_cache_payload()
+        returns, rather than folding it into the shared cache format.
+
+        Raw grid, unsmoothed - mirrors _pitch_to_payload's own raw-frame
+        style. The web client windows/smooths this itself per note (see
+        web/src/noteCurve.js), the same way it already builds the pitch
+        contour and volume curve from raw pitch frames rather than a
+        pre-windowed server response.
+        """
+        if vibrato_data is None:
+            return {"points": []}
+        n = int(vibrato_data.computed_until)
+        if n <= 0:
+            return {"points": []}
+        times = vibrato_data.index_time(np.arange(n, dtype=float))
+        with vibrato_data.lock:
+            rates = vibrato_data.rates[:n]
+            extents = vibrato_data.extents[:n]
+            qualities = vibrato_data.qualities[:n]
+        return {
+            "points": [
+                [
+                    JsonHandler._pack_number(times[i]),
+                    JsonHandler._pack_number(rates[i]),
+                    JsonHandler._pack_number(extents[i]),
+                    JsonHandler._pack_number(qualities[i]),
+                ]
+                for i in range(n)
+            ],
+        }
+
     def _pitch_from_payload(self, recording: Recording, payload) -> Pitch | None:
         if payload is None:
             return None

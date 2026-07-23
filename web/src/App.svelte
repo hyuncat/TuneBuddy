@@ -8,6 +8,7 @@
   import ScoreViewer from "./ScoreViewer.svelte";
   import NoteOverlay from "./NoteOverlay.svelte";
   import ResultsView from "./ResultsView.svelte";
+  import NotePanel from "./NotePanel.svelte";
   import Toolbar from "./Toolbar.svelte";
   import RecordingTree from "./RecordingTree.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
@@ -143,6 +144,8 @@
             pitchMistakes={session.pitchMistakes}
             timingMistakes={session.timingMistakes}
             pitchFrames={session.analysisResult.pitch_data?.pitches}
+            vibratoPoints={session.analysisResult.vibrato?.points}
+            vibMinCycles={session.analysisResult.config?.vib_min_cycles}
             pitchTolerance={session.pitchTolerance}
             currentTime={playback.currentTime}
             selectedMistake={session.selectedMistake}
@@ -159,7 +162,17 @@
     </section>
 
     <aside class="right-column">
-      <ResultsView />
+      <div class="results-pane">
+        <ResultsView />
+      </div>
+      <div class="note-panel-pane">
+        <NotePanel
+          userNotesActive={session.analysisResult?.note_data}
+          pitchFrames={session.analysisResult?.pitch_data?.pitches}
+          vibratoPoints={session.analysisResult?.vibrato?.points}
+          currentTime={playback.currentTime}
+        />
+      </div>
     </aside>
   </div>
 
@@ -279,9 +292,24 @@
   .right-column {
     width: 296px;
     flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
     border-left: 4px solid var(--border);
     background: var(--bg-window);
     min-width: 240px;
     max-width: 420px;
+  }
+  /* app.py's right_column QSplitter: MistakeWidget+ToleranceWidget take the
+     slack, NotePanel keeps a fixed size below it (setStretchFactor(1, 0)). */
+  .results-pane {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .note-panel-pane {
+    height: 300px;
+    flex-shrink: 0;
+    border-top: 4px solid var(--border);
+    overflow: hidden;
   }
 </style>

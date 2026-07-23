@@ -16,6 +16,7 @@
   //     mkPen(0, 255, 0, 255))
   import { noteFromArray, noteName } from "./mistakes.js";
   import { meanVolume, volumeFrac, volumeRangeDb, viridis, cssRgb } from "./colors.js";
+  import { vibratoNoteSummary } from "./noteCurve.js";
 
   let {
     scoreNotes,
@@ -25,6 +26,8 @@
     timingMistakes = [],
     pitchTolerance,
     pitchFrames = null,
+    vibratoPoints = null,
+    vibMinCycles = 1.5,
     currentTime = null,
     selectedMistake = null,
     selectedMistakeOverridden = false,
@@ -292,6 +295,7 @@
       onsetMistake: timing.onset,
       durationMistake: timing.duration,
       volumeFrac: noteVolumeFrac(note),
+      vibrato: vibratoNoteSummary(vibratoPoints, note, vibMinCycles),
     };
   });
 
@@ -376,9 +380,6 @@
       fill={userNoteColor(i)}
       class="user-note"
       class:hovered={hoveredNoteIdx === i}
-      onclick={(ev) => handleNoteClick(ev, i)}
-      onmouseenter={() => handleNoteHover(i)}
-      onmouseleave={handleNoteLeave}
     />
   {/each}
 
@@ -393,6 +394,27 @@
   {#each highlightRects as r}
     <rect x={r.x} y={r.y} width={r.width} height={r.height} class="mistake-highlight" class:overridden={selectedMistakeOverridden} />
   {/each}
+
+  <!-- Invisible, enlarged click/hover targets for user notes - drawn last
+       (highest z) so they always win hit-testing over the pitch dots/lines
+       drawn on top of the thin visible bars. Height mirrors GuitarHero's own
+       CLICK_SLACK (±0.5 semitones around the note's pitch, so it scales with
+       the current pitch-range zoom the same way desktop's slack does,
+       instead of a fixed pixel guess); width gets a slightly bigger floor
+       than the visible bar's so short/grace notes stay clickable. -->
+  {#each userNotesParsed as note, i}
+    <rect
+      x={xPos(note.startTime)}
+      y={yPos(topPitch(note)) - semitoneHeight / 2}
+      width={Math.max(4, xPos(note.endTime) - xPos(note.startTime))}
+      height={semitoneHeight}
+      fill="transparent"
+      class="user-note-hit"
+      onclick={(ev) => handleNoteClick(ev, i)}
+      onmouseenter={() => handleNoteHover(i)}
+      onmouseleave={handleNoteLeave}
+    />
+  {/each}
 </svg>
 
 {#if noteInfo}
@@ -400,7 +422,11 @@
     <p><b>Pitch:</b> {noteInfo.noteName} {noteInfo.cents >= 0 ? "+" : ""}{noteInfo.cents.toFixed(0)}¢</p>
     <p><b>Onset:</b> {noteInfo.onset.toFixed(2)}s{noteInfo.onsetMistake ? ` (${TIMING_LABELS[noteInfo.onsetMistake]})` : ""}</p>
     <p><b>Duration:</b> {noteInfo.duration.toFixed(2)}s{noteInfo.durationMistake ? ` (${TIMING_LABELS[noteInfo.durationMistake]})` : ""}</p>
-    <p><b>Vibrato:</b> —</p>
+    {#if noteInfo.vibrato}
+      <p><b>Vibrato:</b> f={noteInfo.vibrato.rate.toFixed(1)}Hz, A={noteInfo.vibrato.extent.toFixed(0)}¢</p>
+    {:else}
+      <p><b>Vibrato:</b> —</p>
+    {/if}
     {#if noteInfo.volumeFrac != null}
       <p class="volume-row">
         <b>Volume:</b>
@@ -466,10 +492,12 @@
   }
   .user-note {
     opacity: 0.95;
-    cursor: pointer;
   }
   .user-note.hovered {
     opacity: 1;
+  }
+  .user-note-hit {
+    cursor: pointer;
   }
   .overlay-wrap {
     position: relative;

@@ -146,7 +146,8 @@ async def analyze(
             rec.mistake_detector.detect_timing_mistakes()
             rec.trim_end()
 
-            payload = JsonHandler(rec).to_cache_payload(
+            handler = JsonHandler(rec)
+            payload = handler.to_cache_payload(
                 score_filepath=str(score_path), recording_name="upload"
             )
         except ValueError as e:
@@ -164,6 +165,13 @@ async def analyze(
     # the desktop app's local .json.xz cache format and deliberately left
     # unmodified - this trims only the API response.
     payload["alignment"] = {"pairs": payload["alignment"]["pairs"]}
+    # Vibrato is already computed as a side effect of detect_notes() above
+    # (Recording.detect_notes() -> recompute_vibrato(), unconditional) - this
+    # is pure serialization, not extra analysis work. Added here rather than
+    # in to_cache_payload() itself: vibrato is deliberately never persisted to
+    # the desktop app's local cache (cheap to recompute on load), so this key
+    # is web-API-only, not part of the shared cache payload shape.
+    payload["vibrato"] = JsonHandler._vibrato_to_payload(rec.vibrato_data)
     return payload
 
 
