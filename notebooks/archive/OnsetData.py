@@ -1,3 +1,10 @@
+"""Archived custom spectral-onset experiment (not imported by live code).
+
+This snapshot references the former onset_* Config fields and is retained only
+for experiment provenance. Production note detection and mistake correction no
+longer compute or consume spectral onsets.
+"""
+
 import threading
 import numpy as np
 from bisect import bisect_left, bisect_right

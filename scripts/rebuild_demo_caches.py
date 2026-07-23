@@ -94,11 +94,11 @@ def rebuild_one(meta: dict) -> dict:
             # mirror perform.py::analyze, minus the UI refreshes
             rec.reset_analysis()
             rec.detect_notes()
+            rec.resize_score(to_span="onset")
             rec.detect_mistakes()
-            rec.mistake_checker.mistake_correction_loop()
+            rec.stabilize_score_alignment()
             rec.reindex_mistakes()
             rec.update_alignment_distances()
-            rec.mistake_detector.detect_timing_mistakes()
             rec.trim_end()
 
             saved = JsonHandler(rec).save_cache(

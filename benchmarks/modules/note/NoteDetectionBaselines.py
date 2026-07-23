@@ -72,34 +72,16 @@ class BenchmarkNoteDetector:
     def detect(
         self,
         method: str = "ruptures",
-        refined_with_onsets: bool | None = None,
-        refine_with_onsets: bool | None = None,
-        onset_data=None,
         **kwargs: Any,
     ) -> NoteData:
-        """Dispatch one benchmark method.
-
-        `refine_with_onsets` is accepted as a compatibility alias; the benchmark
-        output column uses `refined_with_onsets`.
-        """
-        if refined_with_onsets is None:
-            refined_with_onsets = bool(refine_with_onsets)
-
+        """Dispatch one benchmark method."""
         method = self._normalize_method(method)
         if method == "ruptures":
             notes = self.detect_ruptures(**kwargs)
         elif method == "slope_window":
-            notes = self.detect_slope_window(onset_data=onset_data, **kwargs)
+            notes = self.detect_slope_window(**kwargs)
         elif method == "crepe_notes":
-            notes = self.detect_crepe_notes(onset_data=onset_data, **kwargs)
-        elif method == "onset_only":
-            notes = self.detect_onset_only(onset_data=onset_data, **kwargs)
-        elif method == "onset_pitch_hybrid":
-            notes = self.detect_onset_only(
-                onset_data=onset_data,
-                merge_adjacent=True,
-                **kwargs,
-            )
+            notes = self.detect_crepe_notes(**kwargs)
         elif method == "basic_pitch":
             notes = self.detect_basic_pitch(**kwargs)
         elif method == "tony_pyin":
@@ -112,27 +94,14 @@ class BenchmarkNoteDetector:
         else:
             raise ValueError(f"unknown note benchmark method: {method!r}")
 
-        if refined_with_onsets:
-            notes = self.refine_with_onsets(notes, onset_data=onset_data)
         return notes
 
-    def refine_with_onsets(self, note_data: NoteData, onset_data=None) -> NoteData:
-        onset_data = self._onset_data(onset_data)
-        onset_times = None if onset_data is None else onset_data.read()
-        return self.detector.refine_with_onsets(
-            clone_note_data(note_data),
-            onset_times,
-        )
-
     def apply_transition_postprocess(self, note_data: NoteData) -> NoteData:
-        """Run the production post-detection cleanup: re-median each note over its
-        non-transition frames, then drop notes that are mostly slide frames.
+        """Legacy benchmark-only transition cleanup.
 
-        Mirrors ``perform.py::analyze`` (recompute_note_pitches -> prune_transition
-        _notes). Transition frames must already be flagged (the note benchmarker
-        does this in ``prepare_for_note_detection`` / the slope-window detector runs
-        it itself). Applied to every change-point family; the external / onset-only
-        ("moreover") baselines opt out."""
+        Production no longer marks or removes transition frames. This remains
+        available only for explicit historical baseline comparisons.
+        """
         pitch_data = self.recording.pitch_data
         notes = clone_note_data(note_data)
         self._recompute_note_pitches(notes, pitch_data)
@@ -146,15 +115,18 @@ class BenchmarkNoteDetector:
         model: str = "l2",
         cost: str | None = None,
         pen: float | None = None,
+        pitch_step_semitones: float | None = None,
+        min_note_length_factor: float | None = None,
+        min_silence_duration_ms: float | None = None,
         jump: int | None = None,
         width: int | None = None,
         n_bkps: int | None = None,
         oracle_note_count: bool = False,
-        exclude_transitions: bool = True,
+        exclude_transitions: bool = False,
         do_transitions: bool | None = None,
         features: Sequence[str] | None = None,
         standardize_features: bool | None = None,
-        merge_adjacent: bool = True,
+        merge_adjacent: bool = False,
         **_unused: Any,
     ) -> NoteData:
         if algorithm is not None:
@@ -166,15 +138,20 @@ class BenchmarkNoteDetector:
             exclude_transitions = bool(do_transitions)
         self._prepare_transition_flags(exclude_transitions)
 
-        min_size = self._pelt_min_size_from_score()
-        runs = self._pelt_runs(
-            self.recording.pitch_data,
-            min_gap_frames=min_size,
+        self._configure_note_segmentation(
+            min_note_length_factor=min_note_length_factor,
+            min_silence_duration_ms=min_silence_duration_ms,
         )
+        min_size = self._pelt_min_size_from_score()
+        runs = self._pelt_runs(self.recording.pitch_data)
         if not runs:
             return NoteData()
 
-        penalty = self._pelt_penalty(min_size) if pen is None else float(pen)
+        penalty = (
+            self._pelt_penalty(min_size, pitch_step_semitones)
+            if pen is None
+            else float(pen)
+        )
         pelt_jump = self._pelt_jump(jump)
         feature_names = tuple(features or self._default_features(cost or model))
         if standardize_features is None:
@@ -406,8 +383,8 @@ class BenchmarkNoteDetector:
 
                 segment = list(pitches[prev:end])
                 midi_num = self._pelt_segment_pitch(segment)
-                start_time = self._pelt_boundary_time(pitches, prev)
-                end_time = self._pelt_boundary_time(pitches, end)
+                start_time = self.detector.get_boundary_time(pitches, prev)
+                end_time = self.detector.get_boundary_time(pitches, end)
                 if end_time <= start_time:
                     prev = end
                     continue
@@ -445,7 +422,6 @@ class BenchmarkNoteDetector:
         unv_ratio: float = 0.8,
         refine_onsets: bool = True,
         exclude_transitions: bool = True,
-        onset_data=None,
         **_unused: Any,
     ) -> NoteData:
         """The original (pre-PELT) sliding-window, slope-aware note detector.
@@ -607,56 +583,6 @@ class BenchmarkNoteDetector:
 
             return self._notedata_from_midi(Path(midi_path), origin=origin)
 
-    def detect_onset_only(
-        self,
-        exclude_transitions: bool = False,
-        merge_adjacent: bool = False,
-        min_note_factor: float | None = None,
-        onset_data=None,
-        **_unused: Any,
-    ) -> NoteData:
-        """Segment from spectral onsets alone, then assign median pitch per span."""
-        self._prepare_transition_flags(exclude_transitions)
-        onset_data = self._onset_data(onset_data)
-        if onset_data is None or len(onset_data) == 0:
-            return NoteData()
-
-        factor = self.detector.MIN_NOTE_FACTOR if min_note_factor is None else min_note_factor
-        min_seconds = getattr(self.config, "min_note_length", 0.03)
-        try:
-            score_note_data = self.recording.score_data.clipped_note_data(
-                channel=self.recording.active_instrument
-            )
-            min_seconds = score_note_data.get_min_note_length(default=float(min_seconds), clean=True)
-        except (AttributeError, KeyError, TypeError):
-            pass
-        min_seconds = max(0.0, float(min_seconds) * factor)
-        min_frames = max(1, int(np.ceil(min_seconds * (self.config.sr / self.config.h1))))
-        runs = self._pelt_runs(
-            self.recording.pitch_data,
-            min_gap_frames=min_frames,
-        )
-
-        bkps_by_run = []
-        for run in runs:
-            run_start = self._pelt_boundary_time(run, 0)
-            run_end = self._pelt_boundary_time(run, len(run))
-            boundaries = []
-            for onset_time in onset_data.read(run_start, run_end):
-                if onset_time - run_start < min_seconds or run_end - onset_time < min_seconds:
-                    continue
-                idx = int(np.searchsorted([p.time for p in run], float(onset_time)))
-                if min_frames <= idx <= len(run) - min_frames:
-                    boundaries.append(idx)
-            boundaries.append(len(run))
-            bkps_by_run.append(sorted(set(boundaries)))
-
-        return self._notes_from_run_breakpoints(
-            runs,
-            bkps_by_run,
-            merge_adjacent=merge_adjacent,
-        )
-
     def detect_basic_pitch(
         self,
         onset_threshold: float = 0.5,
@@ -685,7 +611,10 @@ class BenchmarkNoteDetector:
                 min_seconds = score_note_data.get_min_note_length(default=float(min_seconds), clean=True)
             except (AttributeError, KeyError, TypeError):
                 pass
-            min_length = 1000.0 * max(0.0, float(min_seconds) * self.detector.MIN_NOTE_FACTOR)
+            min_length = 1000.0 * max(
+                0.0,
+                float(min_seconds) * self.config.min_note_length_factor,
+            )
         model_path = None
         try:
             from basic_pitch import ICASSP_2022_MODEL_PATH
@@ -893,40 +822,51 @@ class BenchmarkNoteDetector:
                 medians[i] = float(np.median(values))
         return medians
 
+    def _configure_note_segmentation(
+        self,
+        min_note_length_factor: float | None = None,
+        min_silence_duration_ms: float | None = None,
+    ) -> None:
+        """Apply benchmark overrides through the recording's Config."""
+        changed = False
+        if min_note_length_factor is not None:
+            self.config.min_note_length_factor = float(min_note_length_factor)
+            changed = True
+        if min_silence_duration_ms is not None:
+            self.config.min_silence_duration_ms = float(min_silence_duration_ms)
+            changed = True
+        if changed:
+            self.recording.update_config(self.config)
+
     def _pelt_min_size_from_score(self) -> int:
-        return max(
-            1,
-            round(
-                self.detector.MIN_NOTE_FACTOR
-                * self.config.get_min_note_length(type="frames")
-            ),
+        return self.config.min_note_pitch_frames(
+            factor=self.config.min_note_length_factor,
         )
 
-    def _pelt_penalty(self, min_size: int) -> float:
-        return 0.5 * int(min_size) * (self.config.pitch_thresh ** 2)
+    def _pelt_penalty(
+        self,
+        min_size: int,
+        pitch_step_semitones: float | None = None,
+    ) -> float:
+        pitch_step = (
+            self.config.pitch_thresh
+            if pitch_step_semitones is None
+            else float(pitch_step_semitones)
+        )
+        return 0.5 * int(min_size) * (pitch_step ** 2)
 
     def _pelt_jump(self, jump: int | None = None) -> int:
-        return max(1, int(self.config.h2 if jump is None else jump))
+        return max(1, int(1 if jump is None else jump))
 
     def _pelt_runs(
         self,
         pitch_data: PitchData,
-        min_gap_frames: int | None = None,
     ) -> list[list[Pitch]]:
-        del min_gap_frames
         return self.recording.note_detector.get_pitch_runs(pitch_data.data)
 
     def _pelt_segment_pitch(self, pitches: Sequence[Pitch]) -> list[float]:
         med = self._get_median_pitches(pitches, n_candidates=3)
         return med if med[0] != -1 else [-1.0, -1.0, -1.0]
-
-    @staticmethod
-    def _pelt_boundary_time(pitches: Sequence[Pitch], i: int) -> float:
-        if i <= 0:
-            return pitches[0].time
-        if i >= len(pitches):
-            return pitches[-1].time
-        return 0.5 * (pitches[i - 1].time + pitches[i].time)
 
     def _same_note_pitch(self, note: Note | None, midi_num: Sequence[float]) -> bool:
         if note is None or not note.midi_num or not midi_num:
@@ -1076,7 +1016,6 @@ class BenchmarkNoteDetector:
             "crepe": "crepe_notes",
             "crepe-notes": "crepe_notes",
             "basic-pitch": "basic_pitch",
-            "onsets": "onset_only",
         }
         return aliases.get(method, method)
 
@@ -1089,23 +1028,6 @@ class BenchmarkNoteDetector:
         for pitch in self.recording.pitch_data.data:
             if pitch is not None:
                 pitch.is_transition = False
-
-    def _onset_data(self, onset_data=None):
-        if onset_data is not None:
-            return onset_data
-        existing = getattr(self.recording, "onset_data", None)
-        if existing is not None:
-            return existing
-        detector = getattr(self.recording, "onset_detector", None)
-        if detector is None:
-            from app_logic.user.ds.OnsetData import OnsetDetector
-
-            detector = OnsetDetector(self.recording)
-            self.recording.onset_detector = detector
-        detector.update_config(self.config)
-        onset_data = detector.detect()
-        self.recording.onset_data = onset_data
-        return onset_data
 
     @staticmethod
     def _confidence(pitch: Pitch) -> float:
@@ -1127,7 +1049,10 @@ class BenchmarkNoteDetector:
             min_seconds = score_note_data.get_min_note_length(default=float(min_seconds), clean=True)
         except (AttributeError, KeyError, TypeError):
             pass
-        min_seconds = max(0.0, float(min_seconds) * self.detector.MIN_NOTE_FACTOR)
+        min_seconds = max(
+            0.0,
+            float(min_seconds) * self.config.min_note_length_factor,
+        )
         out = NoteData()
 
         for idx, note in enumerate(note_data.read(i=0, j=len(note_data.times))):

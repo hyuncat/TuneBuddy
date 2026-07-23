@@ -257,9 +257,21 @@ class PerformTab(QWidget):
         """Each recording owns its own pitch detector; connect each only once."""
         if rec is None or rec.pitch_detector in self._wired_detectors:
             return
+        rec.pitch_detector.pitch_detected.connect(self._on_live_pitch_detected)
         rec.pitch_detector.status_changed.connect(self.status_bar.update_status)
         rec.pitch_detector.detection_finished.connect(self._on_detection_finished)
         self._wired_detectors.add(rec.pitch_detector)
+
+    def _on_live_pitch_detected(self, _t: float):
+        """Refresh pitch dots immediately instead of waiting for a clock tick."""
+        detector = self.sender()
+        if (
+            not self.is_recording
+            or self.recording is None
+            or (detector is not None and detector is not self.recording.pitch_detector)
+        ):
+            return
+        self.guitar_hero.schedule_live_pitch_refresh()
 
     def set_user_audio_enabled(self, enabled: bool):
         """Mirror the toolbar 'User' checkbox; stop playback now if turning off."""
@@ -516,28 +528,19 @@ class PerformTab(QWidget):
             return
         print("analyzing... ")
         rec.reset_analysis()  # clear stale notes/alignment/mistakes before recomputing
-        rec.detect_notes(use_transitions=False)
-        # rec.recompute_note_pitches()
-        # rec.prune_transition_notes()
+        rec.detect_notes()
 
         # Give the initial alignment an onset-fitted score. Count-in/runway and
         # the final note's release must never affect the fitted tempo.
         rec.resize_score(to_span="onset")
         rec.detect_mistakes()
-        rec.mistake_checker.mistake_correction_loop()
 
-        # Correction can split/merge the edge notes and thereby change the
-        # take's first/last onset. Refit from the FINAL corrected onsets before
-        # GuitarHero renders the score bars, then relink the alignment because
-        # change_tempo() rebuilt the score Note objects.
-        if not rec.resize_score_to_aligned_onsets():
-            rec.resize_score(to_span="onset")
-        rec.alignment.sync_score_notes(
-            rec.score_data.note_datas.get(rec.active_instrument)
-        )
+        # A raw endpoint insertion/deletion can bias the provisional tempo fit.
+        # Refit from matched onsets before the first correction, then alternate
+        # realignment and correction until boundaries and pairs stabilize.
+        rec.stabilize_score_alignment()
         rec.reindex_mistakes()
         rec.update_alignment_distances() # color the user pitches by the final alignment
-        rec.mistake_detector.detect_timing_mistakes()  # derive early/late/short/long from the final alignment
         rec.trim_end()
         rec.analysis_notice = ""
 
@@ -573,11 +576,7 @@ class PerformTab(QWidget):
     def _refresh_mistake_widget(self, rec: Recording):
         """Push both mistake lists into the panel: the detected PITCH mistakes
         and the derived TIMING mistakes (early/late/short/long). The dropdown
-        picks which is shown. Timing mistakes are computed as a step of analyze();
-        backfill them here only for an already-analyzed take loaded from cache
-        (its alignment is restored but the derived list isn't persisted)."""
-        if rec.has_analysis() and not rec.alignment.timing_mistakes:
-            rec.mistake_detector.detect_timing_mistakes()
+        picks which is shown. Both lists are built during alignment."""
         self.mistake_widget.load_mistakes(rec.alignment.pitch_mistakes)
         self.mistake_widget.load_timing_mistakes(rec.alignment.timing_mistakes)
         self._refresh_score_mistakes(rec)

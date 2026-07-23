@@ -139,11 +139,11 @@ async def analyze(
             # mirrors perform.py analyze method's call sequence
             rec.reset_analysis()
             rec.detect_notes()
+            rec.resize_score(to_span="onset")
             rec.detect_mistakes()
-            rec.mistake_checker.mistake_correction_loop()
+            rec.stabilize_score_alignment()
             rec.reindex_mistakes()
             rec.update_alignment_distances()
-            rec.mistake_detector.detect_timing_mistakes()
             rec.trim_end()
 
             payload = JsonHandler(rec).to_cache_payload(
@@ -221,16 +221,11 @@ class RealignRequest(BaseModel):
 
 @app.post("/realign")
 async def realign(payload: RealignRequest) -> dict:
-    """Re-run pitch-mistake alignment at a new pitch tolerance, without
-    re-uploading audio or re-running pitch/note detection. This calls the
-    real MistakeDetector.detect_pitch_mistakes() - the same production path
-    Recording.detect_mistakes() uses by default (onset_aware=False) - rather
-    than a JS reimplementation: pitch tolerance is baked into the alignment's
-    own DP cost matrix (see algorithms/MistakeDetector.py's
-    _substitution_cost), so a tolerance change can genuinely change which
-    notes pair with which, not just relabel a fixed pairing. Reusing the
-    real algorithm here means zero risk of a hand-ported version silently
-    producing a different (wrong) alignment than the desktop app would.
+    """Return production string-edit pairs while applying a new classification
+    tolerance, without re-uploading audio or re-running pitch/note detection.
+    Pairing itself uses weighted absolute pitch/onset/duration errors and is
+    independent of the classification threshold; pitch_tolerance determines
+    which returned diagonal pairs are substitutions.
 
     Only pitch tolerance goes through this endpoint - timing-mistake
     reclassification (early/late/short/long) is a simple fixed-pairs
@@ -247,8 +242,9 @@ async def realign(payload: RealignRequest) -> dict:
     config = Config(pitch_tolerance=payload.pitch_tolerance)
     detector = MistakeDetector(config=config)
     try:
-        aligned_pairs, _mistakes = detector.detect_pitch_mistakes(
-            user_string=user_nd, midi_string=score_nd
+        alignment = detector.detect_mistakes(
+            user_notes=user_nd,
+            score_notes=score_nd,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Realignment failed: {e}")
@@ -269,7 +265,7 @@ async def realign(payload: RealignRequest) -> dict:
                 JsonHandler._lookup_note_index(u, user_maps),
                 JsonHandler._lookup_note_index(s, score_maps),
             ]
-            for u, s in aligned_pairs
+            for u, s in alignment.pairs
         ]
     }
 

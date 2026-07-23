@@ -32,6 +32,11 @@ class Note:
             return "—"
         return Config.get_note_name(self.midi_num[0], prefer_flats=prefer_flats)
 
+    def duration(self) -> float:
+        """Return this note's nonnegative duration in seconds."""
+        return max(0.0, float(self.end_time - self.start_time))
+
+
 class NoteData:
     """Data to store and retrieve notes efficiently (indexing + binary search)
     Supports read by index and by start/end time."""
@@ -120,7 +125,7 @@ class NoteData:
             n = self.data[t]
             if clean and (not n.midi_num or n.midi_num[0] == -1):
                 continue
-            note_length = n.end_time - n.start_time
+            note_length = n.duration()
             if note_length > 0 and note_length < min_length:
                 min_length = note_length
         

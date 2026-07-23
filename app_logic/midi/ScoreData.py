@@ -472,7 +472,7 @@ class ScoreData:
                 else:
                     element = m21chord.Chord(midis)
                 element.duration = m21duration.Duration(
-                    max(quantum, quantize((n.end_time - n.start_time) * sec_to_ql))
+                    max(quantum, quantize(n.duration() * sec_to_ql))
                 )
                 part.insert(max(0.0, quantize(n.start_time * sec_to_ql)), element)
             part.makeMeasures(inPlace=True)

@@ -1019,7 +1019,8 @@ class Attune(QMainWindow):
             rec.config.timing_tolerance = tolerance
             rec.update_config(rec.config)
             if rec.has_analysis():
-                rec.mistake_detector.detect_timing_mistakes()
+                rec.detect_mistakes()
+                self.perform_tab.guitar_hero.load_alignment(rec.alignment)
                 self.perform_tab.refresh_mistake_widget(rec)
             self._save_recording_cache(rec, recording_name=self.active_recording_name)
             return

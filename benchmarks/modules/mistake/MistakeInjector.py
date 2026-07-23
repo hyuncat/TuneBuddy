@@ -25,7 +25,7 @@ from benchmarks.paths import REPO_ROOT, ensure_repo_on_path  # noqa: E402
 
 ensure_repo_on_path()
 ROOT = REPO_ROOT
-MistakeType = Literal["substitution", "deletion", "insertion"]
+MistakeType = Literal["substitution", "deletion", "insertion", "short", "long"]
 _SOURCE_SCORE_ID_UNSET = object()
 
 
@@ -33,6 +33,9 @@ class TruthEvent(TypedDict, total=False):
     type: MistakeType
     score_note_id: int
     time: float
+    original_duration: float
+    performed_duration: float
+    duration_error: float
 
 
 class MistakeInjector:
@@ -40,6 +43,10 @@ class MistakeInjector:
     Interface for injecting mistakes into scores, symbolically or re-synthesized through audio.
     Mirrors the PolyTune methods 'augment_mistakes' and 'add_screwups' sampling from 
     'lambda_occur ~ U(0.1, 0.4)' and applying +/-50% count jitter to select error indices.
+
+    Attune extends the original pitch-edit injection with explicit short/long
+    events. Those events preserve onset and pitch, alter duration by a sampled
+    absolute number of seconds, and emit timing ground truth for evaluation.
     
     Rk: When synthesized, the first and last notes are artificially longer due to reverb.
     We hard-correct for this by truncating any excess for those two edge notes only, and likewise
@@ -53,6 +60,9 @@ class MistakeInjector:
     POLYTUNE_TIMING_MEAN_MS = 0.0
     POLYTUNE_TIMING_STD_MS = 300.0
     POLYTUNE_SCREWUP_TYPES = tuple(range(16))
+    SHORT_DURATION_CODE = 4
+    LONG_DURATION_CODE = 5
+    DURATION_ERROR_RANGE_SEC = (0.30, 0.60)
 
     def __init__(
         self,
@@ -62,6 +72,7 @@ class MistakeInjector:
         duration_std: float = POLYTUNE_DURATION_STD,
         timing_mean_ms: float = POLYTUNE_TIMING_MEAN_MS,
         timing_std_ms: float = POLYTUNE_TIMING_STD_MS,
+        duration_error_range_sec: tuple[float, float] = DURATION_ERROR_RANGE_SEC,
         allow_overlap: bool = True,
         protect_boundary_notes: bool = True,
         mistake_rate: float | None = None,
@@ -78,14 +89,19 @@ class MistakeInjector:
                 raise ValueError("screwup_type_weights must have length 16")
             self.screwup_type_weights = self._normalize_weights(screwup_type_weights)
         elif weights is not None:
-            # Compatibility for old notebooks using (substitution, deletion,
-            # insertion). Timing-only codes keep zero probability in this mode.
-            if len(weights) != 3:
-                raise ValueError("weights must have length 3")
+            # Backwards compatible 3-vector:
+            #   (substitution, deletion, insertion)
+            # Duration-aware 5-vector:
+            #   (substitution, deletion, insertion, short, long)
+            if len(weights) not in {3, 5}:
+                raise ValueError("weights must have length 3 or 5")
             probs = np.zeros(16, dtype=float)
             probs[1] = float(weights[0])
             probs[0] = float(weights[1])
             probs[3] = float(weights[2])
+            if len(weights) == 5:
+                probs[self.SHORT_DURATION_CODE] = float(weights[3])
+                probs[self.LONG_DURATION_CODE] = float(weights[4])
             self.screwup_type_weights = self._normalize_weights(probs)
         else:
             self.screwup_type_weights = tuple([1.0 / 16.0] * 16)
@@ -95,6 +111,15 @@ class MistakeInjector:
         self.duration_std = float(duration_std)
         self.timing_mean_ms = float(timing_mean_ms)
         self.timing_std_ms = float(timing_std_ms)
+        duration_error_min, duration_error_max = map(float, duration_error_range_sec)
+        if duration_error_min <= 0 or duration_error_max < duration_error_min:
+            raise ValueError(
+                "duration_error_range_sec must be positive and ordered"
+            )
+        self.duration_error_range_sec = (
+            duration_error_min,
+            duration_error_max,
+        )
         self.allow_overlap = allow_overlap
         self.protect_boundary_notes = protect_boundary_notes
         self.out_dir = (
@@ -168,6 +193,41 @@ class MistakeInjector:
         duration_var = random_generator.gamma(shape, scale)
         out = max(0.5 * duration, duration * duration_var)
         return float(min(out, 2.0 * duration))
+
+    def _duration_mistake_span(
+        self,
+        notes: Sequence[Note],
+        note_index: int,
+        requested_type: Literal["short", "long"],
+        random_generator: np.random.Generator,
+    ) -> tuple[Literal["short", "long"], float, float]:
+        """Change duration while holding onset and pitch fixed.
+
+        Errors are sampled in seconds because production timing tolerance is in
+        seconds. A note too short to support the requested short error becomes a
+        long example instead; otherwise clamping would create a nominal "short"
+        truth event below the detector's default 0.25 s tolerance.
+        """
+        note = notes[note_index]
+        start = float(note.start_time)
+        original_duration = max(1e-6, note.duration())
+        error_min, error_max = self.duration_error_range_sec
+        mistake_type = requested_type
+        if mistake_type == "short" and original_duration <= error_min + 1e-6:
+            mistake_type = "long"
+
+        if mistake_type == "short":
+            maximum = min(error_max, original_duration - 1e-6)
+            error = float(random_generator.uniform(error_min, maximum))
+            duration = original_duration - error
+        else:
+            error = float(random_generator.uniform(error_min, error_max))
+            duration = original_duration + error
+
+        end = start + duration
+        if not self.allow_overlap and note_index < len(notes) - 1:
+            end = min(end, float(notes[note_index + 1].start_time))
+        return mistake_type, start, end
 
     @staticmethod
     def _clamp_midi(midi_num: float) -> int:
@@ -347,6 +407,38 @@ class MistakeInjector:
                 )
                 continue
 
+            if screwup_type in {self.SHORT_DURATION_CODE, self.LONG_DURATION_CODE}:
+                requested_type: Literal["short", "long"] = (
+                    "short" if screwup_type == self.SHORT_DURATION_CODE else "long"
+                )
+                duration_type, start_time, end_time = self._duration_mistake_span(
+                    notes,
+                    note_index,
+                    requested_type,
+                    random_generator,
+                )
+                original_duration = max(1e-6, note.duration())
+                performed_duration = max(1e-6, end_time - start_time)
+                out_notes.append(
+                    self._copy_note(
+                        note,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                )
+                truth.append(
+                    dict(
+                        type=duration_type,
+                        score_note_id=note.id,
+                        time=note.start_time,
+                        original_duration=float(original_duration),
+                        performed_duration=float(performed_duration),
+                        duration_error=float(performed_duration - original_duration),
+                    )
+                )
+                selected_metadata[-1]["emitted_type"] = duration_type
+                continue
+
             start_time, end_time = self._timed_span(
                 notes,
                 note_index,
@@ -376,7 +468,7 @@ class MistakeInjector:
             if screwup_type == 2:
                 pitch_delta = self._sample_pitch_delta(random_generator)
                 new_pitch = self._clamp_midi(note.midi_num[0] + pitch_delta)
-                original_duration = max(1e-6, note.end_time - note.start_time)
+                original_duration = max(1e-6, note.duration())
                 initial_duration = original_duration / 8.0 + random_generator.uniform(
                     low=-original_duration / 32.0,
                     high=(original_duration / 8.0) * 3.0,
@@ -411,7 +503,7 @@ class MistakeInjector:
                 )
                 out_notes.append(timed_note)
                 extra_duration = self._sample_duration(
-                    max(1e-6, timed_note.end_time - timed_note.start_time),
+                    max(1e-6, timed_note.duration()),
                     random_generator,
                 )
                 extra_start = self._extra_note_start(
@@ -440,9 +532,9 @@ class MistakeInjector:
                 truth.append(dict(type="insertion", time=extra_start))
                 continue
 
-            # GitHub codes 4..15 are timing/duration-only placeholders: PolyTune
-            # applies the jittered span as realism but labels no mistake, so the
-            # note lands in the "correct" bucket and we emit no truth event.
+            # Remaining GitHub placeholder codes apply the jittered span as
+            # realism but emit no truth event. Codes 4 and 5 are now explicit
+            # Attune short/long extensions handled above.
             out_notes.append(
                 self._copy_note(note, start_time=start_time, end_time=end_time)
             )
@@ -462,6 +554,7 @@ class MistakeInjector:
             "pitch_offset_std": self.pitch_offset_std,
             "duration_mean": self.duration_mean,
             "duration_std": self.duration_std,
+            "duration_error_range_sec": list(self.duration_error_range_sec),
             "timing_mean_ms": self.timing_mean_ms,
             "timing_std_ms": self.timing_std_ms,
             "allow_overlap": self.allow_overlap,

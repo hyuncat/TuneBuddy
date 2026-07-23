@@ -156,7 +156,7 @@ class VibratoData:
             return None, None
         rate = float(np.median(rates[mask]))
         extent = float(np.median(extents[mask]))
-        note_duration = max(0.0, note.end_time - note.start_time)
+        note_duration = note.duration()
         if note_duration * rate < max(0.0, float(self.config.vib_min_cycles)):
             return None, None
         return rate, extent

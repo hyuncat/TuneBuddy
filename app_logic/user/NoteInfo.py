@@ -35,7 +35,7 @@ class NoteInfo:
             note_name=note.get_note_name(),
             cents=(midi - round(midi)) * 100.0,
             onset=note.start_time,
-            duration=note.end_time - note.start_time,
+            duration=note.duration(),
             onset_mistake=onset_mistake,
             duration_mistake=duration_mistake,
             vibrato_rate_hz=rate,

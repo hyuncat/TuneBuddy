@@ -1,48 +1,25 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
 import time
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
 from algorithms.Config import Config
 from app_logic.Alignment import Alignment, Mistake
-from app_logic.NoteData import NoteData, Note
+from app_logic.NoteData import Note, NoteData
 
 if TYPE_CHECKING:
     from app_logic.user.ds.Recording import Recording
 
 
-@dataclass(frozen=True)
-class _CostModel:
-    """Onset-aware DP costs as negative log-priors of the mistake model (anchored so
-    a correct on-time match costs 0), plus the Gaussian onset/pitch spreads."""
-    c_match: float
-    c_sub: float
-    c_ins: float
-    c_del: float
-    onset_sigma: float
-    pitch_sigma: float
-
-
 class MistakeDetector:
-    # --- ONSET-AWARE ALIGNMENT COST MODEL ---
-    # The onset-aware aligner sets its DP costs to the negative log-priors of a
-    # simple generative mistake model (plus Gaussian onset/pitch penalties), so the
-    # substitution-vs-(insertion+deletion) tradeoff is determined by these stats
-    # rather than hand-tuned magic numbers. `MISTAKE_RATE` and the screwup-type
-    # shares default to the PolyTune injector (16 uniform codes: 1 deletion,
-    # 1 substitution, 2 insertion, 12 timing-only) — change MISTAKE_RATE and the
-    # costs follow. See _alignment_priors() / _align_cost_model().
-    MISTAKE_RATE = 0.25
-    SCREWUP_DELETION_SHARE = 1 / 16
-    SCREWUP_SUBSTITUTION_SHARE = 1 / 16
-    SCREWUP_INSERTION_SHARE = 2 / 16
-    ALIGN_ONSET_SIGMA = 0.20   # sec; stdev of a matched/substituted onset
-    ALIGN_PITCH_SIGMA = 2.0    # semitones; stdev of a substitution's pitch
+    # index constants for dp backpointer
+    DELETION = 0
+    SUBSTITUTION = 1
+    INSERTION = 2
 
-    def __init__(self, recording: Recording=None, config: Config=None, verbose: bool = False):
+    def __init__(self, recording: Recording=None, config: Config=None, verbose: bool=False):
         if isinstance(recording, Config) and config is None:
             config = recording
             recording = None
@@ -50,268 +27,274 @@ class MistakeDetector:
         self.config = recording.config if recording else config
         self.verbose = verbose
 
-        # pitch mistake edit costs
-        self.INSERTION_COST = self.config.ins_cost
-        self.DELETION_COST = self.config.del_cost
-        self.TOLERANCE = self.config.pitch_tolerance
-
     def update_config(self, config: Config):
-        """update the config and all relevant parameters"""
         self.config = config
-        self.INSERTION_COST = self.config.ins_cost
-        self.DELETION_COST = self.config.del_cost
-        self.TOLERANCE = self.config.pitch_tolerance
 
-    def detect_pitch_mistakes(
-        self,
-        user_string: NoteData,
-        midi_string: NoteData,
-        verbose: bool | None = None,
-    ):
-        """Pitch-only Levenshtein alignment of user vs score notes (returns
-        alignment pairs + pitch mistakes). The substitution cost depends ONLY on
-        pitch distance, so the minimal-edit path ignores WHEN each note was played.
-        This is the original aligner and the A/B baseline for
-        detect_pitch_mistakes_onset_aware()."""
-        return self._align(user_string, midi_string, onset_aware=False, verbose=verbose)
-
-    def detect_pitch_mistakes_onset_aware(
-        self,
-        user_string: NoteData,
-        midi_string: NoteData,
-        verbose: bool | None = None,
-    ):
-        """Onset-aware alignment: same DP, but the costs are the negative log-priors
-        of the configured mistake model (_alignment_priors) plus Gaussian
-        onset/pitch penalties, instead of the pitch-only magic numbers. A match pays
-        only its onset penalty; a substitution adds the wrong-note prior plus
-        UNBOUNDED quadratic onset and pitch penalties — so a pairing that is far in
-        time (an off-by-one alignment shift around an indel) or implausibly wrong in
-        pitch costs more than an insertion+deletion and is split instead of becoming
-        a spurious substitution. This anchors the alignment in time (among
-        equal-pitch candidates a user note pairs with the score note nearest in
-        onset) without hand-tuned costs. A/B against detect_pitch_mistakes
-        (pitch-only)."""
-        return self._align(user_string, midi_string, onset_aware=True, verbose=verbose)
-
-    def _alignment_priors(self) -> tuple[float, float, float, float]:
-        """Per-score-note operation priors (p_correct, p_substitution, p_insertion,
-        p_deletion) for the onset-aware aligner, derived from MISTAKE_RATE and the
-        screwup-type shares. Automated: the aligner's DP costs follow whenever these
-        change (a note is 'correct' unless it was deleted or substituted; insertions
-        are extra notes scored against the same per-note budget)."""
-        lam = max(0.0, min(1.0, float(self.MISTAKE_RATE)))
-        p_del = lam * self.SCREWUP_DELETION_SHARE
-        p_sub = lam * self.SCREWUP_SUBSTITUTION_SHARE
-        p_ins = lam * self.SCREWUP_INSERTION_SHARE
-        p_correct = max(1e-6, 1.0 - p_del - p_sub)
-        return p_correct, p_sub, p_ins, p_del
-
-    def _align_cost_model(self) -> _CostModel:
-        """Derive the onset-aware DP costs as negative log-priors of the configured
-        mistake model, anchored so a correct on-time match costs 0. Automated: the
-        substitution/insertion/deletion costs come straight from
-        _alignment_priors(), so they track MISTAKE_RATE without hand-tuning."""
-        p_correct, p_sub, p_ins, p_del = self._alignment_priors()
-        base = -np.log(max(p_correct, 1e-9))
-        nll = lambda p: float(-np.log(max(p, 1e-9)) - base)
-        return _CostModel(
-            c_match=0.0,
-            c_sub=nll(p_sub),
-            c_ins=nll(p_ins),
-            c_del=nll(p_del),
-            onset_sigma=max(float(self.ALIGN_ONSET_SIGMA), 1e-3),
-            pitch_sigma=max(float(self.ALIGN_PITCH_SIGMA), 1e-3),
-        )
-
-    def _substitution_cost(self, user_note: Note, midi_note: Note, model: _CostModel | None) -> float:
-        """Cost of matching/substituting user_note against midi_note.
-        Pitch-only (model is None): 0 within tolerance ('same note'), else the
-        semitone distance clamped to 10 (the original cost).
-        Onset-aware (model given): a within-tolerance match costs only its Gaussian
-        onset penalty; a substitution adds the wrong-note prior plus unbounded
-        quadratic onset AND pitch penalties, so an implausibly far/wrong pairing
-        loses to insertion+deletion."""
-        d = abs(self.get_distance(user_note, midi_note))
-        if model is None:
-            return 0.0 if d < self.TOLERANCE else min(d, 10)
-        onset_pen = 0.5 * ((user_note.start_time - midi_note.start_time) / model.onset_sigma) ** 2
-        if d < self.TOLERANCE:
-            return model.c_match + onset_pen
-        return model.c_sub + onset_pen + 0.5 * (d / model.pitch_sigma) ** 2
-
-    def _align(
-        self,
-        user_string: NoteData,
-        midi_string: NoteData,
-        onset_aware: bool,
-        verbose: bool | None = None,
-    ):
-        """Shared edit-distance core for the pitch-only and onset-aware aligners.
-        Builds the DP, traces back, and returns (notes, mistakes). Only the
-        operation COSTS differ between the two (pitch-only magic numbers vs the
-        onset-aware negative-log-prior model); mistake CLASSIFICATION below stays
-        pitch-only — onset never invents a pitch mistake, it only steers which notes
-        pair up."""
+    def detect_mistakes(self, user_notes: NoteData, score_notes: NoteData, verbose: bool=None) -> Alignment:
+        """Align played notes to the score and build every resulting mistake."""
         if verbose is None:
             verbose = self.verbose
         start = time.perf_counter()
-        user_notes = list(user_string.data.values())
-        user_notes = [n for n in user_notes if n.midi_num[0] != -1]
 
-        # cost model: onset-aware uses negative log-priors (ins/del costs included);
-        # pitch-only keeps the original flat ins/del costs.
-        model = self._align_cost_model() if onset_aware else None
-        ins_cost = model.c_ins if model else self.INSERTION_COST
-        del_cost = model.c_del if model else self.DELETION_COST
+        user_string = [
+            user_notes.data[t]
+            for t in user_notes.times
+            if user_notes.data[t].midi_num[0] != -1
+        ]
+        midi_string = [score_notes.data[t] for t in score_notes.times]
 
-        # setup dp matrix
-        N = len(midi_string.times)
-        M = len(user_notes)
         if verbose:
             print(
-                f"[MistakeDetector] aligning {M} user note(s) to {N} score note(s) "
-                f"(onset_aware={onset_aware})",
+                f"[MistakeDetector] aligning {len(user_string)} user note(s) "
+                f"to {len(midi_string)} score note(s)",
                 flush=True,
             )
 
-        mat = np.zeros([N+1, M+1], dtype=np.float64)
-        backpointer = np.zeros([N+1, M+1], dtype=np.int64)
+        alignment = self.get_string_edit_alignment(user_string, midi_string)
 
-        # initialize first row / column
-        mat[0, :] = np.cumsum([0]+[ins_cost]*M) # all insertions
-        mat[:, 0] = np.cumsum([0]+[del_cost]*N) # all deletions
-
-        for i in range(1, N+1): # midi index
-            midi_note = midi_string.read_note(i=i-1)
-            for j in range(1, M+1): # user index
-                user_note = user_notes[j-1]
-                SUB_COST = self._substitution_cost(user_note, midi_note, model)
-
-                top_three = np.array([
-                    mat[i-1, j] + del_cost,
-                    mat[i-1, j-1] + SUB_COST,
-                    mat[i, j-1] + ins_cost
-                ])
-                mat[i, j] = np.min(top_three)
-                backpointer[i, j] = np.argmin(top_three) # eg, 0=del, 1=sub, 2=ins
-
-        # traceback the backpointer
-        # print("starting pitch mistake traceback...")
-        i = N
-        j = M
-
-        mistakes = []
-        notes = []
-        mistakes_to_reverse_position = {}
-        while i>0 or j>0:
-            # on the boundaries the backpointer is unset (0), so force the only
-            # legal move: all-insertions along the top row, all-deletions down
-            # the left column. otherwise the earliest notes get silently dropped.
-            if i == 0:
-                mistake_type = 2  # only user notes remain -> insertion
-            elif j == 0:
-                mistake_type = 0  # only score notes remain -> deletion
-            else:
-                mistake_type = backpointer[i, j]
-            midi_note = midi_string.read_note(i=i-1) if i > 0 else None
-            user_note = user_notes[j-1] if j > 0 else None
-
-            # 0: deletion
-            if mistake_type==0 and i>0:
-                # print(f"--> DELETION at i={i}, j={j}")
-                mistake = Mistake(type="deletion", user_note=user_note, midi_note=midi_note)
-                mistakes_to_reverse_position[mistake] = len(notes)
-                mistakes.append(mistake)
-                notes.append((None, midi_note))
-                i -= 1
-
-            # 1: substitution / no change
-            elif mistake_type==1 and i>0 and j>0:
-                note_distance = self.get_distance(user_note, midi_note)
-                if abs(note_distance) >= self.TOLERANCE:
-                    # print(f"--> SUBSTITUTION at i={i}, j={j} (distance={note_distance})")
-                    mistake = Mistake(type="substitution", user_note=user_note, midi_note=midi_note)
-                    mistakes_to_reverse_position[mistake] = len(notes)
-                    mistakes.append(mistake)
-                notes.append((user_note, midi_note))
-                i -= 1
-                j -= 1
-
-            # 2: insertion
-            elif mistake_type==2 and j>0:
-                # print(f"--> INSERTION at i={i}, j={j}")
-                mistake = Mistake(type="insertion", user_note=user_note, midi_note=midi_note)
-                mistakes_to_reverse_position[mistake] = len(notes)
-                mistakes.append(mistake)
-                j -= 1
-                notes.append((user_note, None))
-            else:
-                # fallback to prevent infinite loop
-                # print(f"[warning] Invalid state at i={i}, j={j}, backpointer={mistake_type}")
-                break
-
-        notes = list(reversed(notes))
-        mistakes = list(reversed(mistakes))
-        # print(f"Done! Took {time.time() - start:.2f} seconds")
-        for mistake in mistakes:
-            mistake.set_pair_index(len(notes) - 1 - mistakes_to_reverse_position[mistake])
         if verbose:
             print(
-                f"[MistakeDetector] done: {len(mistakes)} pitch mistake(s), "
-                f"{len(notes)} aligned pair(s) in {time.perf_counter() - start:.2f}s",
+                f"[MistakeDetector] done: "
+                f"{len(alignment.pitch_mistakes)} pitch mistake(s), "
+                f"{len(alignment.timing_mistakes)} timing mistake(s), "
+                f"{len(alignment.pairs)} aligned pair(s) in "
+                f"{time.perf_counter() - start:.2f}s",
                 flush=True,
             )
-        return notes, mistakes
+        return alignment
 
-    def detect_timing_mistakes(self, alignment: Alignment | None = None) -> list[Mistake]:
-        """Derive early/late/short/long timing mistakes from alignment pairs.
+    # phase 1: dp string edit
+    def string_edit(self, user_string: Sequence[Note], midi_string: Sequence[Note]) -> np.ndarray:
+        """Return the cheapest edit operation at every dynamic-programming cell."""
+        user_count = len(user_string)
+        score_count = len(midi_string)
+        backpointer = np.zeros(
+            (score_count + 1, user_count + 1),
+            dtype=np.uint8,
+        )
 
-        This is post-alignment analysis: it reads the master `alignment.pairs`
-        list, stores the derived list on `alignment.timing_mistakes`, and returns
-        that list. Only matched pairs can produce timing mistakes.
-        """
-        alignment = alignment or (self.recording.alignment if self.recording else None)
-        if alignment is None:
-            return []
+        # get all insertion and deletion costs in advance for filling in DP matrix
+        insertion_costs = np.fromiter(
+            (self.get_insertion_cost(note) for note in user_string),
+            dtype=np.float64,
+            count=user_count,
+        )
+        deletion_costs = np.fromiter(
+            (self.get_deletion_cost(note) for note in midi_string),
+            dtype=np.float64,
+            count=score_count,
+        )
 
-        timing_tol = max(0.0, float(self.config.timing_tolerance))
-        mistakes: list[Mistake] = []
-        for pair_index, (user_note, score_note) in enumerate(alignment.pairs):
-            if user_note is None or score_note is None:
+        previous = np.zeros(user_count + 1, dtype=np.float64)
+        if user_count:
+            previous[1:] = np.cumsum(insertion_costs)
+            backpointer[0, 1:] = self.INSERTION
+
+        # fill in DP matrix row by row
+        for score_index, score_note in enumerate(midi_string, start=1):
+            current = np.empty(user_count + 1, dtype=np.float64)
+            deletion_cost = deletion_costs[score_index - 1]
+            current[0] = previous[0] + deletion_cost
+            backpointer[score_index, 0] = self.DELETION
+
+            for user_index, user_note in enumerate(user_string, start=1):
+                delete_total = previous[user_index] + deletion_cost
+                substitute_total = (
+                    previous[user_index - 1]
+                    + self.get_substitution_cost(user_note, score_note)
+                )
+                insert_total = (
+                    current[user_index - 1]
+                    + insertion_costs[user_index - 1]
+                )
+                # preserve numpy.argmin's deletion/substitution/insertion tie order
+                if delete_total <= substitute_total and delete_total <= insert_total:
+                    current[user_index] = delete_total
+                    operation = self.DELETION
+                elif substitute_total <= insert_total:
+                    current[user_index] = substitute_total
+                    operation = self.SUBSTITUTION
+                else:
+                    current[user_index] = insert_total
+                    operation = self.INSERTION
+                backpointer[score_index, user_index] = operation
+            previous = current
+
+        return backpointer
+
+    def get_string_edit_alignment(
+        self,
+        user_string: Sequence[Note],
+        score_string: Sequence[Note],
+    ) -> Alignment:
+        """Align two already-ordered note sequences with the production costs."""
+        backpointer = self.string_edit(user_string, score_string)
+        return self.build_mistakes(
+            backpointer,
+            user_string,
+            score_string,
+        )
+
+    # phase 2: build mistakes / alignment through tracing DP matrix
+    def build_mistakes(self, backpointer: np.ndarray, user_string: Sequence[Note],
+                       midi_string: Sequence[Note]) -> Alignment:
+        """Trace an edit path and return a complete pitch/timing alignment."""
+        # init variables
+        user_index, score_index = len(user_string), len(midi_string)
+        reversed_pairs: list[tuple[Note | None, Note | None]] = []
+        indexed_pitch_mistakes: list[tuple[int, Mistake]] = []
+        indexed_timing_mistakes: list[tuple[int, Mistake]] = []
+        pitch_tolerance = max(0.0, float(self.config.pitch_tolerance))
+        timing_tolerance = max(0.0, float(self.config.timing_tolerance))
+
+        # retrace backwards
+        while score_index > 0 or user_index > 0:
+            # when we hit the top or left edge, must insert/delete
+            if score_index == 0:
+                operation = self.INSERTION
+            elif user_index == 0:
+                operation = self.DELETION
+            else: # else take operation denoted by DP backpointer
+                operation = int(backpointer[score_index, user_index])
+
+            reverse_pair_index = len(reversed_pairs)
+            if operation == self.DELETION:
+                score_note = midi_string[score_index - 1]
+                reversed_pairs.append((None, score_note))
+                indexed_pitch_mistakes.append(
+                    (
+                        reverse_pair_index,
+                        Mistake(
+                            type="deletion",
+                            user_note=None,
+                            midi_note=score_note,
+                        ),
+                    )
+                )
+                score_index -= 1
                 continue
 
-            onset_off = user_note.start_time - score_note.start_time
-            user_dur = max(1e-9, user_note.end_time - user_note.start_time)
-            score_dur = max(1e-9, score_note.end_time - score_note.start_time)
-            dur_off = user_dur - score_dur
+            if operation == self.INSERTION:
+                user_note = user_string[user_index - 1]
+                reversed_pairs.append((user_note, None))
+                indexed_pitch_mistakes.append(
+                    (
+                        reverse_pair_index,
+                        Mistake(
+                            type="insertion",
+                            user_note=user_note,
+                            midi_note=None,
+                        ),
+                    )
+                )
+                user_index -= 1
+                continue
 
-            if abs(onset_off) > timing_tol:
-                m = Mistake(
-                    type="late" if onset_off > 0 else "early",
+            user_note = user_string[user_index - 1]
+            score_note = midi_string[score_index - 1]
+            reversed_pairs.append((user_note, score_note))
+
+            if self.get_pitch_distance(user_note, score_note) >= pitch_tolerance:
+                indexed_pitch_mistakes.append(
+                    (
+                        reverse_pair_index,
+                        Mistake(
+                            type="substitution",
+                            user_note=user_note,
+                            midi_note=score_note,
+                        ),
+                    )
+                )
+
+            onset_offset = user_note.start_time - score_note.start_time
+            if abs(onset_offset) > timing_tolerance:
+                mistake = Mistake(
+                    type="late" if onset_offset > 0 else "early",
                     user_note=user_note,
                     midi_note=score_note,
                 )
-                m.info = f"{onset_off:+.2f}s"
-                m.set_pair_index(pair_index)
-                mistakes.append(m)
+                mistake.info = f"{onset_offset:+.2f}s"
+                indexed_timing_mistakes.append((reverse_pair_index, mistake))
 
-            if abs(dur_off) > timing_tol:
-                m = Mistake(
-                    type="long" if dur_off > 0 else "short",
+            duration_offset = user_note.duration() - score_note.duration()
+            if abs(duration_offset) > timing_tolerance:
+                mistake = Mistake(
+                    type="long" if duration_offset > 0 else "short",
                     user_note=user_note,
                     midi_note=score_note,
                 )
-                m.info = f"{dur_off:+.2f}s"
-                m.set_pair_index(pair_index)
-                mistakes.append(m)
+                mistake.info = f"{duration_offset:+.2f}s"
+                indexed_timing_mistakes.append((reverse_pair_index, mistake))
 
-        alignment.timing_mistakes = mistakes
-        alignment.reindex_mistakes(mistakes)
-        return mistakes
-    
-    def get_distance(self, user_note: Note, midi_note: Note):
-        """Return the closest pitch distance between the user note and score note.
-        When score note is a chord, user matches the nearest chord member."""
-        return min(abs(u - m) for u in user_note.midi_num for m in midi_note.midi_num)
-        
+            user_index -= 1
+            score_index -= 1
+
+        pairs = list(reversed(reversed_pairs))
+
+        def finish(
+            indexed_mistakes: list[tuple[int, Mistake]],
+        ) -> list[Mistake]:
+            for reverse_pair_index, mistake in indexed_mistakes:
+                mistake.set_pair_index(len(pairs) - 1 - reverse_pair_index)
+            indexed_mistakes.sort(key=lambda item: item[1].pair_index)
+            return [mistake for _, mistake in indexed_mistakes]
+
+        # create alignment object and return
+        alignment = Alignment(config=self.config, notes=pairs)
+        alignment.pitch_mistakes = finish(indexed_pitch_mistakes)
+        alignment.timing_mistakes = finish(indexed_timing_mistakes)
+        return alignment
+
+    # --- distance / cost functions ---
+    def get_pitch_distance(self, user_note: Note, score_note: Note) -> float:
+        """Monophonic pitch distance in semitones."""
+        return float(abs(user_note.midi_num[0] - score_note.midi_num[0]))
+
+    def get_timing_distance(self, user_note: Note, score_note: Note) -> float:
+        """Weighted absolute onset and duration distance in seconds."""
+        onset_distance = abs(user_note.start_time - score_note.start_time)
+        duration_distance = abs(user_note.duration() - score_note.duration())
+        return (
+            self.config.alignment_alpha_onset * onset_distance
+            + self.config.alignment_alpha_duration * duration_distance
+        )
+
+    def get_deletion_cost(self, score_note: Note) -> float:
+        """Cost of omitting one score note."""
+        return (
+            self.config.del_cost
+            + self.config.alignment_gamma_time * score_note.duration()
+        )
+
+    def get_insertion_cost(self, user_note: Note) -> float:
+        """Cost of playing one unmatched note."""
+        return (
+            self.config.ins_cost
+            + self.config.alignment_gamma_time * user_note.duration()
+        )
+
+    def get_substitution_cost(self, user_note: Note, score_note: Note) -> float:
+        """Cost of pairing two notes, whether the pair is correct or substituted."""
+        return (
+            self.config.alignment_gamma_pitch
+            * self.get_pitch_distance(user_note, score_note)
+            + self.config.alignment_gamma_time
+            * self.get_timing_distance(user_note, score_note)
+        )
+
+    def get_alignment_cost(
+        self,
+        alignment: Alignment
+        | Sequence[tuple[Note | None, Note | None]],
+    ) -> float:
+        """Return the exact string-edit cost of an alignment path."""
+        pairs = alignment.pairs if isinstance(alignment, Alignment) else alignment
+        cost = 0.0
+        for user_note, score_note in pairs:
+            if user_note is None and score_note is not None:
+                cost += self.get_deletion_cost(score_note)
+            elif user_note is not None and score_note is None:
+                cost += self.get_insertion_cost(user_note)
+            elif user_note is not None and score_note is not None:
+                cost += self.get_substitution_cost(user_note, score_note)
+        return float(cost)

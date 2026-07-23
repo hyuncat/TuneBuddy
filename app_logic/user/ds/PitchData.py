@@ -209,7 +209,7 @@ class PitchData:
         return (
             pitch is not None
             and pitch.value != -1
-            and pitch.unvoiced_prob < self.UNVOICED_THRESHOLD
+            and pitch.unvoiced_prob < self.config.unv_thresh
             and (include_transitions or not getattr(pitch, "is_transition", False))
         )
 

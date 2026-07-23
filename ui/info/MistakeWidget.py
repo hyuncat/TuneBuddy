@@ -167,8 +167,7 @@ class MistakeWidget(QWidget):
     TIMING mode columns: Index | Time | Type | Note | Amount | Override
       Type is a TEXT label ("Too long" / "Too short" / "Early" / "Late"). Amount
       is a signed-seconds deviation (onset offset for early/late, duration
-      difference for too long/short). Timing mistakes are derived post-alignment
-      (MistakeDetector.detect_timing_mistakes).
+      difference for too long/short). Timing mistakes are built during alignment.
 
     Both modes share an Override column: a trash-can to dismiss a flagged mistake,
     an undo arrow to undo. The Type/Override icon cells are rendered via item

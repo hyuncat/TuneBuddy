@@ -81,7 +81,7 @@ from benchmarks.modules.runner import (  # noqa: E402
 )
 
 ALL_METHODS: list[str] = list(_ALL_NOTE_METHODS)
-CPD_METHODS: list[str] = [m for m in ALL_METHODS if m not in _EXTERNAL_NOTE_METHODS and m != "onset-only"]
+CPD_METHODS: list[str] = [m for m in ALL_METHODS if m not in _EXTERNAL_NOTE_METHODS]
 
 
 def _is_missing_dependency(exc: Exception) -> bool:
