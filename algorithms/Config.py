@@ -43,7 +43,7 @@ class Config:
 
     # --- PITCH DETECTION PARAMETERS ---
     sr: int = 44100     # sample rate
-    w1: int = 1024 * 4  # frame size
+    w1: int = 1024 * 2  # frame size
     h1: int = 128       # hop size
     fmin: float = 196.0 # Hz
     fmax: float = 3000.0 # Hz
@@ -61,9 +61,9 @@ class Config:
     # Score-derived shortest-note duration. Recording.update_min_note_length()
     # refreshes this after every score-to-take fit and before correction.
     min_note_length: float = 0.03  # seconds
-    # Minimum detected segment length as a fraction of the shortest score note.
-    min_note_length_factor: float = 0.75
-    # Width of the local decoded-silence majority window. At sr=44100 and
+    # minimum detected segment length as a fraction of the shortest score note
+    min_note_length_factor: float = 0.60
+    # width of the local decoded-silence majority window. At sr=44100 and
     # h1=128, 10 ms maps to three frames and requires two unvoiced frames.
     min_silence_duration_ms: float = 10.0
 

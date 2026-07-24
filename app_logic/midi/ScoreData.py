@@ -695,6 +695,30 @@ class ScoreData:
                 return int(round(midi[0]))
         return None
 
+    def note_midi_range(
+        self, channel: int | None = None,
+    ) -> tuple[int, int] | None:
+        """Lowest/highest voiced MIDI pitches for an instrument.
+
+        This is the shared source for the Settings panel's displayed Range and
+        a new Recording's pitch-detection defaults. Chord members all count:
+        the detector must cover every score pitch, not only the first pitch at
+        each onset.
+        """
+        channel = self.active_instrument if channel is None else channel
+        note_data = self.note_datas.get(channel)
+        if note_data is None:
+            return None
+        midis = [
+            float(midi)
+            for note in note_data.data.values()
+            for midi in note.midi_num
+            if midi != -1
+        ]
+        if not midis:
+            return None
+        return int(round(min(midis))), int(round(max(midis)))
+
     # --- score METADATA MANAGEMENT ---
     def set_title(self, title: str):
         """Update display title -> included in next render's metadata."""

@@ -30,6 +30,8 @@ class Recording:
         self.active_instrument = self.score_data.active_instrument
         self._note_segmentation_signature = None
         self.analysis_notice = ""
+        if config is None:
+            config = self._default_config_from_score()
         self.update_config(config)
 
         # algorithms!!
@@ -68,6 +70,16 @@ class Recording:
         self.a2p_queue = Buffer(self.config.sr) #audio-to-pitches
         self._timbre_thread: threading.Thread | None = None
         self._timbre_thread_lock = threading.Lock()
+
+    def _default_config_from_score(self) -> Config:
+        """Build the no-sidecar defaults shown by the left Settings panel."""
+        config = Config()
+        midi_range = self.score_data.note_midi_range(self.active_instrument)
+        if midi_range is not None:
+            low_midi, high_midi = midi_range
+            config.fmin = config.midi_to_freq(low_midi)
+            config.fmax = config.midi_to_freq(high_midi)
+        return config
 
     def update_config(self, config: Config=None):
         """initialize the config, either with a provided one or a default one"""

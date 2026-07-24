@@ -43,7 +43,7 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-from benchmarks.paths import REPO_ROOT, RESULTS_ROOT, ensure_repo_on_path
+from benchmarks.paths import REPO_ROOT, SWEEP_RESULTS_ROOT, ensure_repo_on_path
 
 ensure_repo_on_path()
 
@@ -723,7 +723,7 @@ def run_sweep(
     if not (0 < options.tune_per_stratum < options.per_stratum):
         raise ValueError("tune_per_stratum must be between 0 and per_stratum")
     workers = max(1, int(workers or max(1, (os.cpu_count() or 4) - 1)))
-    output_dir = Path(output_dir or RESULTS_ROOT / "note" / "stringedit_param_sweep")
+    output_dir = Path(output_dir or SWEEP_RESULTS_ROOT / "mistake")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     sample = select_sample(options)
@@ -828,7 +828,7 @@ def run_sweep(
 
 
 def load_results(output_dir: Path | str | None = None) -> dict[str, Any]:
-    output_dir = Path(output_dir or RESULTS_ROOT / "note" / "stringedit_param_sweep")
+    output_dir = Path(output_dir or SWEEP_RESULTS_ROOT / "mistake")
     recommendation_path = output_dir / "recommendation.json"
     return {
         "output_dir": output_dir,

@@ -121,8 +121,8 @@ class PitchSmoother:
         self.config = config
         RESOLUTION_CENTS = 10.0
         self.resolution = RESOLUTION_CENTS / 100.0  # in semitones
-        self.switch_prob = 0.01
-        self.yin_trust = 0.5
+        self.switch_prob = 0.0025
+        self.yin_trust = 0.65
         MAX_JUMP_CENTS = 250.0
 
         # --- build the pitch grid (bin index <-> midi number) ---
@@ -137,7 +137,8 @@ class PitchSmoother:
         self.bin_midis = self.midi_min + self.resolution * np.arange(self.n_bins)
 
         # max jump in bins (each side of the diagonal)
-        self.max_jump = int(round(MAX_JUMP_CENTS / RESOLUTION_CENTS))
+        # self.max_jump = int(round(MAX_JUMP_CENTS / RESOLUTION_CENTS))
+        self.max_jump =9
 
         self.n_states = 2 * self.n_bins  # voiced bins, then unvoiced bins
 

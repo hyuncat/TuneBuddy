@@ -20,10 +20,12 @@ REPO_ROOT = find_repo_root()
 BENCHMARKS_ROOT = REPO_ROOT / "benchmarks"
 DATASETS_ROOT = BENCHMARKS_ROOT / "datasets"
 RESULTS_ROOT = BENCHMARKS_ROOT / "results"
+SWEEPS_ROOT = BENCHMARKS_ROOT / "sweeps"
+SWEEP_RESULTS_ROOT = SWEEPS_ROOT / "results"
+SWEEP_SCRIPTS_ROOT = SWEEPS_ROOT / "scripts"
 
 
 def ensure_repo_on_path(root: Path = REPO_ROOT) -> None:
     root_str = str(root)
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
-

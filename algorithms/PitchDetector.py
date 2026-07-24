@@ -33,7 +33,7 @@ class PitchDetector(QObject):
         # --- pitch config variables ---
         # ensure max lag is big enough to detect lowest f0 (largest period)
         # defaults to score's min/max pitch range, can be overridden
-        self.PADDING = 2.0 # whole step padding
+        self.PADDING = 4.0 # in semitones
         padded_fmin = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmin) - self.PADDING)
         padded_fmax = self.config.midi_to_freq(self.config.freq_to_midi(self.config.fmax) + self.PADDING)
         self.tau_max = int(self.config.sr / padded_fmin)
@@ -62,10 +62,11 @@ class PitchDetector(QObject):
         # block variable for stalling buffer
         self.block = False
 
-        # cached bandpass SOS (see bandpass_filter): the Butterworth design is
-        # constant per Config, but preprocess_audio filters once per frame.
-        self._bandpass_sos = None
-        self._bandpass_key = None
+        # Cached preprocessing SOS (see pitch_bandpass_filter): the Butterworth
+        # design is constant per Config, but preprocess_audio filters every
+        # frame.
+        self._preprocess_sos = None
+        self._preprocess_filter_key = None
 
     # might not be necessary anymore :)
     def load_config(self, config: Config):
@@ -426,34 +427,59 @@ class PitchDetector(QObject):
 
     def cmndf(self, x, acf) -> np.ndarray:
         """
-        cumulative normalized difference function (CMNDF) for better peak-picking of the fundamental period
-        based directly off original YIN algorithm
+        Cumulative mean normalized difference function from the original YIN
+        algorithm.
 
         Args:
-            x: needed to compute energy for diff_fct inversion
-            acf: the result of autocorrelation on x
+            x: The current analysis frame.
+            acf: Full-frame autocorrelation of ``x``.
         """
-        # --- INVERT TO DIFFERENCE FUNCTION ---
-        # compute the energy (r_t(0) and r_{t+\tau}(0)) for each lag
-        r_0 = np.sum(x**2)
-        energy = np.full(acf.shape, r_0)
+        tau_limit = min(self.tau_max, len(acf), len(x) - 1)
+        cmndf = np.ones(self.tau_max, dtype=np.float64)
+        if tau_limit <= 1:
+            return cmndf
 
-        diff_fct = energy[0] + energy - 2*acf
-        diff_fct[0] = 0
-        diff_fct = np.abs(diff_fct)
+        # YIN equation (2) compares x[j] with x[j + tau] over one fixed
+        # window. Reserve tau_limit samples as look-ahead so every lag uses the
+        # same number of terms instead of padding the shifted window with zero.
+        window_size = len(x) - tau_limit
+        reference_energy = float(np.dot(x[:window_size], x[:window_size]))
 
-        # --- NORMALIZE + CLAMP
-        diff_fct = diff_fct / (np.max(diff_fct) - np.min(diff_fct))
+        # acf[tau] contains the desired fixed-window cross term plus the
+        # autocorrelation of the reserved tail. Subtracting that small tail ACF
+        # reuses the full-frame FFT rather than performing a second large FFT.
+        tail = x[window_size:]
+        tail_acf = np.correlate(tail, tail, mode="full")[
+            len(tail) - 1 : len(tail) - 1 + tau_limit
+        ]
+        cross_terms = acf[:tau_limit] - tail_acf
 
-        cmndf = np.zeros(self.tau_max) 
-        cmndf[0] = 1 # make first value 1
-        total_diff = 1
+        squared_prefix = np.concatenate(
+            ([0.0], np.cumsum(x * x, dtype=np.float64))
+        )
+        starts = np.arange(tau_limit)
+        shifted_energy = (
+            squared_prefix[starts + window_size] - squared_prefix[starts]
+        )
+        diff_fct = (
+            reference_energy + shifted_energy - 2.0 * cross_terms
+        )
+        # Roundoff can make the theoretically non-negative difference a few
+        # ulps below zero.
+        diff_fct = np.maximum(diff_fct, 0.0)
+        diff_fct[0] = 0.0
 
-        for tau in range(1, self.tau_max):
-            total_diff += diff_fct[tau]
-            avg_diff = total_diff / tau 
-            cmndf[tau] = diff_fct[tau] / avg_diff
-
+        # YIN equation (3): d'(0) = 1 and, for tau > 0, divide by the
+        # cumulative mean from lag 1 through tau. There is deliberately no
+        # additive pseudocount in the cumulative sum.
+        taus = np.arange(1, tau_limit)
+        cumulative_diff = np.cumsum(diff_fct[1:tau_limit])
+        cmndf[1:tau_limit] = np.divide(
+            diff_fct[1:tau_limit] * taus,
+            cumulative_diff,
+            out=np.ones(tau_limit - 1, dtype=np.float64),
+            where=cumulative_diff > 0.0,
+        )
         return cmndf
 
     # modifying the difference function
@@ -604,69 +630,40 @@ class PitchDetector(QObject):
 
 
     # AUDIO PREPROCESSING
-    def bandpass_filter(self, x: np.ndarray, fmin: float=50, fmax: float=4000) -> np.ndarray:
+    def pitch_bandpass_filter(
+        self,
+        x: np.ndarray,
+    ) -> np.ndarray:
+        """Retain the configured pitch range with asymmetric padding.
+
+        Config.fmin/fmax constrain the YIN lag search and smoother state space;
+        the filter extends two semitones below fmin and two octaves above fmax.
+        The wider upper padding preserves four harmonics at the top of the
+        expected range instead of repeating the old 1.2*fmax cutoff, which
+        removed evidence needed to resolve high violin notes.
         """
-        a 2nd order Butterworth bandpass IIR (infinite impulse response) filter to get 
-        rid of noise outside of the typical pitch range
-
-        Args:
-            x: The input audio signal as a 1D NumPy array.
-            fmin: The lower cutoff frequency (in Hz) for the bandpass filter. Frequencies below this value will be attenuated.
-            fmax: The upper cutoff frequency (in Hz) for the bandpass filter. Frequencies above this value will be attenuated.
-
-        Returns:
-            np.ndarray: The filtered audio signal as a 1D NumPy array, with reduced noise outside the typical pitch range.
-        """
-        # The Butterworth design depends only on (fmin, fmax, sr) — all constant
-        # per Config — but this runs once per frame (~344x/sec live). Redesigning
-        # the filter each call (iirfilter -> zpk2sos) was ~60% of per-frame pitch
-        # cost and starved the live audio->pitch queue, so cache the SOS and only
-        # rebuild it when the cutoffs/rate actually change.
-        key = (fmin, fmax, self.SR)
-        if self._bandpass_key != key:
-            self._bandpass_sos = iirfilter(
-                N=2, Wn=[fmin, fmax],
-                btype='bandpass',
-                ftype='butter',
-                output='sos',
-                fs=self.SR
-            )
-            self._bandpass_key = key
-        return sosfilt(self._bandpass_sos, x)
-    
-    def high_pass_iir_filter(self, x: np.ndarray, cutoff_freq=150, 
-                             sr: int=44100) -> np.ndarray:
-        """
-        a 2nd order high pass IIR (infinite impulse response) filter to lower intensity 
-        of low frequency noise below 150 Hz
-
-        Args:
-        audio_data (np.ndarray): The input audio signal as a 1D NumPy array.
-        cutoff_freq (float, optional): The cutoff frequency (in Hz) for the high-pass filter. 
-                                        Frequencies below this value will be attenuated. 
-                                        Defaults to 150 Hz.
-        sr (int, optional): The sampling rate (in Hz) of the audio signal. 
-                            This is used to calculate the Nyquist frequency 
-                            for normalizing the cutoff frequency. Defaults 
-                            to the sample rate defined in `AppConfig.SAMPLE_RATE`.
-
-        Returns:
-            np.ndarray: The filtered audio signal as a 1D NumPy array, with reduced 
-                        low-frequency noise.
-        """
-        nyquist_freq = sr / 2
-
-        # normalize freq by nyquist (scipy expects Wn between 0 - 1)
-        normal_cutoff = cutoff_freq / nyquist_freq
-        sos = iirfilter(
-            N=2, Wn=normal_cutoff, rp=3, 
-            btype='highpass', 
-            ftype='butter', 
-            output='sos', 
-            fs=sr
+        padded_fmin = self.config.midi_to_freq(
+            self.config.freq_to_midi(self.config.fmin) - self.PADDING
         )
-        x = sosfilt(sos, x)
-        return x
+        padded_fmax = self.config.midi_to_freq(
+            self.config.freq_to_midi(self.config.fmax) + 24.0
+        )
+        upper_cutoff = min(
+            padded_fmax,
+            0.5 * self.SR * (1.0 - 1e-6),
+        )
+        key = (padded_fmin, upper_cutoff, self.SR)
+        if self._preprocess_filter_key != key:
+            self._preprocess_sos = iirfilter(
+                N=2,
+                Wn=[padded_fmin, upper_cutoff],
+                btype="bandpass",
+                ftype="butter",
+                output="sos",
+                fs=self.SR,
+            )
+            self._preprocess_filter_key = key
+        return sosfilt(self._preprocess_sos, x)
 
     def preprocess_audio(self, x: list) -> tuple[np.ndarray, float]:
         """
@@ -690,6 +687,5 @@ class PitchDetector(QObject):
         if peak == 0:  # constant/silent frame (digital silence, DC) -> no pitch
             return np.zeros_like(x), 0.0
         x = x/peak # normalize
-        x = self.bandpass_filter(x, fmin=self.config.fmin*0.8, fmax=self.config.fmax*1.2) # get rid of noise outside of pitch range
-        # x = self.high_pass_iir_filter(x, iir_cutoff_freq)
+        x = self.pitch_bandpass_filter(x)
         return x, volume

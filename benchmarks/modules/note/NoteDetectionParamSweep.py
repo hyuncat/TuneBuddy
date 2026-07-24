@@ -42,7 +42,7 @@ import pandas as pd
 import ruptures as rpt
 from tqdm.auto import tqdm
 
-from benchmarks.paths import RESULTS_ROOT, ensure_repo_on_path
+from benchmarks.paths import SWEEP_RESULTS_ROOT, ensure_repo_on_path
 
 ensure_repo_on_path()
 
@@ -52,7 +52,7 @@ from benchmarks.modules.note.NoteDetectionBaselines import BenchmarkNoteDetector
 
 
 RUNNER_VERSION = 4
-DEFAULT_OUTPUT_DIR = RESULTS_ROOT / "note" / "note_detection_param_sweep"
+DEFAULT_OUTPUT_DIR = SWEEP_RESULTS_ROOT / "note"
 FIXED_PARAMETER_METHOD = "kernelcpd-linear"
 
 METHOD_CONFIGS: dict[str, dict[str, Any]] = {

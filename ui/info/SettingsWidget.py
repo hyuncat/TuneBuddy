@@ -159,8 +159,9 @@ class SettingsWidget(QWidget):
         row = QHBoxLayout()
         row.addWidget(QLabel("Tuning:"))
         self.tuning_input = QLineEdit()
-        self.tuning_input.setPlaceholderText("440")
-        self.tuning_input.setText("440")
+        default_tuning = f"{Config().tuning:g}"
+        self.tuning_input.setPlaceholderText(default_tuning)
+        self.tuning_input.setText(default_tuning)
         row.addWidget(self.tuning_input, 1)
         row.addWidget(QLabel("Hz"))
 
@@ -263,16 +264,10 @@ class SettingsWidget(QWidget):
         given instrument channel (defaults populated 'based on the score')."""
         if channel is None:
             return
-        note_data = score_data.note_datas.get(channel)
-        if note_data is None or not note_data.times:
+        midi_range = score_data.note_midi_range(channel)
+        if midi_range is None:
             return
-        midis = [
-            n.midi_num[0] for n in note_data.data.values()
-            if n.midi_num and n.midi_num[0] != -1
-        ]
-        if not midis:
-            return
-        low, high = int(round(min(midis))), int(round(max(midis)))
+        low, high = midi_range
         self.low_input.setText(midi_to_name(low))
         self.high_input.setText(midi_to_name(high))
 
