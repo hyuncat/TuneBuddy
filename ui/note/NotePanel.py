@@ -1,3 +1,5 @@
+import time
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QStackedWidget
 )
@@ -18,12 +20,16 @@ class NotePanel(QWidget):
     update_time / refresh). Orchestration only — each graph owns its own
     rendering, legends included."""
 
+    LIVE_REFRESH_INTERVAL = 1.0 / 15.0
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(6, 6, 6, 6)
         self._layout.setSpacing(4)
         self._t = 0.0
+        self._live = False
+        self._last_live_refresh = 0.0
 
         self.widgets: dict[str, NoteCurveWidget] = {
             "Volume": VolumeWidget(),
@@ -64,11 +70,18 @@ class NotePanel(QWidget):
             w.set_recording(rec)
 
     def set_live(self, live: bool):
+        self._live = bool(live)
+        self._last_live_refresh = 0.0
         for w in self.widgets.values():
             w.set_live(live)
 
     def update_time(self, t: float):
         self._t = t
+        if self._live:
+            now = time.monotonic()
+            if now - self._last_live_refresh < self.LIVE_REFRESH_INTERVAL:
+                return
+            self._last_live_refresh = now
         self._active().update_time(t)
 
     def refresh(self):
@@ -91,4 +104,5 @@ class NotePanel(QWidget):
         for key, w in self.widgets.items():
             for extra in w.header_widgets():
                 extra.setVisible(key == name)
+        self._last_live_refresh = 0.0
         active.update_time(self._t)

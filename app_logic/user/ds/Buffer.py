@@ -10,11 +10,21 @@ class Buffer:
     def __init__(self, sr: int=44100):
         self.buffer = deque()
         self.t_0, self.t_curr = 0, 0
+        self.sample_cursor = 0
         self.sr = sr
         self.lock = threading.Lock()
 
     def init_start_time(self, t_0: float):
-        self.t_0, self.t_curr = t_0, t_0
+        """Begin a fresh stream at ``t_0``.
+
+        A detector stops with less than one analysis window still buffered.
+        Those samples belong to the old take and must not become the beginning
+        of the next one.
+        """
+        with self.lock:
+            self.buffer.clear()
+            self.t_0, self.t_curr = t_0, t_0
+            self.sample_cursor = 0
 
     def push(self, indata: Sequence[float]):
         """writes some iterable data (np.array, list) into our queue"""
@@ -43,9 +53,14 @@ class Buffer:
                     self.buffer.popleft()
 
         # update time variables
-        read_time = self.t_curr
+        # Derive time from an integer sample cursor instead of repeatedly
+        # adding a floating-point hop duration. The latter occasionally landed
+        # just below an exact pitch-grid boundary and overwrote the preceding
+        # frame, leaving isolated holes in otherwise continuous live plots.
+        read_time = self.t_0 + self.sample_cursor / self.sr
         if not stall:
-            self.t_curr += hop_size / self.sr
+            self.sample_cursor += hop_size
+            self.t_curr = self.t_0 + self.sample_cursor / self.sr
 
         return outdata, read_time
 

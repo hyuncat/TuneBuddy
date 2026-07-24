@@ -154,7 +154,11 @@ class PitchData:
         ]
         self.end_index = len(self.data)
 
-    def write(self, pitches: list[Pitch] | Pitch, start_time: float=0):
+    def write(
+        self,
+        pitches: list[Pitch] | Pitch,
+        start_time: float | None = None,
+    ):
         """write the pitches to the data at the given time index"""
         if isinstance(pitches, Pitch):
             pitches = [pitches]
@@ -162,11 +166,17 @@ class PitchData:
             p.ensure_compatible(self.config) if p is not None else None
             for p in pitches
         ]
-        if not start_time:
+        if start_time is None:
             start_time = pitches[0].time
 
         # get indices into data array
-        i = self.time_to_index(start_time)
+        # Live writes are addressed by an exact frame-start grid point. Round
+        # that point rather than flooring a nearly-integral float, which can
+        # otherwise map two adjacent live frames onto the same storage slot.
+        i = int(round(
+            (start_time - self.t_origin)
+            * (self.config.sr / self.config.h1)
+        ))
         j = i+len(pitches)
 
         if j > len(self.data)*0.8: # if close enough to end

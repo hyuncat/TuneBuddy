@@ -648,20 +648,60 @@ class MistakeChecker:
         source_notes: list[Note],
         replacements: list[Note],
     ) -> bool:
-        """Whether a replacement joins notes across a note-length silence."""
+        """Whether a replacement joins notes across a note-length silence.
+
+        Measure decoded silence from the pitch frames themselves. Note endpoints
+        are only a fallback: their frame-centre convention can move a borderline
+        gap by several milliseconds, and the score-relative threshold can move
+        by a similar amount while the score fit stabilizes.
+        """
         ordered = sorted(source_notes, key=lambda note: note.start_time)
         minimum_silence = self.config.min_note_seconds(
             factor=self.config.min_note_length_factor,
         )
-        # NoteDetector stores the final voiced frame's time as a run's end.
-        # Include its frame interval when comparing the half-open gap duration.
         frame_duration = self.config.h1 / self.config.sr
+        # Silence is decoded through a finite majority window, so durations
+        # closer than that window are indistinguishable at the detector's own
+        # temporal resolution. This also prevents a few milliseconds of tempo
+        # refitting from changing whether the same physical silence is crossed.
+        silence_resolution = max(
+            frame_duration,
+            self.config.min_silence_duration_ms / 1000.0,
+        )
+        pitch_data = self.pd
+
+        def decoded_silence_duration(left: Note, right: Note) -> float:
+            if pitch_data is not None:
+                # Note boundaries and Pitch.time are frame-centre timestamps.
+                # pitch_curve() uses that same coordinate system; read() is
+                # intentionally frame-start-indexed for streaming writes.
+                _, values = pitch_data.pitch_curve(
+                    left.end_time,
+                    right.start_time,
+                )
+                longest_run = current_run = 0
+                for is_voiced in np.isfinite(values):
+                    if is_voiced:
+                        current_run = 0
+                    else:
+                        current_run += 1
+                        longest_run = max(longest_run, current_run)
+                if longest_run:
+                    return longest_run * frame_duration
+
+            # NoteDetector stores the final voiced frame's time as a run's end.
+            # Include that frame interval in the endpoint-only fallback.
+            return max(
+                0.0,
+                right.start_time - left.end_time + frame_duration,
+            )
 
         for left, right in zip(ordered, ordered[1:]):
-            gap_duration = (
-                right.start_time - left.end_time + frame_duration
-            )
-            if gap_duration < minimum_silence - self.COST_EPSILON:
+            gap_duration = decoded_silence_duration(left, right)
+            if (
+                gap_duration + silence_resolution
+                < minimum_silence - self.COST_EPSILON
+            ):
                 continue
             if any(
                 replacement.start_time <= left.end_time + self.COST_EPSILON

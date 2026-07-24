@@ -31,6 +31,7 @@ class Toolbar(QToolBar):
         super().__init__() # init the QToolBar it inherits from
         self.setOrientation(Qt.Orientation.Horizontal)
         self.instrument_checkboxes: dict[int, QCheckBox] = {}
+        self.user_audio_enabled = True
 
         # important references
         self.score_data = score_data
@@ -182,7 +183,7 @@ class Toolbar(QToolBar):
         self.addWidget(self.metronome_label)
         self.metronome_switch = ToggleSwitch("Metronome")
         self.metronome_switch.toggled.connect(self.metronome_toggled)
-        self.metronome_switch.setChecked(True) # default to metronome on
+        self.metronome_switch.setChecked(False) # default to metronome off
         self.addWidget(self.metronome_switch)
 
     def init_signals(self):
@@ -245,14 +246,14 @@ class Toolbar(QToolBar):
         self.instrument_checkboxes: dict[int, QCheckBox] = {}
 
         # ---> add a 'user' button
-        user_checkbox = QCheckBox("User")
-        user_checkbox.setChecked(True) # default to user audio playback on
-        user_checkbox.toggled.connect(self.user_audio_toggled.emit)
+        self.user_checkbox = QCheckBox("User")
+        self.user_checkbox.setChecked(self.user_audio_enabled)
+        self.user_checkbox.toggled.connect(self._on_user_audio_toggled)
         # format container
         user_container = QWidget()
         user_layout = QHBoxLayout(user_container)
         user_layout.setContentsMargins(2, 2, 10, 2)
-        user_layout.addWidget(user_checkbox)
+        user_layout.addWidget(self.user_checkbox)
         user_layout.addStretch()
 
         user_action = QWidgetAction(self)
@@ -265,10 +266,8 @@ class Toolbar(QToolBar):
             # print("oops no instruments")
             return # no score loaded, or score has no instruments
 
-        # a freshly loaded score resets playing_instruments to ALL channels
-        # (metronome included); re-apply the switch so the toolbar toggle —
-        # not the load default — decides whether the metronome plays. (Guarded
-        # because this also runs during init, before the switch is built.)
+        # Re-apply the independent metronome switch after a score swap. Guarded
+        # because this also runs during init, before the switch is built.
         if hasattr(self, "metronome_switch"):
             self.metronome_toggled(self.metronome_switch.isChecked())
 
@@ -277,7 +276,7 @@ class Toolbar(QToolBar):
             if channel == self.score_data.metronome_channel:
                 continue # don't show metronome sound
             checkbox = QCheckBox(instr_name)
-            checkbox.setChecked(True) # default to all instruments selected
+            checkbox.setChecked(channel in self.score_data.playing_instruments)
             checkbox.toggled.connect(self.on_instrument_selection_changed)
             self.instrument_checkboxes[channel] = checkbox
 
@@ -291,6 +290,10 @@ class Toolbar(QToolBar):
             action = QWidgetAction(self)
             action.setDefaultWidget(container)
             self.instrument_menu.addAction(action)
+
+    def _on_user_audio_toggled(self, checked: bool):
+        self.user_audio_enabled = checked
+        self.user_audio_toggled.emit(checked)
 
     def on_instrument_selection_changed(self, checked: bool):
         """Handle changes in instrument selection."""

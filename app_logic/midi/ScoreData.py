@@ -271,7 +271,9 @@ class ScoreData:
 
         # reset other shit
         self.displayed_instruments = set(self.instruments.keys())
-        self.playing_instruments = set(self.instruments.keys())
+        # Playback defaults to the recorded user take only. MIDI instruments
+        # (including the injected metronome channel) are opt-in from the toolbar.
+        self.playing_instruments = set()
         self.active_instrument = self.get_default_instrument()
 
     def measure_onsets_og(self, channel: int | None = None) -> list[float]:

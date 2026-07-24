@@ -55,7 +55,10 @@ class JsonHandler:
     # millisecond-valued strict-majority silence window.
     # v16: production selects pitch_thresh=0.75 and removes the obsolete PELT
     # stride from Config.
-    NOTE_ANALYSIS_VERSION = 17
+    # v17: note segmentation shares the plotted 0.90 voicing cutoff.
+    # v18: correction measures silence from decoded pitch frames and compares it
+    # at the note detector's temporal resolution.
+    NOTE_ANALYSIS_VERSION = 18
     CACHE_SUFFIX = ".json.xz"
     GZIP_CACHE_SUFFIX = ".json.gz"
     LEGACY_CACHE_SUFFIX = ".json"

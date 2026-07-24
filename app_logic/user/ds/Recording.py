@@ -150,6 +150,8 @@ class Recording:
         if audio_sr and audio_sr != self.config.sr:
             self.config.sr = audio_sr
             self.update_config(self.config)
+        if audio_sr and hasattr(self, "a2p_queue"):
+            self.a2p_queue.sr = audio_sr
 
     def save_audio(self, audio_filepath: str | Path):
         """Persist this recording's current audio buffer to disk."""
@@ -353,9 +355,10 @@ class Recording:
     def write_pitch_data(self, indata: list[Pitch], start_time: float):
         """Write detected pitches to pitch_data at the given start_time."""
         self.pitch_data.write(indata, start_time)
-        # Centered windows become available about vib_win_sec/2 behind the
-        # playhead. extend() only computes newly available stride points.
-        self.vibrato_detector.extend(self.vibrato_data, self.pitch_data)
+        # Vibrato is fit on its own worker (VibratoDetector.run): only wake it so
+        # the live pitch loop never blocks on an LS-Prony fit. Repeated wakeups
+        # coalesce naturally when that lower-priority worker is still busy.
+        self.vibrato_detector.notify()
 
     def get_length(self, raw=True):
         if raw:

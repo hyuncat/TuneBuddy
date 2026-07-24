@@ -257,21 +257,9 @@ class PerformTab(QWidget):
         """Each recording owns its own pitch detector; connect each only once."""
         if rec is None or rec.pitch_detector in self._wired_detectors:
             return
-        rec.pitch_detector.pitch_detected.connect(self._on_live_pitch_detected)
         rec.pitch_detector.status_changed.connect(self.status_bar.update_status)
         rec.pitch_detector.detection_finished.connect(self._on_detection_finished)
         self._wired_detectors.add(rec.pitch_detector)
-
-    def _on_live_pitch_detected(self, _t: float):
-        """Refresh pitch dots immediately instead of waiting for a clock tick."""
-        detector = self.sender()
-        if (
-            not self.is_recording
-            or self.recording is None
-            or (detector is not None and detector is not self.recording.pitch_detector)
-        ):
-            return
-        self.guitar_hero.schedule_live_pitch_refresh()
 
     def set_user_audio_enabled(self, enabled: bool):
         """Mirror the toolbar 'User' checkbox; stop playback now if turning off."""
@@ -436,6 +424,16 @@ class PerformTab(QWidget):
         self.audio_player.stop()
         self.status_bar.update_status("")
 
+    def prime_recording(self):
+        """Count-in started: warm the mic input device so its first-start
+        transient settles before the record point (see AudioRecorder.prime)."""
+        self.audio_recorder.prime()
+
+    def unprime_recording(self):
+        """Count-in cancelled before it armed: release the primed mic stream."""
+        if not self.is_recording:
+            self.audio_recorder.stop()
+
     def start_recording(self, start_time: float | None = None):
         """Start recording; called after app.py's count-in.
 
@@ -456,13 +454,25 @@ class PerformTab(QWidget):
         self.recording.timbre_data.t_origin = origin
         self.wall_clock.set_floor(origin)
         self.is_recording = True
-        self.guitar_hero.set_live(True)  # pitch-dot opacity: fixed absolute dB window
+        cfg = self.recording.config
+        # One display-only compensation, derived from the detector window.
+        # GuitarHero retains it while move_plot continues emitting the real
+        # transport time, so it cannot feed back into the shared slider.
+        self.guitar_hero.set_live_playhead_offset(-0.5 * cfg.w1 / cfg.sr)
+        self.guitar_hero.set_live(True)
         if self.note_panel is not None:
             self.note_panel.set_live(True)  # trailing-window mode
         self.audio_player.stop()
-        self.wall_clock.start(t)
-        self.audio_recorder.run(start_time=t)
+        # Fit vibrato incrementally on its own worker so it never blocks the
+        # pitch->plot loop. Starting with the take avoids a costly historical
+        # backfill if the user opens the Vibrato graph midway through.
+        self.recording.vibrato_detector.run()
+        # Ready the consumer before capture, then start the clock only after
+        # PortAudio confirms that the input stream is active. This prevents
+        # stream-start time from becoming a permanent plot/playhead offset.
         self.recording.pitch_detector.run(start_time=t)
+        self.audio_recorder.run(start_time=t)
+        self.wall_clock.start(t)
         self.midi_player.play(start_time=t)  # play whatever audio the user enabled
 
     def stop_recording(self):
@@ -476,7 +486,16 @@ class PerformTab(QWidget):
         self.wall_clock.set_floor(0.0)  # drop the runway floor for plain playback
         self.audio_recorder.stop()
         self.midi_player.stop()
-        self.recording.pitch_detector.stop()
+        # The mic is now closed, so drain every complete analysis frame that it
+        # captured before stopping. Previously this discarded the queued tail,
+        # leaving the pitch track visibly behind the paused playhead.
+        self.recording.pitch_detector.stop(drain=True)
+        # Stop the vibrato worker after the drain so its final flush covers the
+        # fully-drained pitch track.
+        self.recording.vibrato_detector.stop()
+        self.guitar_hero.set_live_playhead_offset(0.0)
+        self.guitar_hero.update_pitches()
+        self.guitar_hero.plot.viewport().update()
         self.status_bar.update_status("")
 
     # --- VIEW DRIVING (called by the host's shared clock/slider dispatch) ---

@@ -1,4 +1,5 @@
 import numpy as np
+import threading
 from bisect import bisect_right
 from math import ceil, floor
 
@@ -79,8 +80,46 @@ class VibratoDetector:
         self.recording = recording
         self.config = config if config else recording.config
 
+        # live worker (see run): recompute vibrato off the pitch thread.
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+
     def update_config(self, config: Config):
         self.config = config
+
+    # --- live worker: keep vibrato off the pitch/GUI critical path ---
+    def run(self):
+        """Start the live worker. It recomputes vibrato whenever notify() flags
+        new pitch frames, so the pitch->plot loop never blocks on an LS-Prony
+        fit and vibrato is free to lag behind under load."""
+        self.stop()
+        self._stop.clear()
+        self._wake.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        """Drain notify() wakeups into incremental extend() passes, then flush
+        once more so the drained tail is covered after recording stops."""
+        rec = self.recording
+        while not self._stop.is_set():
+            self._wake.wait(0.1)  # the timeout just re-checks the stop flag
+            self._wake.clear()
+            self.extend(rec.vibrato_data, rec.pitch_data)
+        self.extend(rec.vibrato_data, rec.pitch_data)
+
+    def stop(self):
+        """Stop the live worker (a final extend() flush runs as it exits)."""
+        if self._thread and self._thread.is_alive():
+            self._stop.set()
+            self._wake.set()  # unblock the wait so it sees the stop flag
+            self._thread.join()
+        self._thread = None
+
+    def notify(self):
+        """Producer hook (pitch thread): new pitch frames are ready to fit."""
+        self._wake.set()
 
     # --- whole-track / incremental passes ---
     def detect(self, pitch_data, note_data=None) -> VibratoData:
@@ -99,9 +138,9 @@ class VibratoDetector:
     def extend(self, vibrato_data: VibratoData, pitch_data,
                finalize: bool = False, note_data=None) -> None:
         """Compute every not-yet-computed grid point whose full centered
-        window of pitch frames exists. Incremental: cheap to call per written
-        frame from the live pitch thread (values land half a window behind
-        the playhead), and it is the whole offline pass when called once."""
+        window of pitch frames exists. Incremental: the live worker calls this
+        as pitch frames arrive (values land half a window behind the playhead),
+        and it is the whole offline pass when called once."""
         cfg = self.config
         frame_rate = cfg.sr / cfg.h1
         half = max(4, int(round(cfg.vib_win_sec * frame_rate / 2)))

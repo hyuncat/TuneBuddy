@@ -250,6 +250,16 @@ class PracticeTab(QWidget):
         self.midi_player.stop()
         self.status_bar.update_status("")
 
+    def prime_recording(self):
+        """Count-in started: warm the mic input device so its first-start
+        transient settles before capture (see AudioRecorder.prime)."""
+        self.audio_recorder.prime()
+
+    def unprime_recording(self):
+        """Count-in cancelled before it armed: release the primed mic stream."""
+        if not self.is_recording:
+            self.audio_recorder.stop()
+
     def start_recording(self, start_time: float | None = None):
         """Begin a practice run.
         Advances forward only when user's pitch matches the score.
@@ -267,11 +277,19 @@ class PracticeTab(QWidget):
         self.practice_time = t
         self._last_render = 0.0
         self.is_recording = True
+        # Practice advances on the frame-start address emitted by the detector,
+        # while pitch dots use the analysis-window center. Keep the visual
+        # playhead on that center without changing the gating/storage time.
+        cfg = self.recording.config
+        self.guitar_hero.set_live_playhead_offset(0.5 * cfg.w1 / cfg.sr)
         self.guitar_hero.set_live(True)  # pitch-dot opacity: fixed absolute dB window
         if self.note_panel is not None:
             self.note_panel.set_live(True)  # trailing-window mode
-        self.audio_recorder.run(start_time=t)
         self.recording.pitch_detector.run(start_time=t)
+        # Keep this incremental and off the pitch thread. Starting with the
+        # take prevents a historical backfill spike if Vibrato is opened later.
+        self.recording.vibrato_detector.run()
+        self.audio_recorder.run(start_time=t)
 
     def stop_recording(self):
         if not self.is_recording:
@@ -283,6 +301,8 @@ class PracticeTab(QWidget):
         self.wall_clock.pause()
         self.audio_recorder.stop()
         self.recording.pitch_detector.stop()
+        self.recording.vibrato_detector.stop()
+        self.guitar_hero.set_live_playhead_offset(0.0)
 
     # --- VIEW DRIVING (called by the host's shared clock/slider dispatch) ---
     def _move_views(self, t: float):

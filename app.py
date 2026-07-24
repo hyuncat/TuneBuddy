@@ -711,6 +711,7 @@ class Attune(QMainWindow):
             self.countdown_timer.cancel()
             self.is_counting_in = False
             self.record_button.setIcon(self.record_icon)
+            self._active_tab().unprime_recording()  # release the warmed mic stream
             self._active_tab().render_at(self._countin_head)
             return
         if not panel.is_recording:
@@ -735,6 +736,9 @@ class Attune(QMainWindow):
             self._countin_head = head
             self.is_counting_in = True
             self.record_button.setIcon(self.pause_icon)
+            # Warm the mic input device now so its first-start transient settles
+            # during the count-in, not into the first second of the take.
+            panel.prime_recording()
             self.countdown_timer.start(
                 beats=beats,
                 channel=sd.metronome_channel,

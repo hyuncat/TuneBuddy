@@ -52,6 +52,7 @@ class PitchDetector(QObject):
         self.pda_thread: threading.Thread = None
         self.offline_thread: threading.Thread = None  # for detect_pitches_async
         self.stop_event = threading.Event()
+        self._drain_on_stop = False
         self._stream_volume_peak = 0.0
         self._last_volume_gate_stats: dict[str, float | int] = {}
         self.cqt = CQT(self.config)
@@ -60,6 +61,11 @@ class PitchDetector(QObject):
 
         # block variable for stalling buffer
         self.block = False
+
+        # cached bandpass SOS (see bandpass_filter): the Butterworth design is
+        # constant per Config, but preprocess_audio filters once per frame.
+        self._bandpass_sos = None
+        self._bandpass_key = None
 
     # might not be necessary anymore :)
     def load_config(self, config: Config):
@@ -84,6 +90,7 @@ class PitchDetector(QObject):
         """keep trying to detect pitches while we can"""
         self.stop()
         self.stop_event.clear()
+        self._drain_on_stop = False
         self._stream_volume_peak = 0.0
         self._cqt_frame_index = 0
         self.recording.a2p_queue.init_start_time(start_time)
@@ -93,29 +100,44 @@ class PitchDetector(QObject):
         self.pda_thread.start()
     
     def _run(self) -> None:
-        while not self.stop_event.is_set():
+        while True:
             try:
+                stopping = self.stop_event.is_set()
+                if stopping and not self._drain_on_stop:
+                    break
                 # if self.block:
                     # self.recording.a2p_queue.stall(self.HOP_SIZE) # occurs when in practice mode and you fuck up
                 x, t = self.recording.a2p_queue.pop(self.FRAME_SIZE, self.HOP_SIZE, stall=self.block)
 
                 if x is None: # returns none if not enough to detect
+                    if stopping:
+                        break
                     self.stop_event.wait(0.002)
                     continue
                 # x, t = x[0], x[1]
                 pitch = self.detect_pitch(x, t)
+                # Buffer addresses frames by their start so it can advance on
+                # the h1 grid, but a pitch describes the center of its analysis
+                # window (the convention already used by offline detection).
+                pitch.time = t + 0.5 * self.FRAME_SIZE / self.SR
                 self.recording.write_pitch_data([pitch], t)
                 # print(f'detected pitch @ {pitch.time}, midi_num: {pitch.candidate_pitches[0][0]}, unvoiced_prob: {pitch.unvoiced_prob}')
-                self.pitch_detected.emit(pitch.time)
+                # Practice reads the just-written storage slot, so retain the
+                # frame-start address on the signal even though Pitch.time is
+                # now correctly center-stamped for plotting and analysis.
+                self.pitch_detected.emit(t)
 
             except Exception as e:
                 print(f"[PitchDetector] frame skipped due to error: {e}")
                 continue
 
-    def stop(self):
+    def stop(self, drain: bool = False):
+        """Stop live detection, optionally processing all complete queued frames."""
         if self.pda_thread and self.pda_thread.is_alive():
+            self._drain_on_stop = drain
             self.stop_event.set()
             self.pda_thread.join() # pause the main thread until recording thread recognizes the stop event
+        self._drain_on_stop = False
 
     # OFFLINE (whole-file) detection, run on a background thread so the Qt event
     # loop stays free (e.g. to animate a loading spinner while we wait).
@@ -595,15 +617,22 @@ class PitchDetector(QObject):
         Returns:
             np.ndarray: The filtered audio signal as a 1D NumPy array, with reduced noise outside the typical pitch range.
         """
-        sos = iirfilter(
-            N=2, Wn=[fmin, fmax],
-            btype='bandpass', 
-            ftype='butter', 
-            output='sos', 
-            fs=self.SR
-        )
-        x = sosfilt(sos, x)
-        return x
+        # The Butterworth design depends only on (fmin, fmax, sr) — all constant
+        # per Config — but this runs once per frame (~344x/sec live). Redesigning
+        # the filter each call (iirfilter -> zpk2sos) was ~60% of per-frame pitch
+        # cost and starved the live audio->pitch queue, so cache the SOS and only
+        # rebuild it when the cutoffs/rate actually change.
+        key = (fmin, fmax, self.SR)
+        if self._bandpass_key != key:
+            self._bandpass_sos = iirfilter(
+                N=2, Wn=[fmin, fmax],
+                btype='bandpass',
+                ftype='butter',
+                output='sos',
+                fs=self.SR
+            )
+            self._bandpass_key = key
+        return sosfilt(self._bandpass_sos, x)
     
     def high_pass_iir_filter(self, x: np.ndarray, cutoff_freq=150, 
                              sr: int=44100) -> np.ndarray:
