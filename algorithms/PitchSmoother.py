@@ -22,9 +22,10 @@ section 2.2 of the paper and realised in the reference implementation
         unvoiced     : (1 - yin_trust * sum_k p*_k) / M    (uniform over bins)
 
   * Transition probabilities:
-        - voicing: 0.99 to stay, 0.01 to switch (eq. 7)
-        - pitch:   triangular kernel, max jump 25 bins = 2.5 semitones/frame,
-                   peak at 0, normalised to sum to 1 (eq. 8)
+        - voicing: Attune defaults to 0.9975 to stay, 0.0025 to switch;
+                   the paper uses 0.99 / 0.01 (eq. 7)
+        - pitch:   triangular kernel, Attune default max jump 9 bins =
+                   90 cents/frame, peak at 0, normalised to sum to 1 (eq. 8)
         - assumed independent, so the full transition is their product.
 
   * Initial distribution: uniform over the unvoiced states.
@@ -99,17 +100,10 @@ class PitchSmoother:
     def __init__(self, recording: Recording=None, config: Config=None):
         """
         Args:
+            recording: optional Recording to pull config from (if not supplied
+                directly). If both are supplied, the explicit config takes precedence.
             config: app Config (used for tuning + the freq<->midi conversion,
                 and as the default pitch range via fmin/fmax).
-            fmin / fmax: pitch-range bounds in Hz. Default to config.fmin/fmax.
-                The paper uses 55 Hz (A1) .. 880 Hz (A5); using the instrument
-                range is usually a better fit for this app.
-            resolution_cents: bin width in cents. Paper uses 10 (= 0.1 semitone).
-            max_jump_cents: maximum frame-to-frame pitch jump. Paper uses 250
-                cents (2.5 semitones = 25 bins of 10 cents).
-            switch_prob: probability of switching voiced<->unvoiced (eq. 7).
-            yin_trust: weight on the YIN candidate mass when voiced (the 0.5 of
-                eq. 6 / MonoPitchHMM's m_yinTrust).
         """
         self.recording = recording
         self.config = config if config else recording.config
@@ -117,13 +111,22 @@ class PitchSmoother:
             self.update_config(self.config)
 
     def update_config(self, config: Config):
-        """update the config and all relevant parameters"""
+        """update the config and all relevant parameters. importantly, this sets
+        the following attributes on self to be used in the algorithm
+            fmin / fmax: pitch-range bounds in Hz. Default to config.fmin/fmax
+            resolution_cents: bin width in cents; paper uses 10 (= 0.1 semitone)
+            max_jump_cents: maximum frame-to-frame pitch jump. Attune uses 90
+                cents (9 bins of 10 cents); the paper uses 250 cents.
+            switch_prob: probability of switching voiced<->unvoiced (eq. 7).
+            yin_trust: weight on the YIN candidate mass when voiced. Attune
+                uses 0.65; eq. 6 / MonoPitchHMM uses 0.5.
+        """
         self.config = config
         RESOLUTION_CENTS = 10.0
         self.resolution = RESOLUTION_CENTS / 100.0  # in semitones
         self.switch_prob = 0.0025
         self.yin_trust = 0.65
-        MAX_JUMP_CENTS = 250.0
+        MAX_JUMP_CENTS = 90.0
 
         # --- build the pitch grid (bin index <-> midi number) ---
         fmin = config.fmin
@@ -137,8 +140,7 @@ class PitchSmoother:
         self.bin_midis = self.midi_min + self.resolution * np.arange(self.n_bins)
 
         # max jump in bins (each side of the diagonal)
-        # self.max_jump = int(round(MAX_JUMP_CENTS / RESOLUTION_CENTS))
-        self.max_jump =9
+        self.max_jump = int(round(MAX_JUMP_CENTS / RESOLUTION_CENTS))
 
         self.n_states = 2 * self.n_bins  # voiced bins, then unvoiced bins
 

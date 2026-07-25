@@ -221,13 +221,9 @@ class PitchDetector(QObject):
         return pitch
 
 
-    def detect_pitches(
-        self,
-        x: np.ndarray,
-        show_progress: bool = False,
-        progress_desc: str = "Detecting pitches",
-        verbose: bool = False,
-    ) -> list[Pitch]:
+    def detect_pitches(self, x: np.ndarray, show_progress: bool = False, 
+                       progress_desc: str = "Detecting pitches", 
+                       verbose: bool = False) -> list[Pitch]:
         """
         Computes multi-frame pitch detection on an arbitrary length array of audio data.
         Returns a nested list of pitches, each corresponding to the freq estimates (probabilistic)
@@ -548,7 +544,7 @@ class PitchDetector(QObject):
         below a certain 'absolute threshold'. Runs 
 
         Args:
-            cdf: the clamped difference function for y-values corresponding in the threshold range
+            cdf: the difference function for y-values corresponding in the threshold range
             acf_peaks: indices of the prominent-peaks found from the ACF (to index into the CDF)
             threshold: take the first trough below this value of d'(tau)
         
