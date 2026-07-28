@@ -124,9 +124,9 @@
         <span class="label">Tolerance:</span>
         <input
           type="range"
-          min="0.05"
+          min="0.5"
           max="5"
-          step="0.05"
+          step="0.5"
           value={session.pitchTolerance}
           oninput={handlePitchToleranceChange}
           class="tolerance-slider"
@@ -201,6 +201,7 @@
   .mistake-widget {
     flex: 1;
     min-height: 0;
+    overflow-y: auto;
   }
   .mistake-header {
     display: flex;

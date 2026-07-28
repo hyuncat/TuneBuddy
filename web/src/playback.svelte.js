@@ -58,6 +58,25 @@ function createPlaybackState() {
   let currentMetronomeChannel = null;
   let lastLoadedKey = null; // dedupe rebuilds when nothing relevant changed
 
+  // `duration` is the longer of the score's own notes and the user's
+  // recording - a recording can run past the score's last note (extra
+  // playing, a slow ending) and the transport/GuitarHero overlay should
+  // still play/scrub through all of it rather than cutting off at the
+  // score's own length. audioEl.duration is only known once its metadata
+  // loads, hence the separate 'loadedmetadata' listener recomputing this.
+  let scoreDurationRaw = 0;
+  function updateDuration() {
+    const next = Math.max(scoreDurationRaw, audioEl.duration || 0);
+    if (next === duration) return;
+    duration = next;
+    // The synth's SMF was already padded to the old (shorter) duration -
+    // rebuild it so the score's own playback doesn't finish (and freeze the
+    // shared cursor/GuitarHero playhead) before the longer recording does.
+    // resume:true bypasses reload()'s no-op dedup and preserves position.
+    reload({ resume: true });
+  }
+  audioEl.addEventListener("loadedmetadata", updateDuration);
+
   function activeChannelsData() {
     if (!currentNoteData) return [];
     const channels = [];
@@ -173,7 +192,8 @@ function createPlaybackState() {
     currentNoteData = noteData;
     currentBpm = noteData?.bpm ?? 120;
     currentMetronomeChannel = noteData?.metronome_channel ?? null;
-    duration = computeDuration(noteData);
+    scoreDurationRaw = computeDuration(noteData);
+    updateDuration();
     lastLoadedKey = null;
     if (synth) {
       await reload();
@@ -193,6 +213,7 @@ function createPlaybackState() {
     if (!audioEl) return;
     if (audioEl.src) URL.revokeObjectURL(audioEl.src);
     audioEl.src = file ? URL.createObjectURL(file) : "";
+    updateDuration(); // clears the old recording's contribution immediately; 'loadedmetadata' re-adds it once the new file's real length is known
   }
 
   function stopPolling() {

@@ -227,10 +227,28 @@ function createSessionState() {
     selectedMistakeKey = null;
   }
 
+  // Mirrors perform.py's _clear_analysis: a new score or recording
+  // invalidates any existing analysis (it was computed against the OLD
+  // score/audio pair), so the mistake table and GuitarHero overlay must not
+  // keep showing it - otherwise pitchMistakes/timingMistakes end up pairing
+  // stale userNotes against the NEW scoreNotesActive, which is exactly what
+  // produced the "mistake widget looks wrong after uploading a new score"
+  // symptom (indices/notes that don't correspond to each other at all).
+  function _resetAnalysis() {
+    analysisResult = null;
+    analyzeStatus = "idle";
+    analyzeError = "";
+    realignedPairs = null;
+    realignError = "";
+    overridden = new Set();
+    selectedMistakeKey = null;
+  }
+
   async function pickScore(file) {
     scoreFile = file;
     noteDataError = "";
     selectedInstrument = null;
+    _resetAnalysis();
     if (!file) {
       noteData = null;
       return;
@@ -250,6 +268,7 @@ function createSessionState() {
   function pickAudio(file) {
     audioFile = file;
     statusMessage = file ? `Recording set: ${file.name}` : "";
+    _resetAnalysis();
     playback.loadUserAudio(file);
   }
 
