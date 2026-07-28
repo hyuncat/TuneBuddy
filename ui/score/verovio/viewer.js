@@ -508,6 +508,8 @@ document.addEventListener("keydown", (ev) => {
 
 // --- INIT VEROVIO TOOLKIT ---
 // (hangs until WASM is ready. sets toolkit -> tk.)
+// Prevent race conditions: if loadScore is called before verovio is ready, queue the load and run it once vereovio is initialized.
+let pendingLoad = null; // {b64, partIndex} | null
 (function init() {
     // make sure verovio was imported from verovio-toolkit-wasm.js
     if (typeof verovio === "undefined" || !verovio.module) {
@@ -518,12 +520,21 @@ document.addEventListener("keydown", (ev) => {
     verovio.module.onRuntimeInitialized = () => {
         tk = new verovio.toolkit();
         setStatus("Ready");
+        if (pendingLoad) {
+            const { b64, partIndex } = pendingLoad;
+            pendingLoad = null;
+            window.loadScore(b64, partIndex);
+        }
     };
 })();
 
 // --- PUBLIC API (called from python) ---
 window.loadScore = function(b64, partIndex = 0) {
-    if (!tk) { setStatus("Verovio not ready"); return; }
+    if (!tk) {
+        pendingLoad = { b64, partIndex };
+        setStatus("Verovio not ready - queued");
+        return;
+    }
     try {
         setStatus("Loading score...");
         activePartIndex = Number.isFinite(Number(partIndex)) ? Number(partIndex) : 0;

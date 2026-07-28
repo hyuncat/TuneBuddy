@@ -43,9 +43,31 @@ to recompute on load). All the windowing/smoothing (the 3-point median,
 per-note vs. take-wide ranges) happens client-side in `noteCurve.js`, off
 the raw grid, the same architecture as the Volume/pitch curves. The
 GuitarHero-style click popup's Vibrato row (`NoteOverlay.svelte`) is filled
-in from the same data too. Not yet done: deployment (still runs locally only), a proper ScoreTimeMap port (score clicks before
-any analysis has run use Verovio's own rendered timeline as a best-effort
-approximation - see `onNoteClicked` in `App.svelte`), and a few toolbar stubs
+in from the same data too.
+
+The score cursor is barline-anchored, not approximate: `scoreTimeMap.js`
+ports `ui/time/ScoreTimeMap.py` faithfully (piecewise-linear interpolation
+between the app's MIDI timeline and Verovio's own, which drifts from it over
+a piece), anchored from `/notedata`'s `measure_onsets_og`/`bpm_og`/
+`transpose_offset` fields paired with `ScoreViewer.svelte`'s
+`getMeasureTimemap()`. Owned as a plain instance in `App.svelte` (not a
+shared singleton, not inside `ScoreViewer.svelte`) - mirrors `perform.py`
+owning `_time_map` rather than `ScoreViewer.py`, keeping the viewer a dumb
+Verovio wrapper with no score-policy knowledge. This fixed a real, previously
+-shipped bug in the process, not just the approximate-click gap this was
+originally scoped to close: the ongoing playback-cursor push
+(`scoreViewer.setPlaybackTime`) was sending raw app time completely
+unconverted, silently drifting from what's actually sounding on any
+recording where Verovio's timeline had diverged from the MIDI one -
+desktop always converts this (`perform.py:504`), the web port never had.
+Also fixed along the way: `ui/score/verovio/viewer.js`'s `window.loadScore`
+now queues a request and flushes it once Verovio's WASM finishes
+initializing, instead of silently dropping it - a same-origin iframe host
+can call `loadScore` moments after page load, well before the async WASM
+init completes, and the old behavior meant the score could silently never
+load for the rest of the session with no retry.
+
+Not yet done: deployment (still runs locally only), and a few toolbar stubs
 (Settings, Save, Clip) that are either dead ends in the desktop app itself
 (Settings) or real features not yet built (Save, Clip) — see inline comments
 in `Toolbar.svelte` for the current state of each.
@@ -193,6 +215,7 @@ web/
 │   │                            # score-note-indexed mistake payload ScoreViewer's iframe renders
 │   ├── colors.js                # viridis ramp + volume math, ported from ui/Colors.py + PitchData
 │   ├── noteCurve.js             # "note under the cursor" window + curve extraction for NotePanel
+│   ├── scoreTimeMap.js          # barline-anchored app<->Verovio time conversion, ported from ScoreTimeMap.py
 │   ├── noteDataCache.js        # content-hash-keyed cache for /notedata responses
 │   ├── realign.js              # debounced /realign calls for pitch-tolerance changes
 │   ├── theme.css               # dark theme, extracted from qdarktheme's real stylesheet

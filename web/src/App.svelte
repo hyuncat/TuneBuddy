@@ -17,8 +17,24 @@
   import { session } from "./sessionState.svelte.js";
   import { playback } from "./playback.svelte.js";
   import { buildAnnotations } from "./annotations.js";
+  import { ScoreTimeMap } from "./scoreTimeMap.js";
 
   let scoreViewer;
+
+  // Owned here (not a shared singleton, not inside ScoreViewer.svelte) -
+  // mirrors perform.py owning _time_map rather than ScoreViewer.py: the
+  // widget stays a dumb Verovio wrapper with no score-policy knowledge
+  // (tempo/transpose), and App.svelte plays the same "host tab" role
+  // perform.py does. Only this file's two call sites below need it today.
+  let timeMap = new ScoreTimeMap();
+
+  function scoreInfo() {
+    return {
+      bpm: session.noteData?.bpm,
+      bpmOg: session.noteData?.bpm_og,
+      transposeOffset: session.noteData?.transpose_offset,
+    };
+  }
 
   // Mirrors perform.py's _refresh_score_mistakes: push score-note-indexed
   // mistake markers into the viewer whenever the underlying mistakes,
@@ -45,38 +61,40 @@
   // while playing, matching desktop's scrub-only guard).
   //
   // Annotation clicks already carry app/MIDI time (from noteMeta.seekTime -
-  // built off the same NoteData timeline playback.seek() uses). Plain note
-  // clicks (no annotation loaded yet, e.g. before Analyze) only have
-  // Verovio's OWN rendered-SVG timeline, which can drift from MIDI time -
-  // desktop corrects this with ScoreTimeMap (not yet ported here; a
-  // score-scrubbing concern independent of mistake annotations). Snapping to
-  // the nearest real note onset is a reasonable approximation until that
-  // exists.
+  // built off the same NoteData timeline playback.seek() uses) - no map
+  // needed, matching desktop's on_annotation_clicked taking app_sec directly.
   function onAnnotationClicked(appSec) {
     if (playback.isPlaying) return;
     playback.seek(appSec);
   }
 
+  // Plain note clicks only carry Verovio's OWN rendered-SVG time, which
+  // drifts from MIDI time - convert via the barline map first (mirrors
+  // perform.py's _score_note_start_from_viewer), then snap to the nearest
+  // rendered score-note onset so the shared transport lands on a real
+  // NoteData start time.
   function onNoteClicked(viewerSec) {
     if (playback.isPlaying) return;
+    const appT = timeMap.appTime(viewerSec, scoreInfo());
     const starts = (session.scoreNotesActive ?? []).map((n) => n[1]);
     if (!starts.length) {
-      playback.seek(viewerSec);
+      playback.seek(appT);
       return;
     }
     const nearest = starts.reduce((best, t) =>
-      Math.abs(t - viewerSec) < Math.abs(best - viewerSec) ? t : best
+      Math.abs(t - appT) < Math.abs(best - appT) ? t : best
     );
     playback.seek(nearest);
   }
 
   // Drives the score cursor from the real playback clock - mirrors
-  // app.py's time_changed, which calls ScoreViewer.set_playback_time on
-  // every WallClock tick. playback.svelte.js polls at the same 10Hz
-  // cadence WallClock itself uses.
+  // app.py's time_changed, which calls ScoreViewer.set_playback_time via
+  // perform.py's _score_viewer_time (the SAME barline-map conversion used
+  // above, just the inverse direction). playback.svelte.js polls at the
+  // same 10Hz cadence WallClock itself uses.
   $effect(() => {
     if (scoreViewer?.isReady()) {
-      scoreViewer.setPlaybackTime(playback.currentTime);
+      scoreViewer.setPlaybackTime(timeMap.viewerTime(playback.currentTime, scoreInfo()));
     }
   });
 
@@ -90,12 +108,27 @@
   // Loads the real uploaded score into Verovio the moment /notedata returns
   // it (musicxml_b64 - see analyze_api.py), independent of Analyze ever
   // running, mirroring the desktop app's score-independent score loading.
+  //
+  // Re-anchors the barline time map right after (mirrors perform.py's
+  // refresh_score_viewer -> _rebuild_time_map) - simpler here than desktop's
+  // version, though: ScoreViewer.svelte's getMeasureTimemap() is a same-
+  // origin, synchronous iframe call (unlike desktop's genuinely async Qt
+  // runJavaScript-with-callback), and loadScore() itself runs Verovio's
+  // render synchronously start to finish, so the timemap is already valid
+  // the instant loadScore() returns - no async _store callback needed.
   let lastLoadedMusicXml = null;
   $effect(() => {
     const b64 = session.noteData?.musicxml_b64;
     if (b64 && b64 !== lastLoadedMusicXml && scoreViewer?.isReady()) {
       lastLoadedMusicXml = b64;
       scoreViewer.loadScore(base64ToBytes(b64));
+      const veroOnsets = scoreViewer.getMeasureTimemap();
+      const appOnsets = session.noteData?.measure_onsets_og;
+      if (veroOnsets?.length && appOnsets?.length) {
+        timeMap.setAnchors(appOnsets, veroOnsets);
+      } else {
+        timeMap.clear();
+      }
     }
   });
 </script>

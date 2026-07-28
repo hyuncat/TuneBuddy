@@ -215,6 +215,16 @@ async def note_data(score: UploadFile = File(...)) -> dict:
         # program in note_data[channel][i][5] (Note.instrument, set from
         # MidiData.instruments - a real GM program number, not guessed).
         "metronome_channel": score_data.metronome_channel,
+        # ScoreTimeMap inputs (see ui/time/ScoreTimeMap.py): barline onsets in
+        # the original-tempo timeframe, paired 1:1 by measure index with
+        # Verovio's own measure timemap (ScoreViewer.svelte's
+        # getMeasureTimemap()) to anchor the score cursor to the MIDI/NoteData
+        # timeline instead of Verovio's own drifting one. channel=None (first
+        # part) since the web port always renders the full score - there's no
+        # per-instrument re-render here the way desktop's viewer_show_full has.
+        "measure_onsets_og": score_data.measure_onsets_og(),
+        "bpm_og": score_data.bpm_og,
+        "transpose_offset": score_data.transpose_offset,
     }
 
 
