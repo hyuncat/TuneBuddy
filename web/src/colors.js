@@ -4,6 +4,7 @@
 // static SCORE_THEME constant in ScoreViewer.svelte - this file is only the
 // part that needs real computation: the take's own loudness range and the
 // viridis ramp built from it.
+import { getVoicedPitchFrames } from "./PitchFrameHandler.js";
 
 // --- ui.Colors.VIRIDIS_ANCHORS / SCORE_DIM / VOL_LIVE_FLOOR_DB ---
 const VIRIDIS_ANCHORS = [
@@ -54,17 +55,11 @@ export function volumeFrac(volume, vminDb, vmaxDb) {
   return Math.max(0, Math.min(1, frac));
 }
 
-// candidateFrames: the app's raw pitch_data.pitches payload
-// ([time, candidates, volume, unvoicedProb, ..., isTransition, value]) -
-// filters to voiced frames itself, mirroring PitchData.read(clean=True).
-const UNVOICED_THRESHOLD = 0.9;
+// Voiced frames' volumes in [startTime, endTime] - mirrors PitchData.read(clean=True).
 function voicedVolumes(pitchFrames, startTime = -Infinity, endTime = Infinity) {
   const vols = [];
-  for (const frame of pitchFrames ?? []) {
-    if (!frame) continue;
-    const [time, , volume, unvoicedProb, , , , value] = frame;
-    if (time < startTime || time > endTime) continue;
-    if (value === -1 || unvoicedProb >= UNVOICED_THRESHOLD) continue;
+  for (const frame of getVoicedPitchFrames(pitchFrames, startTime, endTime)) {
+    const [, , volume] = frame;
     if (volume > 0) vols.push(volume);
   }
   return vols;

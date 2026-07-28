@@ -17,6 +17,7 @@
   import { noteFromArray, noteName } from "./mistakes.js";
   import { meanVolume, volumeFrac, volumeRangeDb, viridis, cssRgb } from "./colors.js";
   import { vibratoNoteSummary } from "./noteCurve.js";
+  import { getVoicedPitchFrames } from "./PitchFrameHandler.js";
 
   let {
     scoreNotes,
@@ -87,14 +88,9 @@
   let userNotesParsed = $derived(userNotes.map(noteFromArray));
 
   // --- GuitarHero.update_user_items' pitch scatter, ported ---
-  // Payload shape (JsonHandler._pitch_to_payload):
-  //   [time, candidate_pitches[[midi, prob], ...], volume, unvoiced_prob,
-  //    live_distance, aligned_distance, is_transition, value]
   // Only the first (most probable) candidate is plotted per frame, matching
   // GuitarHero's `break` after the first candidate_pitches entry. Voicing
-  // filter mirrors PitchData.is_voiced_pitch (value != -1 and
-  // unvoiced_prob < UNVOICED_THRESHOLD, default 0.9 - see algorithms/Config.py).
-  const UNVOICED_THRESHOLD = 0.9;
+  // filter (PitchData.is_voiced_pitch) lives in getVoicedPitchFrames now.
   const REST_COLOR = "rgb(140, 140, 140)";
 
   // --- GuitarHero's own "Colors:" dropdown (color_mode) - independent of
@@ -108,10 +104,8 @@
   let pitchPoints = $derived.by(() => {
     if (!pitchFrames) return [];
     const points = [];
-    for (const frame of pitchFrames) {
-      if (!frame) continue;
-      const [time, candidates, volume, unvoicedProb, , alignedDistance, isTransition, value] = frame;
-      if (value === -1 || unvoicedProb >= UNVOICED_THRESHOLD) continue;
+    for (const frame of getVoicedPitchFrames(pitchFrames, -Infinity, Infinity)) {
+      const [time, candidates, volume, , , alignedDistance, isTransition] = frame;
       if (!candidates || candidates.length === 0) continue;
       const midi = candidates[0][0];
       let color;

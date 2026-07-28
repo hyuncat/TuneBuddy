@@ -3,6 +3,7 @@
 // extraction (app_logic/user/ds/PitchData.py's pitch_curve/volume_curve)
 // that NotePanel's graphs (Volume now, Vibrato/Timbre later) draw against.
 import { noteFromArray } from "./mistakes.js";
+import { getPitchFramesInRange } from "./PitchFrameHandler.js";
 
 // The transport is quantized (desktop: milliseconds), so seeking to an exact
 // onset can round down just before the note - a small display-only
@@ -32,10 +33,8 @@ export function noteContaining(userNotesActive, t) {
 const UNVOICED_THRESHOLD = 0.9;
 export function pitchContour(pitchFrames, t0, t1) {
   const points = [];
-  for (const frame of pitchFrames ?? []) {
-    if (!frame) continue;
+  for (const frame of getPitchFramesInRange(pitchFrames, t0, t1)) {
     const [time, , , unvoicedProb, , , , value] = frame;
-    if (time < t0 || time > t1) continue;
     const voiced = value !== -1 && unvoicedProb < UNVOICED_THRESHOLD;
     points.push({ time, midi: voiced ? value : null });
   }
@@ -47,10 +46,8 @@ export function pitchContour(pitchFrames, t0, t1) {
 // silence floors at floorDb rather than gapping. Mirrors PitchData.volume_curve.
 export function volumeCurveDb(pitchFrames, t0, t1, floorDb) {
   const points = [];
-  for (const frame of pitchFrames ?? []) {
-    if (!frame) continue;
+  for (const frame of getPitchFramesInRange(pitchFrames, t0, t1)) {
     const [time, , volume] = frame;
-    if (time < t0 || time > t1) continue;
     const db = volume > 0 ? Math.max(floorDb, 20 * Math.log10(volume)) : floorDb;
     points.push({ time, db });
   }
