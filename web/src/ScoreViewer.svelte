@@ -68,12 +68,40 @@
 
   // xmlBytes: Uint8Array of MusicXML content (uncompressed text, matching what
   // ScoreData.to_musicxml_bytes() produces server-side - not a raw .mxl zip).
-  export function loadScore(xmlBytes) {
+  //
+  // onRendered(height), if given, fires once the score has actually produced
+  // visible geometry (see attemptLoad below) - App.svelte uses it to size the
+  // score pane to the rendered line (mirrors perform.py's
+  // _fit_score_viewer_height).
+  export function loadScore(xmlBytes, onRendered) {
     if (!ready) {
       console.warn("[ScoreViewer] loadScore called before ready, ignoring.");
       return;
     }
-    callIframe("loadScore", bytesToBase64(xmlBytes));
+    attemptLoad(bytesToBase64(xmlBytes), 0, onRendered);
+  }
+
+  // Verovio's toolkit can report itself constructed before its engraver is
+  // actually able to produce real geometry (see viewer.js's calledRun
+  // fast-path) - the very first renderToSVG() right after that can silently
+  // come back as an empty 0x0-page SVG, with getContentHeight() reporting 0.
+  // This doesn't self-heal by waiting (confirmed by polling for seconds with
+  // no re-trigger), so it needs an explicit re-call - and the retry has to
+  // live out here on the host rather than inside viewer.js's own script
+  // context: an iframe-internal setTimeout retry was tried first and never
+  // fired at all (a freshly-created/just-shown iframe's own timers can stall
+  // independently of the host page's), while the host's timers fire
+  // reliably.
+  function attemptLoad(b64, attempt, onRendered) {
+    callIframe("loadScore", b64);
+    const height = callIframe("getContentHeight");
+    if (height > 0) {
+      onRendered?.(height);
+    } else if (attempt < 5) {
+      setTimeout(() => attemptLoad(b64, attempt + 1, onRendered), 60);
+    } else {
+      console.warn("[ScoreViewer] score render kept coming back empty after retries");
+    }
   }
 
   export function setPlaybackTime(sec) {

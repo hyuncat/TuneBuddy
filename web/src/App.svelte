@@ -20,6 +20,14 @@
   import { ScoreTimeMap } from "./scoreTimeMap.js";
 
   let scoreViewer;
+  // Rendered-system height (CSS px), pulled from the iframe after each load -
+  // mirrors perform.py's _fit_score_viewer_height, which sizes the Qt
+  // splitter pane to the single rendered line so nothing needs to scroll.
+  // legendHeight is measured via bind:clientHeight so the fit accounts for
+  // the row below the score, same as desktop adding
+  // _score_legend_row.sizeHint().height().
+  let scoreFitHeight = $state(null);
+  let legendHeight = $state(0);
   // Bumped by ScoreViewer's onReady callback the instant its iframe finishes
   // loading - read (not just scoreViewer?.ready) inside effects below so
   // they have a guaranteed local $state dependency to re-run on, rather
@@ -130,7 +138,13 @@
     const b64 = session.noteData?.musicxml_b64;
     if (b64 && b64 !== lastLoadedMusicXml && scoreViewer?.ready) {
       lastLoadedMusicXml = b64;
-      scoreViewer.loadScore(base64ToBytes(b64));
+      // onRendered fires once the score has real geometry (ScoreViewer.svelte
+      // retries internally if the first render comes back empty) - mirrors
+      // ScoreViewer.py's _emit_content_height feeding perform.py's
+      // _fit_score_viewer_height.
+      scoreViewer.loadScore(base64ToBytes(b64), (height) => {
+        scoreFitHeight = height;
+      });
       const veroOnsets = scoreViewer.getMeasureTimemap();
       const appOnsets = session.noteData?.measure_onsets_og;
       if (veroOnsets?.length && appOnsets?.length) {
@@ -152,11 +166,11 @@
     </aside>
 
     <section class="center-column">
-      <div class="score-pane">
+      <div class="score-pane" style={scoreFitHeight ? `flex: 0 1 ${scoreFitHeight + legendHeight + 4}px` : undefined}>
         <div class="score-viewer-wrap">
           <ScoreViewer bind:this={scoreViewer} {onNoteClicked} {onAnnotationClicked} onReady={() => scoreReadyTick++} />
         </div>
-        <div class="score-legend-row">
+        <div class="score-legend-row" bind:clientHeight={legendHeight}>
           <span class="legend-swatches">
             {#if session.scoreColorMode === "volume"}
               <span class="legend-item"><span class="swatch volume-swatch"></span>volume</span>
