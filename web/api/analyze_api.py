@@ -40,13 +40,15 @@ SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".wave", ".flac", ".ogg", ".aif", ".aiff",
 
 app = FastAPI(title="Attune Analyze API")
 
-# Dev-only: any localhost/127.0.0.1 port. Vite's dev port isn't fixed on every
-# machine (autoPort reassigns it if 5173 is already taken by another project),
-# so a fixed origin list breaks in exactly that case. Tighten this to the real
-# deployed frontend origin before shipping.
+# allow_origin_regex covers local dev (any localhost/127.0.0.1 port - Vite's
+# port isn't fixed, autoPort reassigns it if 5173 is taken), allow_origins
+# covers the real deployed frontend. Starlette's CORSMiddleware checks a
+# request's origin against both independently, so a match on either is enough
+# - no need to fold the deployed origin into the regex.
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
+    allow_origins=["https://main.dz0hpijjgdav5.amplifyapp.com"],
     #Post is the only relevant method because frontend will only send Post to the API
     allow_methods=["POST"],
     allow_headers=["*"],
