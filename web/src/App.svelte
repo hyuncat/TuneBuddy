@@ -20,6 +20,12 @@
   import { ScoreTimeMap } from "./scoreTimeMap.js";
 
   let scoreViewer;
+  // Bumped by ScoreViewer's onReady callback the instant its iframe finishes
+  // loading - read (not just scoreViewer?.ready) inside effects below so
+  // they have a guaranteed local $state dependency to re-run on, rather
+  // than relying on reactively noticing a property read through the
+  // cross-component scoreViewer reference, which proved unreliable.
+  let scoreReadyTick = $state(0);
 
   // Owned here (not a shared singleton, not inside ScoreViewer.svelte) -
   // mirrors perform.py owning _time_map rather than ScoreViewer.py: the
@@ -42,7 +48,8 @@
   // categories always go in together - viewer.js itself filters which one is
   // VISIBLE per the active color mode (see annotations.js's header).
   $effect(() => {
-    if (!scoreViewer?.isReady()) return;
+    scoreReadyTick;
+    if (!scoreViewer?.ready) return;
     const annotations = buildAnnotations({
       scoreNotesActive: session.scoreNotesActive,
       userNotesActive: session.analysisResult?.note_data,
@@ -93,7 +100,8 @@
   // above, just the inverse direction). playback.svelte.js polls at the
   // same 10Hz cadence WallClock itself uses.
   $effect(() => {
-    if (scoreViewer?.isReady()) {
+    scoreReadyTick;
+    if (scoreViewer?.ready) {
       scoreViewer.setPlaybackTime(timeMap.viewerTime(playback.currentTime, scoreInfo()));
     }
   });
@@ -118,8 +126,9 @@
   // the instant loadScore() returns - no async _store callback needed.
   let lastLoadedMusicXml = null;
   $effect(() => {
+    scoreReadyTick;
     const b64 = session.noteData?.musicxml_b64;
-    if (b64 && b64 !== lastLoadedMusicXml && scoreViewer?.isReady()) {
+    if (b64 && b64 !== lastLoadedMusicXml && scoreViewer?.ready) {
       lastLoadedMusicXml = b64;
       scoreViewer.loadScore(base64ToBytes(b64));
       const veroOnsets = scoreViewer.getMeasureTimemap();
@@ -145,7 +154,7 @@
     <section class="center-column">
       <div class="score-pane">
         <div class="score-viewer-wrap">
-          <ScoreViewer bind:this={scoreViewer} {onNoteClicked} {onAnnotationClicked} />
+          <ScoreViewer bind:this={scoreViewer} {onNoteClicked} {onAnnotationClicked} onReady={() => scoreReadyTick++} />
         </div>
         <div class="score-legend-row">
           <span class="legend-swatches">

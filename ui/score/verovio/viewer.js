@@ -516,8 +516,7 @@ let pendingLoad = null; // {b64, partIndex} | null
         setStatus("Failed to load...");
         return;
     }
-    // initialize toolkit once WASM runtime is ready
-    verovio.module.onRuntimeInitialized = () => {
+    const onReady = () => {
         tk = new verovio.toolkit();
         setStatus("Ready");
         if (pendingLoad) {
@@ -526,6 +525,20 @@ let pendingLoad = null; // {b64, partIndex} | null
             window.loadScore(b64, partIndex);
         }
     };
+    // Emscripten's onRuntimeInitialized fires exactly once; if the module's
+    // WASM instantiation already finished by the time this script runs
+    // (calledRun true - can happen when the WASM is small/embedded inline
+    // and compiles fast enough to race this script's own execution),
+    // assigning the callback here would be too late and it would never
+    // fire, leaving tk permanently null even though the module is actually
+    // ready - this is exactly what produced the intermittent "score loads
+    // forever" bug (Verovio silently rendering an empty 0x0-page document
+    // because loadData() never actually ran against a real toolkit).
+    if (verovio.module.calledRun) {
+        onReady();
+    } else {
+        verovio.module.onRuntimeInitialized = onReady;
+    }
 })();
 
 // --- PUBLIC API (called from python) ---

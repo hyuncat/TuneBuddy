@@ -14,7 +14,11 @@
   // in the score. Wired to the iframe's window.bridge via the ported viewer.js's
   // window.setBridge() (see ui/score/verovio/viewer.js), since a same-origin
   // iframe has no QWebChannel to push through.
-  let { onNoteClicked = null, onAnnotationClicked = null } = $props();
+  // onReady: fires exactly once, the instant the iframe finishes loading -
+  // an explicit callback rather than relying on the parent reactively
+  // noticing `ready` flip through a cross-component property read, which
+  // proved unreliable in practice (see App.svelte's score-load effect).
+  let { onNoteClicked = null, onAnnotationClicked = null, onReady = null } = $props();
 
   // Mirrors ui/Colors.py's score_theme(): the --score-<role> custom
   // properties viewer.css's mistake/insertion-marker rules read (see
@@ -31,6 +35,7 @@
   };
 
   let ready = $state(false);
+  export { ready };
   let iframeEl;
 
   function handleLoad() {
@@ -40,6 +45,7 @@
       noteClicked: (sec) => onNoteClicked?.(sec),
       annotationClicked: (sec) => onAnnotationClicked?.(sec),
     });
+    onReady?.();
   }
 
   function callIframe(fnName, ...args) {
