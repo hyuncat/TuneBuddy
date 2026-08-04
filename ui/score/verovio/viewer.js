@@ -116,6 +116,29 @@ function renderPage(pageNo) {
     applyMistakeAnnotations();
 }
 
+// tk can report itself constructed (see the calledRun fast-path below)
+// before Verovio's engraver is actually able to produce real geometry - the
+// very first renderToSVG() call right after that can silently come back as
+// an empty 0x0-page SVG (no exception thrown, nothing to catch). Confirmed
+// this doesn't fix itself by waiting: polling the rendered SVG for seconds
+// afterward never showed it repair on its own, so waiting alone won't do -
+// only an explicit re-render does. Retrying a few times is enough headroom
+// for the one-off case where the engine hasn't settled yet. setTimeout
+// (not requestAnimationFrame) on purpose: rAF only fires while the page is
+// actively painting, and this same iframe can be freshly created/hidden
+// mid-layout when a score first loads, so a paint-gated retry can stall
+// indefinitely instead of failing loudly.
+function renderPageWithRetry(pageNo, attempt = 0) {
+    renderPage(pageNo);
+    const svg = document.querySelector("#notation svg");
+    const empty = !svg || svg.getAttribute("width") === "0px" || svg.getAttribute("height") === "0px";
+    if (empty && attempt < 5) {
+        setTimeout(() => renderPageWithRetry(pageNo, attempt + 1), 50);
+    } else if (empty) {
+        console.warn("[viewer] renderToSVG kept returning an empty page after retries");
+    }
+}
+
 const SVGNS = "http://www.w3.org/2000/svg";
 
 function makeRect(cls, bb) {
@@ -576,7 +599,7 @@ window.loadScore = function(b64, partIndex = 0) {
 
         // now render the loaded page (first line) with verovio
         currentPage = 1;
-        renderPage(currentPage);
+        renderPageWithRetry(currentPage);
         setStatus("Ready");
     } catch (e) {
         console.error(e);
