@@ -1,0 +1,30 @@
+# Keeps the build context small and avoids baking dev-only artifacts into
+# the image. This is about build *context* upload size and layer hygiene -
+# the Dockerfile's own COPY lines already only pull in algorithms/,
+# app_logic/, and web/api/, so most top-level dirs below are excluded twice
+# over (redundant with the Dockerfile, but this also speeds up the initial
+# context upload to the Docker daemon before any COPY runs).
+.git/
+.claude/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+venv/
+node_modules/
+
+# Desktop-only and dev-tooling directories the API never imports.
+ui/
+resources/
+benchmarks/
+notebooks/
+component_tests/
+docs/
+
+# Frontend source - built and deployed separately from this image.
+web/src/
+web/web-resources/
+web/dist/
+web/node_modules/
+
+.DS_Store
