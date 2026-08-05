@@ -10,7 +10,9 @@
 import { getNoteData } from "./noteDataCache.js";
 import { realign, debounce } from "./realign.js";
 import { classifyPitchMistakes, classifyTimingMistakes, noteName, noteNameToMidi, midiToHz, mistakeCategory } from "./mistakes.js";
+import { buildAnnotations } from "./annotations.js";
 import { playback } from "./playback.svelte.js";
+import { makeNotifier } from "./notifier.js";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -83,6 +85,12 @@ function createSessionState() {
 
   // Transient StatusBar message (mirrors app.py's StatusBar.status_label).
   let statusMessage = $state("");
+
+  // Fired imperatively whenever fresh note data lands (pickScore, below) -
+  // App.svelte subscribes once (onMount) and pushes the new score into the
+  // viewer directly, mirroring perform.py's refresh_score_viewer being
+  // called explicitly rather than derived from a reactive watcher.
+  const { on: onNoteDataLoaded, notify: notifyNoteDataLoaded } = makeNotifier("noteDataLoaded");
 
   const debouncedRealign = debounce(async (tolerance) => {
     if (!analysisResult || !noteData) return;
@@ -165,6 +173,30 @@ function createSessionState() {
       timingTolerance
     );
   });
+
+  // Score-viewer annotation payload (window.setMistakeAnnotations - see
+  // annotations.js's header). Colocated here as a $derived.by rather than
+  // computed inline in App.svelte's push effect: it's fed by ~9 different
+  // mutations scattered across this module (runAnalyze, toggleOverride,
+  // setSelectedInstrument, setPitchTolerance/setTimingTolerance,
+  // debouncedRealign's completion, pickScore's own noteData/
+  // selectedInstrument writes, _resetAnalysis) - hand-wiring an explicit
+  // notify() at every one of those sites is exactly the kind of missed-site
+  // bug this whole redesign exists to eliminate (a first manual pass at that
+  // list actually missed two). A $derived.by tracks its real dependencies
+  // automatically instead, so App.svelte only has to watch this one
+  // collapsed value (see App.svelte's pushAnnotations/its $effect).
+  let annotationsPayload = $derived.by(() =>
+    buildAnnotations({
+      scoreNotesActive,
+      userNotesActive: analysisResult?.note_data,
+      mistakes: pitchMistakes.concat(timingMistakes),
+      overridden,
+      overrideKey,
+      currentPairs,
+      pitchFrames: analysisResult?.pitch_data?.pitches,
+    })
+  );
 
   let visibleMistakes = $derived(
     (mode === "timing" ? timingMistakes : pitchMistakes).slice().sort((a, b) => {
@@ -259,6 +291,7 @@ function createSessionState() {
       statusMessage = `Loaded ${file.name}`;
       playback.loadNoteData(noteData);
       applyDefaultRangeForActiveInstrument();
+      notifyNoteDataLoaded(noteData);
     } catch (err) {
       noteDataError = err instanceof Error ? err.message : String(err);
       statusMessage = "Failed to load score.";
@@ -379,6 +412,7 @@ function createSessionState() {
     get scoreNotesActive() { return scoreNotesActive; },
     get pitchMistakes() { return pitchMistakes; },
     get timingMistakes() { return timingMistakes; },
+    get annotationsPayload() { return annotationsPayload; },
     get visibleMistakes() { return visibleMistakes; },
     get activeInstrument() { return activeInstrument(); },
     get selectedInstrument() { return selectedInstrument; },
@@ -401,6 +435,7 @@ function createSessionState() {
     toggleOverride,
     selectMistake,
     clearMistakeSelection,
+    onNoteDataLoaded,
   };
 }
 

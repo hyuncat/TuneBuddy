@@ -17,6 +17,7 @@
 import { AudioWorkletNodeSynthesizer, Constants } from "js-synthesizer";
 import { buildSMF, ticksToSeconds, secondsToTicks } from "./smf.js";
 import { noteFromArray } from "./mistakes.js";
+import { makeNotifier } from "./notifier.js";
 
 const SYNTH_BASE = "/synth";
 const SOUNDFONT_URL = `${SYNTH_BASE}/MuseScore_General.sf3`;
@@ -57,6 +58,14 @@ function createPlaybackState() {
   let currentBpm = 120;
   let currentMetronomeChannel = null;
   let lastLoadedKey = null; // dedupe rebuilds when nothing relevant changed
+
+  // Imperative tick notifications, fired on every currentTime update (poll
+  // tick or seek) - mirrors perform.py's WallClock calling move_views(t)
+  // directly on every tick, rather than relying on something reactively
+  // noticing currentTime changed (see App.svelte's onMount subscription for
+  // why: a $effect watching this across the ScoreViewer component boundary
+  // proved unreliable in practice for the score-viewer cursor specifically).
+  const { on: onTick, notify: notifyTick } = makeNotifier("tick");
 
   // `duration` is the longer of the score's own notes and the user's
   // recording - a recording can run past the score's last note (extra
@@ -238,6 +247,7 @@ function createPlaybackState() {
         if (duration) currentTime = duration;
         stopPolling();
       }
+      notifyTick();
     }, POLL_INTERVAL_MS);
   }
 
@@ -277,6 +287,7 @@ function createPlaybackState() {
       synth.seekPlayer(secondsToTicks(seconds, currentBpm));
     }
     if (audioEl) audioEl.currentTime = seconds;
+    notifyTick();
   }
 
   // Playback-speed only (see project notes): unlike the desktop's tempo
@@ -330,6 +341,7 @@ function createPlaybackState() {
     setUserAudioOn,
     toggleChannelMute,
     setMetronomeOn,
+    onTick,
   };
 }
 

@@ -16,8 +16,8 @@
   import StatusBar from "./StatusBar.svelte";
   import { session } from "./sessionState.svelte.js";
   import { playback } from "./playback.svelte.js";
-  import { buildAnnotations } from "./annotations.js";
   import { ScoreTimeMap } from "./scoreTimeMap.js";
+  import { onMount } from "svelte";
 
   let scoreViewer;
   // Rendered-system height (CSS px), pulled from the iframe after each load -
@@ -28,12 +28,6 @@
   // _score_legend_row.sizeHint().height().
   let scoreFitHeight = $state(null);
   let legendHeight = $state(0);
-  // Bumped by ScoreViewer's onReady callback the instant its iframe finishes
-  // loading - read (not just scoreViewer?.ready) inside effects below so
-  // they have a guaranteed local $state dependency to re-run on, rather
-  // than relying on reactively noticing a property read through the
-  // cross-component scoreViewer reference, which proved unreliable.
-  let scoreReadyTick = $state(0);
 
   // Owned here (not a shared singleton, not inside ScoreViewer.svelte) -
   // mirrors perform.py owning _time_map rather than ScoreViewer.py: the
@@ -51,24 +45,25 @@
   }
 
   // Mirrors perform.py's _refresh_score_mistakes: push score-note-indexed
-  // mistake markers into the viewer whenever the underlying mistakes,
-  // overrides, active instrument, or color mode change. Both mistake
-  // categories always go in together - viewer.js itself filters which one is
-  // VISIBLE per the active color mode (see annotations.js's header).
-  $effect(() => {
-    scoreReadyTick;
+  // mistake markers + the active color mode into the viewer. A plain
+  // function (not an effect body) so the ready catch-up below can also call
+  // it directly - mirrors perform.py's on_score_viewer_loaded re-pushing
+  // everything once the JS API becomes ready.
+  function pushAnnotations() {
     if (!scoreViewer?.ready) return;
-    const annotations = buildAnnotations({
-      scoreNotesActive: session.scoreNotesActive,
-      userNotesActive: session.analysisResult?.note_data,
-      mistakes: session.pitchMistakes.concat(session.timingMistakes),
-      overridden: session.overridden,
-      overrideKey: session.overrideKey,
-      currentPairs: session.currentPairs,
-      pitchFrames: session.analysisResult?.pitch_data?.pitches,
-    });
     scoreViewer.setAnnotationColorMode(session.scoreColorMode);
-    scoreViewer.setMistakeAnnotations(annotations);
+    scoreViewer.setMistakeAnnotations(session.annotationsPayload);
+  }
+
+  // session.annotationsPayload is a $derived.by in sessionState.svelte.js
+  // that already tracks every mutation feeding it (see its comment there for
+  // why that's colocated rather than hand-wired) - this effect only needs to
+  // watch that one collapsed value plus scoreColorMode, instead of the 8
+  // separate fields the old effect read directly.
+  $effect(() => {
+    session.annotationsPayload;
+    session.scoreColorMode;
+    pushAnnotations();
   });
 
   // Mirrors perform.py's on_note_clicked/on_annotation_clicked: clicking a
@@ -103,16 +98,17 @@
   }
 
   // Drives the score cursor from the real playback clock - mirrors
-  // app.py's time_changed, which calls ScoreViewer.set_playback_time via
-  // perform.py's _score_viewer_time (the SAME barline-map conversion used
-  // above, just the inverse direction). playback.svelte.js polls at the
-  // same 10Hz cadence WallClock itself uses.
-  $effect(() => {
-    scoreReadyTick;
-    if (scoreViewer?.ready) {
-      scoreViewer.setPlaybackTime(timeMap.viewerTime(playback.currentTime, scoreInfo()));
-    }
-  });
+  // app.py's time_changed / perform.py's move_views calling
+  // ScoreViewer.set_playback_time directly on every WallClock tick. A plain
+  // function, called imperatively from playback.onTick's subscription (see
+  // onMount below) rather than a $effect reading playback.currentTime: this
+  // needs to fire on every ~100ms tick, and reactive tracking through the
+  // scoreViewer binding proved unreliable in practice for exactly that case
+  // (the score never advanced past the first line during playback).
+  function pushPlaybackTime() {
+    if (!scoreViewer?.ready) return;
+    scoreViewer.setPlaybackTime(timeMap.viewerTime(playback.currentTime, scoreInfo()));
+  }
 
   function base64ToBytes(b64) {
     const binary = atob(b64);
@@ -123,7 +119,11 @@
 
   // Loads the real uploaded score into Verovio the moment /notedata returns
   // it (musicxml_b64 - see analyze_api.py), independent of Analyze ever
-  // running, mirroring the desktop app's score-independent score loading.
+  // running, mirroring the desktop app's score-independent score loading. A
+  // plain function, called imperatively from session.onNoteDataLoaded's
+  // subscription (see onMount below) - fired once at the real point
+  // noteData changes, rather than derived from watching
+  // session.noteData?.musicxml_b64 reactively.
   //
   // Re-anchors the barline time map right after (mirrors perform.py's
   // refresh_score_viewer -> _rebuild_time_map) - simpler here than desktop's
@@ -133,26 +133,50 @@
   // render synchronously start to finish, so the timemap is already valid
   // the instant loadScore() returns - no async _store callback needed.
   let lastLoadedMusicXml = null;
-  $effect(() => {
-    scoreReadyTick;
-    const b64 = session.noteData?.musicxml_b64;
-    if (b64 && b64 !== lastLoadedMusicXml && scoreViewer?.ready) {
-      lastLoadedMusicXml = b64;
-      // onRendered fires once the score has real geometry (ScoreViewer.svelte
-      // retries internally if the first render comes back empty) - mirrors
-      // ScoreViewer.py's _emit_content_height feeding perform.py's
-      // _fit_score_viewer_height.
-      scoreViewer.loadScore(base64ToBytes(b64), (height) => {
-        scoreFitHeight = height;
-      });
-      const veroOnsets = scoreViewer.getMeasureTimemap();
-      const appOnsets = session.noteData?.measure_onsets_og;
-      if (veroOnsets?.length && appOnsets?.length) {
-        timeMap.setAnchors(appOnsets, veroOnsets);
-      } else {
-        timeMap.clear();
-      }
+  function pushScoreLoad(b64) {
+    if (!scoreViewer?.ready || !b64 || b64 === lastLoadedMusicXml) return;
+    lastLoadedMusicXml = b64;
+    // onRendered fires once the score has real geometry (ScoreViewer.svelte
+    // retries internally if the first render comes back empty) - mirrors
+    // ScoreViewer.py's _emit_content_height feeding perform.py's
+    // _fit_score_viewer_height.
+    scoreViewer.loadScore(base64ToBytes(b64), (height) => {
+      scoreFitHeight = height;
+    });
+    const veroOnsets = scoreViewer.getMeasureTimemap();
+    const appOnsets = session.noteData?.measure_onsets_og;
+    if (veroOnsets?.length && appOnsets?.length) {
+      timeMap.setAnchors(appOnsets, veroOnsets);
+    } else {
+      timeMap.clear();
     }
+  }
+
+  // ScoreViewer's onReady catch-up push - mirrors perform.py's
+  // on_score_viewer_loaded, which re-pushes score/annotations/playback-time
+  // once the JS API becomes ready. Needed because the imperative
+  // subscriptions above only fire on a NEW mutation; without this, a
+  // mutation that happened before the iframe finished loading (e.g. a score
+  // picked while Verovio's WASM was still initializing) would have its push
+  // silently no-op (pushX's `scoreViewer?.ready` guard) with nothing left to
+  // re-trigger it afterward.
+  function onScoreViewerReady() {
+    pushScoreLoad(session.noteData?.musicxml_b64);
+    pushAnnotations();
+    pushPlaybackTime();
+  }
+
+  // Imperative subscriptions, registered once - see pushPlaybackTime's
+  // comment for why this isn't a reactive $effect. playback.svelte.js and
+  // sessionState.svelte.js call these back directly at their real point of
+  // mutation (a clock tick/seek, or a freshly-loaded score).
+  onMount(() => {
+    const offTick = playback.onTick(pushPlaybackTime);
+    const offNoteData = session.onNoteDataLoaded((noteData) => pushScoreLoad(noteData?.musicxml_b64));
+    return () => {
+      offTick();
+      offNoteData();
+    };
   });
 </script>
 
@@ -168,7 +192,7 @@
     <section class="center-column">
       <div class="score-pane" style={scoreFitHeight ? `flex: 0 1 ${scoreFitHeight + legendHeight + 4}px` : undefined}>
         <div class="score-viewer-wrap">
-          <ScoreViewer bind:this={scoreViewer} {onNoteClicked} {onAnnotationClicked} onReady={() => scoreReadyTick++} />
+          <ScoreViewer bind:this={scoreViewer} {onNoteClicked} {onAnnotationClicked} onReady={onScoreViewerReady} />
         </div>
         <div class="score-legend-row" bind:clientHeight={legendHeight}>
           <span class="legend-swatches">
