@@ -190,7 +190,7 @@
     </aside>
 
     <section class="center-column">
-      <div class="score-pane" style={scoreFitHeight ? `flex: 0 1 ${scoreFitHeight + legendHeight + 4}px` : undefined}>
+      <div class="score-pane" style={`flex: 0 1 ${(scoreFitHeight ?? 200) + legendHeight + 4}px; min-height: 0;`}>
         <div class="score-viewer-wrap">
           <ScoreViewer bind:this={scoreViewer} {onNoteClicked} {onAnnotationClicked} onReady={onScoreViewerReady} />
         </div>
@@ -297,7 +297,6 @@
     min-height: 200px;
     display: flex;
     flex-direction: column;
-    border-bottom: 4px solid var(--border);
   }
   .score-viewer-wrap {
     flex: 1;
@@ -354,11 +353,25 @@
     min-height: 200px;
     display: flex;
     flex-direction: column;
+    /* center children (the placeholder box, or NoteOverlay once analyzed)
+       vertically in whatever height this pane ends up with, rather than
+       pinning them to the top - .overlay-placeholder itself isn't flex:1
+       anymore (see its own comment), so without this it defaults to
+       flex-start and sits right under the border instead of centered. */
+    justify-content: center;
     padding: 8px;
     overflow: auto;
+    border-top: 4px solid var(--border);
   }
   .overlay-placeholder {
-    flex: 1;
+    /* NOT flex:1 - .overlay-pane grows to absorb whatever height
+       .score-pane's auto-fit no longer needs, so stretching this box to
+       fill 100% of an oversized .overlay-pane left a huge empty void with
+       one line of text floating in it. Sizing to its own content instead
+       (padding + text, no stretch) keeps it a normal, proportioned box that
+       sits at the top of .overlay-pane (a column flex container's default
+       main-axis alignment) - any leftover .overlay-pane height beyond that
+       is just plain background, not part of this box. */
     display: flex;
     align-items: center;
     justify-content: center;

@@ -159,10 +159,18 @@
 
 <style>
   .score-viewer {
+    /* NOT min-height:300px (used to be, harmlessly, before App.svelte's
+       score-pane auto-fit existed - .score-pane always had plenty of height
+       by default back then). Now that .score-pane is deliberately bounded
+       to the rendered content's real height, this floor fought that sizing:
+       the iframe (height:100% of this element) would overflow past its
+       actual allotted height and visually cover .score-legend-row below it,
+       even though the legend's own layout box was correctly positioned -
+       getBoundingClientRect() has no idea an overflowing sibling is
+       painting over it. */
     position: relative;
     width: 100%;
     height: 100%;
-    min-height: 300px;
   }
   .loading {
     position: absolute;
